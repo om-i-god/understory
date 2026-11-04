@@ -31,6 +31,7 @@
 #define MAX_CRACKS 7
 #define CRACK_N 36
 #define MAX_LEAVES 14
+#define BLIT_WMAX 4096
 
 typedef struct {
 	float x, y, r, speed, amp, age, life;
@@ -88,6 +89,10 @@ typedef struct {
 	crack_t ck[MAX_CRACKS];
 	leaf_t lf[MAX_LEAVES];
 	int nlf;
+	uint16_t blit_x[BLIT_WMAX], blit_t[BLIT_WMAX]; /* field_blit column cache */
+	/* vector caustics: per grid quad, circumcentres of its two triangles + which triangle owns each side */
+	float ccx[CGH][CGW - 1][2], ccy[CGH][CGW - 1][2];
+	uint8_t own[CGH][CGW - 1][4]; /* top, right, bottom, left -> triangle 0/1 */
 	float drip_t;
 	float A;
 } st_t;
@@ -170,31 +175,55 @@ static inline float fcos(float a)
 /* Full-canvas bilinear field blit (same result as us_field over (0,0)-(aspect,1) with MAX blending),
  * but row-separable and writing the canvas directly: ~4x cheaper at 720p, which matters because the
  * caustics cover the whole pond every frame. */
-static void field_blit(us_canvas *c, const float *f, int fw, int fh, float gain, uint8_t mat)
+static void field_blit(us_canvas *c, const float *f, int fw, int fh, float gain, uint8_t mat, uint16_t *bx, uint16_t *bt)
 {
-	float tmp[FWMAX + 1];
+	int tmp[FWMAX + 1];
+	int W = c->w < BLIT_WMAX ? c->w : BLIT_WMAX;
 	float kx = (float)fw / c->w, ky = (float)fh / c->h;
+	/* the horizontal sample positions are the same for every row */
+	for (int i = 0; i < W; i++) {
+		float fx = (i + 0.5f) * kx - 0.5f;
+		if (fx < 0)
+			fx = 0;
+		int ix = (int)fx;
+		float tx = fx - ix;
+		if (ix >= fw - 1) {
+			ix = fw - 1;
+			tx = 0;
+		}
+		bx[i] = (uint16_t)ix;
+		bt[i] = (uint16_t)(tx * 256.0f + 0.5f);
+	}
 	for (int j = 0; j < c->h; j++) {
 		float fy = (j + 0.5f) * ky - 0.5f;
 		int iy = (int)floorf(fy);
 		float ty = fy - iy;
 		int y0 = iy < 0 ? 0 : (iy >= fh ? fh - 1 : iy), y1 = iy + 1 >= fh ? fh - 1 : (iy + 1 < 0 ? 0 : iy + 1);
 		const float *r0 = f + y0 * fw, *r1 = f + y1 * fw;
-		for (int i = 0; i < fw; i++)
-			tmp[i] = (r0[i] + (r1[i] - r0[i]) * ty) * gain * 255.0f;
-		tmp[fw] = tmp[fw - 1];
-		uint8_t *ink = c->ink + (size_t)j * c->w, *mt = c->mat + (size_t)j * c->w;
-		for (int i = 0; i < c->w; i++) {
-			float fx = (i + 0.5f) * kx - 0.5f;
-			if (fx < 0)
-				fx = 0;
-			int ix = (int)fx;
-			float tx = fx - ix;
-			if (ix >= fw - 1) {
-				ix = fw - 1;
-				tx = 0;
+		int first = -1, last = -1;
+		for (int i = 0; i < fw; i++) {
+			int v = (int)((r0[i] + (r1[i] - r0[i]) * ty) * gain * 255.0f * 256.0f);
+			tmp[i] = v;
+			if (v > 0) {
+				if (first < 0)
+					first = i;
+				last = i;
 			}
-			int iv = (int)(tmp[ix] + (tmp[ix + 1] - tmp[ix]) * tx);
+		}
+		if (first < 0)
+			continue; /* nothing lit on this row (outside the pond) */
+		tmp[fw] = tmp[fw - 1];
+		/* only the columns whose samples can be lit */
+		int i0 = (int)((first - 0.5f) / kx) - 1, i1 = (int)((last + 1.5f) / kx) + 1;
+		if (i0 < 0)
+			i0 = 0;
+		if (i1 > W - 1)
+			i1 = W - 1;
+		uint8_t *ink = c->ink + (size_t)j * c->w, *mt = c->mat + (size_t)j * c->w;
+		for (int i = i0; i <= i1; i++) {
+			int ix = bx[i];
+			int a0 = tmp[ix];
+			int iv = (a0 + (((tmp[ix + 1] - a0) * bt[i]) >> 8)) >> 8; /* 8.8 fixed point */
 			if (iv > 255)
 				iv = 255;
 			if (iv > ink[i]) {
@@ -372,21 +401,6 @@ static void init_scene(st_t *st, const us_ctx *ctx)
 	st->inited = 1;
 }
 
-/* a fin: a lens from its root, filled faintly, outlined */
-static void fin(us_canvas *c, int crisp, float x, float y, float ang, float len, float wid, float v, uint8_t mat)
-{
-	float dx = cosf(ang), dy = sinf(ang);
-	float tx = x + dx * len, ty = y + dy * len;
-	float mx = x + dx * len * 0.55f, my = y + dy * len * 0.55f;
-	float nx = -dy * wid, ny = dx * wid;
-	us_tri(c, x, y, mx + nx, my + ny, tx, ty, crisp ? v : v * 0.3f, mat);
-	us_tri(c, x, y, mx - nx, my - ny, tx, ty, crisp ? v : v * 0.3f, mat);
-	if (!crisp) {
-		float pp[] = {x, y, mx + nx, my + ny, tx, ty, mx - nx, my - ny, x, y};
-		hpoly(c, pp, 5, v, mat);
-	}
-}
-
 /* lily pad: notched disc. crisp -> filled fan; ink -> outline + veins */
 static void draw_pad(us_canvas *c, int crisp, const pad_t *p, float x, float y, float R, float v, uint8_t mat)
 {
@@ -444,6 +458,317 @@ static void draw_strider(us_canvas *c, int crisp, float x, float y, float hd, fl
 	}
 }
 
+/* ---- vector caustics (Ink): the same cellular net as the Pixel field, drawn as its exact Voronoi
+ *      edges -- dual of the (jittered-grid) Delaunay triangulation -- so the light is a web of fine
+ *      filaments instead of a blurry low-res texture ---- */
+static void circumcenter(float ax, float ay, float bx, float by, float cx, float cy, float *ox, float *oy)
+{
+	float d = 2.0f * (ax * (by - cy) + bx * (cy - ay) + cx * (ay - by));
+	if (fabsf(d) < 1e-9f) {
+		*ox = (ax + bx + cx) / 3.0f;
+		*oy = (ay + by + cy) / 3.0f;
+		return;
+	}
+	float a2 = ax * ax + ay * ay, b2 = bx * bx + by * by, c2 = cx * cx + cy * cy;
+	*ox = (a2 * (by - cy) + b2 * (cy - ay) + c2 * (ay - by)) / d;
+	*oy = (a2 * (cx - bx) + b2 * (ax - cx) + c2 * (bx - ax)) / d;
+}
+
+/* bilinear sample of a FW x FH grid at normalized (x, y) */
+static float grid_at(const float *g, int fw, int fh, float A, float x, float y)
+{
+	float fx = x / A * fw - 0.5f, fy = y * fh - 0.5f;
+	fx = us_clampf(fx, 0, fw - 1.001f);
+	fy = us_clampf(fy, 0, fh - 1.001f);
+	int i = (int)fx, j = (int)fy;
+	float tx = fx - i, ty = fy - j;
+	const float *q = g + j * fw + i;
+	return us_lerp(us_lerp(q[0], q[1], tx), us_lerp(q[fw], q[fw + 1], tx), ty);
+}
+
+/* the field shades pixel p with the net at warp(p) = p + off(p); a net point v is therefore drawn at
+ * the p that solves p + off(p) = v (two fixed-point steps are plenty for these gentle warps) */
+static void unwarp(const st_t *st, int fw, int fh, float lt, float vx, float vy, float *px, float *py)
+{
+	float x = vx, y = vy;
+	for (int it = 0; it < 2; it++) {
+		float ox = 0.02f * fcos(y * 6.0f - lt * 0.6f) + 0.01f * fcos(y * 19.0f + lt * 0.7f) +
+			   fcos(x * 13.0f + lt * 0.3f) * 0.012f * fcos(y * 11.0f - lt * 0.4f);
+		float oy = 0.02f * fcos(x * 7.0f + lt * 0.5f) + 0.012f * fcos(x * 17.0f - lt * 0.8f);
+		ox += grid_at(st->dpx, fw, fh, st->A, x, y);
+		oy += grid_at(st->dpy, fw, fh, st->A, x, y);
+		x = vx - ox;
+		y = vy - oy;
+	}
+	*px = x;
+	*py = y;
+}
+
+static void caustic_points(st_t *st, float A, float cs, float lt, uint32_t salt, int *gwo, int *gho)
+{
+	int gw = (int)(A / cs) + 3, gh = (int)(1.0f / cs) + 3;
+	if (gw > CGW)
+		gw = CGW;
+	if (gh > CGH)
+		gh = CGH;
+	for (int j = 0; j < gh; j++)
+		for (int i = 0; i < gw; i++) {
+			uint32_t hsh = (uint32_t)(i * 73856093u) ^ (uint32_t)(j * 19349663u) ^ salt;
+			hsh = hsh * 2654435761u;
+			float h1 = (hsh & 1023) / 1023.0f, h2 = ((hsh >> 10) & 1023) / 1023.0f, h3 = ((hsh >> 20) & 1023) / 1023.0f;
+			float ph = h3 * US_TAU + lt * (0.5f + 0.5f * h1);
+			st->cpx[j * CGW + i] = (i - 1 + 0.5f + 0.32f * fcos(ph) + 0.12f * (h1 - 0.5f)) * cs;
+			st->cpy[j * CGW + i] = (j - 1 + 0.5f + 0.32f * fcos(ph * 1.3f + 1.7f) + 0.12f * (h2 - 0.5f)) * cs;
+		}
+	*gwo = gw;
+	*gho = gh;
+}
+
+static void caustic_edge(const st_t *st, us_canvas *c, int fw, int fh, float lt, float cs, float gain, float x0,
+			 float y0, float x1, float y1)
+{
+	float dx = x1 - x0, dy = y1 - y0;
+	float L = sqrtf(dx * dx + dy * dy);
+	if (L < 1e-4f || L > cs * 2.5f)
+		return;
+	/* short edges are where the light converges: brighter */
+	float v = gain * us_clampf(1.35f - 0.9f * L / cs, 0.35f, 1.25f);
+	int n = 3 + (int)(L / cs * 4.0f);
+	/* filaments bow gently (symmetric in the endpoints, so an edge keeps its curve frame to frame) */
+	float bow = L * 0.14f * fcos((x0 + x1) * 37.0f + (y0 + y1) * 91.0f + lt * 0.6f);
+	float nx = -dy / L * bow, ny = dx / L * bow;
+	float px, py;
+	unwarp(st, fw, fh, lt, x0, y0, &px, &py);
+	float m0 = us_smooth(1.0f, 0.9f, grid_at(st->qmask, fw, fh, st->A, px, py));
+	for (int k = 1; k <= n; k++) {
+		float f = (float)k / n, fm = (k - 0.5f) / n;
+		float b = sinf(US_PI * f);
+		float qx, qy;
+		unwarp(st, fw, fh, lt, x0 + dx * f + nx * b, y0 + dy * f + ny * b, &qx, &qy);
+		float m1 = us_smooth(1.0f, 0.9f, grid_at(st->qmask, fw, fh, st->A, qx, qy));
+		/* brightest at the nodes where filaments meet */
+		float node = 0.5f + 0.7f * (2.0f * fm - 1.0f) * (2.0f * fm - 1.0f);
+		float mv = v * node * fminf(m0, m1);
+		if (mv > 0.01f)
+			hl(c, px, py, qx, qy, mv, US_MAT_WATER);
+		px = qx;
+		py = qy;
+		m0 = m1;
+	}
+}
+
+static void caustic_lines(st_t *st, us_canvas *c, int gw, int gh, float cs, float lt, int fw, int fh, float gain)
+{
+	float(*ccx)[CGW - 1][2] = st->ccx, (*ccy)[CGW - 1][2] = st->ccy;
+	uint8_t(*own)[CGW - 1][4] = st->own;
+	for (int j = 0; j + 1 < gh; j++)
+		for (int i = 0; i + 1 < gw; i++) {
+			float ax = st->cpx[j * CGW + i], ay = st->cpy[j * CGW + i];
+			float bx = st->cpx[j * CGW + i + 1], by = st->cpy[j * CGW + i + 1];
+			float cx = st->cpx[(j + 1) * CGW + i], cy = st->cpy[(j + 1) * CGW + i];
+			float dx = st->cpx[(j + 1) * CGW + i + 1], dy = st->cpy[(j + 1) * CGW + i + 1];
+			float ox, oy;
+			circumcenter(ax, ay, bx, by, cx, cy, &ox, &oy);
+			float rr = (ax - ox) * (ax - ox) + (ay - oy) * (ay - oy);
+			int diag_bc = (dx - ox) * (dx - ox) + (dy - oy) * (dy - oy) >= rr; /* Delaunay: d outside abc */
+			if (diag_bc) {
+				ccx[j][i][0] = ox;
+				ccy[j][i][0] = oy; /* abc: top, left */
+				circumcenter(bx, by, dx, dy, cx, cy, &ccx[j][i][1], &ccy[j][i][1]); /* bdc: right, bottom */
+				own[j][i][0] = 0, own[j][i][3] = 0, own[j][i][1] = 1, own[j][i][2] = 1;
+			} else {
+				circumcenter(ax, ay, bx, by, dx, dy, &ccx[j][i][0], &ccy[j][i][0]); /* abd: top, right */
+				circumcenter(ax, ay, dx, dy, cx, cy, &ccx[j][i][1], &ccy[j][i][1]); /* adc: left, bottom */
+				own[j][i][0] = 0, own[j][i][1] = 0, own[j][i][3] = 1, own[j][i][2] = 1;
+			}
+		}
+	for (int j = 0; j + 1 < gh; j++)
+		for (int i = 0; i + 1 < gw; i++) {
+			/* the diagonal's dual */
+			caustic_edge(st, c, fw, fh, lt, cs, gain, ccx[j][i][0], ccy[j][i][0], ccx[j][i][1], ccy[j][i][1]);
+			if (j > 0) { /* shared side with the quad above */
+				int t0 = own[j][i][0], t1 = own[j - 1][i][2];
+				caustic_edge(st, c, fw, fh, lt, cs, gain, ccx[j][i][t0], ccy[j][i][t0], ccx[j - 1][i][t1], ccy[j - 1][i][t1]);
+			}
+			if (i > 0) { /* shared side with the quad to the left */
+				int t0 = own[j][i][3], t1 = own[j][i - 1][1];
+				caustic_edge(st, c, fw, fh, lt, cs, gain, ccx[j][i][t0], ccy[j][i][t0], ccx[j][i - 1][t1], ccy[j][i - 1][t1]);
+			}
+		}
+}
+
+/* multiply the ink inside a triangle (darkens what lies beneath a solid body) */
+static void carve_tri(us_canvas *c, float x0, float y0, float x1, float y1, float x2, float y2, float keep)
+{
+	float s = c->s;
+	x0 *= s, y0 *= s, x1 *= s, y1 *= s, x2 *= s, y2 *= s;
+	int bx0 = (int)floorf(fminf(x0, fminf(x1, x2))), bx1 = (int)ceilf(fmaxf(x0, fmaxf(x1, x2)));
+	int by0 = (int)floorf(fminf(y0, fminf(y1, y2))), by1 = (int)ceilf(fmaxf(y0, fmaxf(y1, y2)));
+	float d = (y1 - y2) * (x0 - x2) + (x2 - x1) * (y0 - y2);
+	if (fabsf(d) < 1e-6f)
+		return;
+	float id = 1.0f / d;
+	int k8 = (int)(keep * 256.0f);
+	for (int j = by0 < 0 ? 0 : by0; j <= by1 && j < c->h; j++)
+		for (int i = bx0 < 0 ? 0 : bx0; i <= bx1 && i < c->w; i++) {
+			float px = i + 0.5f, py = j + 0.5f;
+			float l0 = ((y1 - y2) * (px - x2) + (x2 - x1) * (py - y2)) * id;
+			float l1 = ((y2 - y0) * (px - x2) + (x0 - x2) * (py - y2)) * id;
+			if (l0 < 0 || l1 < 0 || l0 + l1 > 1)
+				continue;
+			uint8_t *p = c->ink + (size_t)j * c->w + i;
+			*p = (uint8_t)((*p * k8) >> 8);
+		}
+}
+
+/* a fan-shaped fin: rays from the root, joined by a scalloped edge */
+static void fan_fin(us_canvas *c, int crisp, float x, float y, float ang, float spread, float len, float v, uint8_t mat)
+{
+	enum { R = 5 };
+	float tx[R], ty[R];
+	for (int k = 0; k < R; k++) {
+		float a = ang + spread * (k / (float)(R - 1) - 0.5f);
+		float l = len * (0.85f + 0.15f * sinf(US_PI * k / (R - 1)));
+		tx[k] = x + cosf(a) * l;
+		ty[k] = y + sinf(a) * l;
+	}
+	if (crisp) {
+		for (int k = 0; k + 1 < R; k++)
+			us_tri(c, x, y, tx[k], ty[k], tx[k + 1], ty[k + 1], v * 0.75f, mat);
+		return;
+	}
+	for (int k = 0; k < R; k++)
+		hl(c, x, y, tx[k], ty[k], v * (k == 0 || k == R - 1 ? 0.8f : 0.4f), mat);
+	for (int k = 0; k + 1 < R; k++)
+		hl(c, tx[k], ty[k], tx[k + 1], ty[k + 1], v * 0.7f, mat);
+}
+
+/* koi from above: a solid body (it shades the light on the bed beneath it), kohaku-style patches,
+ * fan pectorals, a flowing two-lobed tail */
+static void koi_draw(us_canvas *c, int crisp, koi_t *k, int idx, float kv)
+{
+	float L[2 * KOI_N], Rr[2 * KOI_N];
+	for (int j = 0; j < KOI_N; j++) {
+		int jn = j < KOI_N - 1 ? j + 1 : j, jp = j > 0 ? j - 1 : j;
+		float tx = k->sx[jp] - k->sx[jn], ty = k->sy[jp] - k->sy[jn];
+		float tl = sqrtf(tx * tx + ty * ty) + 1e-6f;
+		float nx = -ty / tl, ny = tx / tl;
+		float f = (float)j / (KOI_N - 1);
+		float wv = sinf(k->ph - f * 4.0f) * 0.012f * f;
+		/* blunt head, full shoulders, a slim wrist before the tail */
+		float wid = k->len * (0.17f * powf(sinf(US_PI * (0.12f + 0.88f * f)), 0.6f) * (1.0f - 0.55f * f * f) + 0.012f);
+		float bx = k->sx[j] + nx * wv, by = k->sy[j] + ny * wv;
+		L[2 * j] = bx + nx * wid;
+		L[2 * j + 1] = by + ny * wid;
+		Rr[2 * j] = bx - nx * wid;
+		Rr[2 * j + 1] = by - ny * wid;
+	}
+	float hdx = k->sx[0] - k->sx[1], hdy = k->sy[0] - k->sy[1];
+	float hn = sqrtf(hdx * hdx + hdy * hdy) + 1e-6f;
+	hdx /= hn, hdy /= hn;
+	float snx = k->sx[0] + hdx * k->len * 0.07f, sny = k->sy[0] + hdy * k->len * 0.07f;
+	float ha = atan2f(hdy, hdx);
+	uint8_t pm = k->mat == US_MAT_BLOOM ? US_MAT_LIGHT : US_MAT_BLOOM; /* patch colour */
+
+	/* tail: two lobes swishing behind the wrist */
+	int e = KOI_N - 1;
+	float ta = atan2f(k->sy[e] - k->sy[e - 2], k->sx[e] - k->sx[e - 2]);
+	float sw = sinf(k->ph - 4.5f) * 0.45f;
+	float fl = k->len * 0.34f;
+	for (int s = -1; s <= 1; s += 2)
+		fan_fin(c, crisp, k->sx[e - 1], k->sy[e - 1], ta + s * 0.42f + sw, 0.55f, fl, kv * 0.9f, k->mat);
+	/* pectoral fans */
+	float px0 = k->sx[2], py0 = k->sy[2];
+	for (int s = -1; s <= 1; s += 2) {
+		float side = ha + s * 1.5708f;
+		float rx = px0 + cosf(side) * k->len * 0.12f, ry = py0 + sinf(side) * k->len * 0.12f;
+		float fa = ha + US_PI + s * (1.05f + 0.3f * sinf(k->ph * 0.5f + s));
+		fan_fin(c, crisp, rx, ry, fa, 0.9f, fl * 0.55f, kv * 0.85f, k->mat);
+	}
+
+	if (crisp) {
+		for (int j = 0; j < KOI_N - 1; j++) {
+			us_tri(c, L[2 * j], L[2 * j + 1], Rr[2 * j], Rr[2 * j + 1], L[2 * j + 2], L[2 * j + 3], kv, k->mat);
+			us_tri(c, Rr[2 * j], Rr[2 * j + 1], Rr[2 * j + 2], Rr[2 * j + 3], L[2 * j + 2], L[2 * j + 3], kv, k->mat);
+		}
+		us_tri(c, L[0], L[1], snx, sny, Rr[0], Rr[1], kv, k->mat);
+	} else {
+		/* the body hides the caustic web on the bed beneath it */
+		for (int j = 0; j < KOI_N - 1; j++) {
+			carve_tri(c, L[2 * j], L[2 * j + 1], Rr[2 * j], Rr[2 * j + 1], L[2 * j + 2], L[2 * j + 3], 0.12f);
+			carve_tri(c, Rr[2 * j], Rr[2 * j + 1], Rr[2 * j + 2], Rr[2 * j + 3], L[2 * j + 2], L[2 * j + 3], 0.12f);
+		}
+		carve_tri(c, L[0], L[1], snx, sny, Rr[0], Rr[1], 0.12f);
+		/* one closed outline: left flank, round snout, right flank */
+		float ol[2 * (2 * KOI_N + 4)];
+		int n = 0;
+		for (int j = KOI_N - 1; j >= 0; j--) {
+			ol[2 * n] = L[2 * j];
+			ol[2 * n + 1] = L[2 * j + 1];
+			n++;
+		}
+		float mx = 0.5f * (L[0] + Rr[0]), my = 0.5f * (L[1] + Rr[1]);
+		ol[2 * n] = 0.5f * (L[0] + snx) + (L[0] - mx) * 0.25f;
+		ol[2 * n + 1] = 0.5f * (L[1] + sny) + (L[1] - my) * 0.25f;
+		n++;
+		ol[2 * n] = snx;
+		ol[2 * n + 1] = sny;
+		n++;
+		ol[2 * n] = 0.5f * (Rr[0] + snx) + (Rr[0] - mx) * 0.25f;
+		ol[2 * n + 1] = 0.5f * (Rr[1] + sny) + (Rr[1] - my) * 0.25f;
+		n++;
+		for (int j = 0; j < KOI_N; j++) {
+			ol[2 * n] = Rr[2 * j];
+			ol[2 * n + 1] = Rr[2 * j + 1];
+			n++;
+		}
+		hpoly(c, ol, n, kv, k->mat);
+		/* faint dorsal line */
+		float sp[2 * KOI_N];
+		for (int j = 1; j < KOI_N - 1; j++) {
+			sp[2 * (j - 1)] = 0.5f * (L[2 * j] + Rr[2 * j]);
+			sp[2 * (j - 1) + 1] = 0.5f * (L[2 * j + 1] + Rr[2 * j + 1]);
+		}
+		hpoly(c, sp, KOI_N - 2, kv * 0.3f, k->mat);
+	}
+	/* patches: two or three blots across the back, the same on every frame (seeded by the fish) */
+	for (int q = 0; q < 3; q++) {
+		float h = sinf(idx * 12.9898f + q * 78.233f) * 43758.5453f;
+		h -= floorf(h);
+		if (q == 2 && h < 0.5f)
+			continue;
+		int j0 = 1 + (int)(h * 3.0f) + q * 2;
+		int j1 = j0 + 1 + (q == 0);
+		if (j1 > KOI_N - 3)
+			j1 = KOI_N - 3;
+		float bias = (h - 0.5f) * 0.6f, wdt = 0.55f + 0.3f * h;
+		for (int j = j0; j < j1; j++) {
+			float ax = 0.5f * (L[2 * j] + Rr[2 * j]), ay = 0.5f * (L[2 * j + 1] + Rr[2 * j + 1]);
+			float bx2 = 0.5f * (L[2 * j + 2] + Rr[2 * j + 2]), by2 = 0.5f * (L[2 * j + 3] + Rr[2 * j + 3]);
+			float hx = 0.5f * (L[2 * j] - Rr[2 * j]), hy = 0.5f * (L[2 * j + 1] - Rr[2 * j + 1]);
+			float gx = 0.5f * (L[2 * j + 2] - Rr[2 * j + 2]), gy = 0.5f * (L[2 * j + 3] - Rr[2 * j + 3]);
+			float a1x = ax + hx * (bias + wdt), a1y = ay + hy * (bias + wdt), a2x = ax + hx * (bias - wdt), a2y = ay + hy * (bias - wdt);
+			float b1x = bx2 + gx * (bias + wdt), b1y = by2 + gy * (bias + wdt), b2x = bx2 + gx * (bias - wdt), b2y = by2 + gy * (bias - wdt);
+			if (crisp) {
+				us_tri(c, a1x, a1y, a2x, a2y, b1x, b1y, 0.85f, pm);
+				us_tri(c, a2x, a2y, b2x, b2y, b1x, b1y, 0.85f, pm);
+			} else {
+				/* ink: the patch is hatched across the body */
+				for (int hk = 0; hk < 4; hk++) {
+					float f = (hk + 0.5f) / 4.0f;
+					hl(c, us_lerp(a1x, b1x, f), us_lerp(a1y, b1y, f), us_lerp(a2x, b2x, f), us_lerp(a2y, b2y, f), kv * 0.75f, pm);
+				}
+			}
+		}
+	}
+	/* eyes */
+	if (!crisp) {
+		float ex = k->sx[0] * 0.65f + k->sx[1] * 0.35f, ey = k->sy[0] * 0.65f + k->sy[1] * 0.35f;
+		for (int s = -1; s <= 1; s += 2)
+			us_point(c, ex + cosf(ha + s * 1.5708f) * k->len * 0.075f, ey + sinf(ha + s * 1.5708f) * k->len * 0.075f,
+				 0.0014f, kv * 1.3f, k->mat);
+	}
+}
 static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 {
 	st_t *st = sp;
@@ -513,20 +838,8 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 		float lt = st->light_t;
 		/* feature points: one per cell, wandering on slow circles */
 		const float cs = 0.13f; /* cell size */
-		int gw = (int)(A / cs) + 3, gh = (int)(1.0f / cs) + 3;
-		if (gw > CGW)
-			gw = CGW;
-		if (gh > CGH)
-			gh = CGH;
-		for (int j = 0; j < gh; j++)
-			for (int i = 0; i < gw; i++) {
-				uint32_t hsh = (uint32_t)(i * 73856093u) ^ (uint32_t)(j * 19349663u) ^ 0x9e3779b9u;
-				hsh = hsh * 2654435761u;
-				float h1 = (hsh & 1023) / 1023.0f, h2 = ((hsh >> 10) & 1023) / 1023.0f, h3 = ((hsh >> 20) & 1023) / 1023.0f;
-				float ph = h3 * US_TAU + lt * (0.5f + 0.5f * h1);
-				st->cpx[j * CGW + i] = (i - 1 + 0.5f + 0.32f * fcos(ph) + 0.12f * (h1 - 0.5f)) * cs;
-				st->cpy[j * CGW + i] = (j - 1 + 0.5f + 0.32f * fcos(ph * 1.3f + 1.7f) + 0.12f * (h2 - 0.5f)) * cs;
-			}
+		int gw, gh;
+		caustic_points(st, A, cs, lt, 0x9e3779b9u, &gw, &gh);
 		/* ripple displacement */
 		memset(st->dpx, 0, sizeof(float) * FW * FH);
 		memset(st->dpy, 0, sizeof(float) * FW * FH);
@@ -571,8 +884,19 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 			st->mask_scale = st->scale;
 			st->mask_A = A;
 		}
+		float gain = (0.13f + 0.3f * st->bass_env + 0.06f * w->daylight) * (1.0f - 0.65f * ice);
+		if (!ctx->crisp) {
+			/* Ink: fine filaments; bass focuses the light (brighter, and the net breathes) */
+			caustic_lines(st, c, gw, gh, cs, lt, FW, FH, 0.2f + 2.0f * gain);
+			/* a second, finer and fainter net drifting the other way: the two interfere like real caustics */
+			int gw2, gh2;
+			const float cs2 = 0.083f;
+			caustic_points(st, A, cs2, lt * 1.35f + 40.0f, 0x51ed270bu, &gw2, &gh2);
+			caustic_lines(st, c, gw2, gh2, cs2, lt, FW, FH, (0.2f + 2.0f * gain) * 0.42f);
+			goto caustics_done;
+		}
 		float inv_cs = 1.0f / cs;
-		float sharp = 1.0f / (0.16f + 0.1f * (1.0f - st->bass_env)) / cs; /* bass focuses the light */
+		float sharp = 1.0f / (0.11f + 0.08f * (1.0f - st->bass_env)) / cs; /* bass focuses the light */
 		/* domain warp bends the cell walls into soft curves */
 		float cx1[FWMAX], cx2[FWMAX];
 		for (int i = 0; i < FW; i++) {
@@ -618,9 +942,9 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 				st->field[idx] = (v * 0.9f + 0.05f) * m;
 			}
 		}
-		float gain = (0.13f + 0.3f * st->bass_env + 0.06f * w->daylight) * (1.0f - 0.65f * ice);
-		field_blit(c, st->field, FW, FH, gain * (ctx->crisp ? 1.3f : 0.85f), US_MAT_WATER);
+		field_blit(c, st->field, FW, FH, gain * 1.3f, US_MAT_WATER, st->blit_x, st->blit_t);
 	}
+caustics_done:
 
 	/* ---- koi below the surface ---- */
 	{
@@ -658,65 +982,8 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 				k->sx[j] = k->sx[j - 1] + dx / d * seg;
 				k->sy[j] = k->sy[j - 1] + dy / d * seg;
 			}
-			/* body outline with a swimming wave */
-			float L[2 * 10], Rr[2 * 10];
-			for (int j = 0; j < KOI_N; j++) {
-				int jn = j < KOI_N - 1 ? j + 1 : j, jp = j > 0 ? j - 1 : j;
-				float tx = k->sx[jp] - k->sx[jn], ty = k->sy[jp] - k->sy[jn];
-				float tl = sqrtf(tx * tx + ty * ty) + 1e-6f;
-				float nx = -ty / tl, ny = tx / tl;
-				float f = (float)j / (KOI_N - 1);
-				float wv = sinf(k->ph - f * 4.0f) * 0.012f * f;
-				float wid = k->len * 0.2f * sinf(US_PI * (0.15f + 0.85f * f)) * (1.0f - 0.5f * f);
-				float bx = k->sx[j] + nx * wv, by = k->sy[j] + ny * wv;
-				L[2 * j] = bx + nx * wid;
-				L[2 * j + 1] = by + ny * wid;
-				Rr[2 * j] = bx - nx * wid;
-				Rr[2 * j + 1] = by - ny * wid;
-			}
-			float kv = 0.55f * (1.0f - 0.5f * ice);
-			if (ctx->crisp) {
-				for (int j = 0; j < KOI_N - 1; j++) {
-					us_tri(c, L[2 * j], L[2 * j + 1], Rr[2 * j], Rr[2 * j + 1], L[2 * j + 2], L[2 * j + 3], kv, k->mat);
-					us_tri(c, Rr[2 * j], Rr[2 * j + 1], Rr[2 * j + 2], Rr[2 * j + 3], L[2 * j + 2], L[2 * j + 3], kv, k->mat);
-				}
-			} else {
-				hpoly(c, L, KOI_N, kv, k->mat);
-				/* koi patches along the back */
-				for (int j = 2; j < KOI_N - 2; j += 2) {
-					float px = 0.5f * (L[2 * j] + Rr[2 * j]), py = 0.5f * (L[2 * j + 1] + Rr[2 * j + 1]);
-					float ww = 0.5f * sqrtf((L[2 * j] - Rr[2 * j]) * (L[2 * j] - Rr[2 * j]) + (L[2 * j + 1] - Rr[2 * j + 1]) * (L[2 * j + 1] - Rr[2 * j + 1]));
-					float hs = sinf(i * 3.7f + j * 1.9f);
-					if (hs > -0.3f)
-						us_disc(c, px + hs * ww * 0.25f, py, ww * (0.45f + 0.2f * hs), kv * 0.45f, k->mat);
-				}
-				hpoly(c, Rr, KOI_N, kv, k->mat);
-				/* rounded snout */
-				float hdx = k->sx[0] - k->sx[1], hdy = k->sy[0] - k->sy[1];
-				float hn = sqrtf(hdx * hdx + hdy * hdy) + 1e-6f;
-				float nx = k->sx[0] + hdx / hn * k->len * 0.06f, ny = k->sy[0] + hdy / hn * k->len * 0.06f;
-				float sn[6] = {L[0], L[1], nx, ny, Rr[0], Rr[1]};
-				hpoly(c, sn, 3, kv, k->mat);
-			}
-			/* tail fin (two swishing lobes), pectoral fins, eyes */
-			{
-				int e = KOI_N - 1;
-				float tx = k->sx[e] - k->sx[e - 2], ty = k->sy[e] - k->sy[e - 2];
-				float ta = atan2f(ty, tx);
-				float sw = sinf(k->ph - 4.5f) * 0.45f;
-				float fl = k->len * 0.32f;
-				for (int s = -1; s <= 1; s += 2)
-					fin(c, ctx->crisp, k->sx[e - 1], k->sy[e - 1], ta + s * 0.38f + sw, fl, fl * 0.3f, kv, k->mat);
-				float hx = k->sx[2], hy = k->sy[2];
-				float ha = atan2f(k->sy[1] - k->sy[3], k->sx[1] - k->sx[3]);
-				for (int s = -1; s <= 1; s += 2)
-					fin(c, ctx->crisp, hx + cosf(ha + s * 1.5708f) * k->len * 0.07f, hy + sinf(ha + s * 1.5708f) * k->len * 0.07f,
-					    ha + US_PI + s * (1.0f + 0.25f * sinf(k->ph * 0.5f + s)), fl * 0.5f, fl * 0.2f, kv * 0.9f, k->mat);
-				float ex = k->sx[0] * 0.6f + k->sx[1] * 0.4f, ey = k->sy[0] * 0.6f + k->sy[1] * 0.4f;
-				for (int s = -1; s <= 1; s += 2)
-					us_point(c, ex + cosf(ha + s * 1.5708f) * k->len * 0.055f, ey + sinf(ha + s * 1.5708f) * k->len * 0.055f,
-						 0.0016f, kv * 1.3f, k->mat);
-			}
+			float kv = 0.6f * (1.0f - 0.5f * ice);
+			koi_draw(c, ctx->crisp, k, i, kv);
 		}
 	}
 
@@ -809,6 +1076,57 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 				pok = ok;
 			}
 		}
+	}
+
+	/* ---- interference: where two crests cross they heap up into a bright point ---- */
+	{
+		int nb = 0;
+		int big[MAX_RINGS];
+		for (int k = 0; k < st->nrg; k++)
+			if (!st->rg[k].small && st->rg[k].age > 0.1f)
+				big[nb++] = k;
+		float rx_, ry_;
+		pond_radii(st, &rx_, &ry_);
+		int pairs = 0;
+		for (int p = 0; p < nb && pairs < 500; p++)
+			for (int q = p + 1; q < nb && pairs < 500; q++) {
+				ring_t *g1 = &st->rg[big[p]], *g2 = &st->rg[big[q]];
+				float dx = g2->x - g1->x, dy = g2->y - g1->y;
+				float d2 = dx * dx + dy * dy;
+				if (d2 < 1e-6f)
+					continue;
+				float d = sqrtf(d2);
+				float e1 = g1->amp * powf(1.0f - g1->age / g1->life, 1.5f), e2 = g2->amp * powf(1.0f - g2->age / g2->life, 1.5f);
+				float ev = fminf(e1, e2);
+				if (ev < 0.06f)
+					continue;
+				pairs++;
+				/* each ring's first two crests */
+				for (int c1 = 0; c1 < 2; c1++)
+					for (int c2 = 0; c2 < 2; c2++) {
+						float r1 = g1->r - c1 * 0.016f * (1.0f + 0.8f * g1->age / g1->life);
+						float r2 = g2->r - c2 * 0.016f * (1.0f + 0.8f * g2->age / g2->life);
+						if (r1 <= 0.002f || r2 <= 0.002f || d > r1 + r2 || d < fabsf(r1 - r2))
+							continue;
+						float aa = (r1 * r1 - r2 * r2 + d2) / (2.0f * d);
+						float h = sqrtf(fmaxf(r1 * r1 - aa * aa, 0.0f));
+						float mx = g1->x + dx * aa / d, my = g1->y + dy * aa / d;
+						float v = us_sat(ev * (c1 + c2 == 0 ? 1.6f : 0.9f));
+						for (int s = -1; s <= 1; s += 2) {
+							float ix = mx - dy / d * h * s, iy = my + dx / d * h * s;
+							float ex = (ix - A * 0.5f) / rx_, ey = (iy - 0.5f) / ry_;
+							if (ex * ex + ey * ey > st->bmin * st->bmin * 0.92f || in_pad(st, npads, ix, iy, 1.0f))
+								continue;
+							if (ctx->crisp) {
+								us_point(c, ix, iy, 0.001f, v, US_MAT_LIGHT);
+							} else {
+								float L = 0.003f + 0.004f * v;
+								hl(c, ix - L, iy, ix + L, iy, v, US_MAT_WATER);
+								hl(c, ix, iy - L, ix, iy + L, v, US_MAT_WATER);
+							}
+						}
+					}
+			}
 	}
 
 	/* ---- lily pads: drift, part for passing rings, bob ---- */

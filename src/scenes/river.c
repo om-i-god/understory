@@ -26,6 +26,12 @@
 #define MAX_REEDS 30 /* reed clumps */
 #define MAX_TUFTS 220
 #define ROCK_V 24
+#define MAX_SURGE 10
+#define MAX_FOAM 360
+#define MAX_GLINT 72
+#define MAX_FISH 4
+#define MAX_TREES 12
+#define TREE_V 40
 #define GX 48 /* coarse noise grid (curl wobble + speed texture), sampled bilinearly */
 #define GY 27
 
@@ -61,8 +67,41 @@ typedef struct {
 } tuft_t;
 
 typedef struct {
+	float x, amp; /* a pulse of faster water travelling downstream */
+} surge_t;
+
+typedef struct {
+	float u, y, pu, py, life, decay;
+} foam_t;
+
+typedef struct {
+	float u, y, age, life, sz;
+} glint_t;
+
+typedef struct {
+	float u, s;         /* position: along (0..1), lateral (-1..1) */
+	float hu, hs;       /* station the fish holds against the current */
+	float len, ph, dart, hd;
+} fish_t;
+
+typedef struct {
+	float u, side, off, r, ph;
+	float lob[TREE_V], lmin, lmax;
+} tree_t;
+
+typedef struct {
 	us_rng rng;
 	int inited;
+	surge_t sg[MAX_SURGE];
+	int nsg;
+	float sgx[NX]; /* surge profile along the river, rebuilt per frame */
+	foam_t fm[MAX_FOAM];
+	int nfm;
+	glint_t gl[MAX_GLINT];
+	int ngl;
+	fish_t fish[MAX_FISH];
+	tree_t tree[MAX_TREES];
+	float foam_acc, glint_acc;
 	float seed_off;
 	prt_t p[MAX_P];
 	int np;
@@ -192,6 +231,13 @@ static void chan(const st_t *st, float x, float *c, float *h, float *s)
 	*c = us_lerp(st->cy[i], st->cy[i + 1], t);
 	*h = us_lerp(st->hw[i], st->hw[i + 1], t);
 	*s = us_lerp(st->sl[i], st->sl[i + 1], t);
+}
+
+static float surge_at(const st_t *st, float x)
+{
+	float f = us_clampf(x / st->A, 0, 1) * (NX - 1.001f);
+	int i = (int)f;
+	return us_lerp(st->sgx[i], st->sgx[i + 1], f - i);
 }
 
 static void build_grid(st_t *st, float A, float t)
@@ -349,6 +395,38 @@ static void init_scene(st_t *st, const us_ctx *ctx)
 		st->tf[i].y = us_rand(r);
 		st->tf[i].sz = us_randr(r, 0.4f, 1.0f);
 	}
+	for (int i = 0; i < MAX_FISH; i++) {
+		fish_t *f = &st->fish[i];
+		f->hu = f->u = (i + us_randr(r, 0.2f, 0.8f)) / MAX_FISH;
+		f->hs = f->s = us_randr(r, -0.45f, 0.45f);
+		f->len = us_randr(r, 0.065f, 0.095f);
+		f->ph = us_rand(r) * US_TAU;
+		f->hd = 0;
+	}
+	for (int i = 0; i < MAX_TREES; i++) {
+		tree_t *tr = &st->tree[i];
+		/* alternate banks, spread along the river */
+		float gu = 0.41f + 0.618034f * i;
+		tr->u = gu - floorf(gu);
+		tr->side = (i & 1) ? 1.0f : -1.0f;
+		int far = (i % 3) == 2; /* every third tree stands back in the fields */
+		tr->off = far ? us_randr(r, 0.1f, 0.42f) : us_randr(r, 0.0f, 0.03f);
+		tr->r = far ? us_randr(r, 0.035f, 0.06f) : us_randr(r, 0.05f, 0.085f);
+		tr->ph = us_rand(r) * 20.0f;
+		float a1 = us_randr(r, 0.04f, 0.09f), p1 = us_rand(r) * US_TAU;
+		float a2 = us_randr(r, 0.03f, 0.07f), p2 = us_rand(r) * US_TAU;
+		for (int v = 0; v < TREE_V; v++) {
+			float th = US_TAU * v / TREE_V;
+			/* lobed crown: leafy clumps around the rim */
+			tr->lob[v] = 1.0f + a1 * cosf(2 * th + p1) + a2 * cosf(3 * th + p2) + 0.07f * fabsf(sinf(4.5f * th + p1));
+		}
+		tr->lmin = 10.0f;
+		tr->lmax = 0.0f;
+		for (int v = 0; v < TREE_V; v++) {
+			tr->lmin = fminf(tr->lmin, tr->lob[v]);
+			tr->lmax = fmaxf(tr->lmax, tr->lob[v]);
+		}
+	}
 	st->np = 0;
 	st->inited = 1;
 }
@@ -405,6 +483,141 @@ static void leaf_shape(us_canvas *c, int crisp, float cx, float cy, float ang, f
 	}
 }
 
+/* fish body half-width at axial position l (-1 tail .. +1 snout), in units of body length */
+static float fish_w(float l)
+{
+	if (l > -0.62f) {
+		float q = (l + 0.62f) / 1.62f; /* 0 at the tail root .. 1 at the snout */
+		float w = 0.15f * powf(sinf(US_PI * (0.08f + 0.92f * q)), 0.7f) * (0.35f + 0.65f * us_smooth(0.0f, 0.45f, q));
+		if (l > 0.18f && l < 0.42f) /* pectoral fins, swept back */
+			w += 0.14f * (0.42f - l) / 0.24f;
+		if (l > -0.42f && l < -0.26f) /* pelvic fins */
+			w += 0.06f * (-0.26f - l) / 0.16f;
+		return w;
+	}
+	return 0.02f + 0.11f * us_smooth(-0.62f, -1.0f, l); /* tail fin flares out */
+}
+
+/* a trout seen from above, as a shadow carved out of the water lines (plus a faint rim in ink) */
+static void fish_draw(us_canvas *c, float x, float y, float ang, float L, float wag, float vis)
+{
+	float ax = cosf(ang), ay = sinf(ang);
+	float R = L * 0.62f;
+	int x0 = (int)floorf((x - R) * c->s), x1 = (int)ceilf((x + R) * c->s);
+	int y0 = (int)floorf((y - R) * c->s), y1 = (int)ceilf((y + R) * c->s);
+	float keep = c->crisp ? 0.0f : 0.1f;
+	keep = us_lerp(1.0f, keep, vis);
+	float inv = 1.0f / c->s;
+	for (int j = y0 < 0 ? 0 : y0; j <= y1 && j < c->h; j++)
+		for (int i = x0 < 0 ? 0 : x0; i <= x1 && i < c->w; i++) {
+			float px = (i + 0.5f) * inv - x, py = (j + 0.5f) * inv - y;
+			float l = (px * ax + py * ay) / (L * 0.5f);
+			if (l < -1.0f || l > 1.0f)
+				continue;
+			float d = (-px * ay + py * ax) / L;
+			d -= wag * (1.0f - l) * (1.0f - l) * 0.05f; /* the tail sweeps */
+			float hw = fish_w(l);
+			/* forked tail */
+			if (fabsf(d) > hw || (l < -0.9f && fabsf(d) < 0.05f * us_smooth(-0.88f, -1.0f, l)))
+				continue;
+			size_t o = (size_t)j * c->w + i;
+			c->ink[o] = (uint8_t)(c->ink[o] * keep);
+		}
+	if (!c->crisp) {
+		float pl[2 * 42], pr[2 * 42];
+		for (int k = 0; k <= 40; k++) {
+			float l = 1.0f - 2.0f * k / 40.0f;
+			float hw = fish_w(l) * L;
+			float sp = wag * (1.0f - l) * (1.0f - l) * 0.05f * L;
+			float cxp = x + ax * l * L * 0.5f - ay * sp, cyp = y + ay * l * L * 0.5f + ax * sp;
+			pl[2 * k] = cxp - ay * hw;
+			pl[2 * k + 1] = cyp + ax * hw;
+			pr[2 * k] = cxp + ay * hw;
+			pr[2 * k + 1] = cyp - ax * hw;
+		}
+		hpoly(c, pl, 41, 0.38f * vis, US_MAT_STEM);
+		hpoly(c, pr, 41, 0.38f * vis, US_MAT_STEM);
+	}
+}
+
+/* zero the ink inside a lobed crown (so the water does not show through the canopy) */
+/* atan2 in [-pi, pi], ~0.01 rad accurate: plenty for picking a lobe */
+static float fast_atan2(float y, float x)
+{
+	float ax = fabsf(x), ay = fabsf(y);
+	float mx = fmaxf(ax, ay), mn = fminf(ax, ay);
+	float a = mn / (mx + 1e-12f);
+	float s2 = a * a;
+	float r = ((-0.0464964749f * s2 + 0.15931422f) * s2 - 0.327622764f) * s2 * a + a;
+	if (ay > ax)
+		r = 1.57079637f - r;
+	if (x < 0)
+		r = 3.14159274f - r;
+	if (y < 0)
+		r = -r;
+	return r;
+}
+
+/* hairline arc (cheap: a few Wu segments) */
+static void harc(us_canvas *c, float x, float y, float r, float a0, float a1, float v, uint8_t mat)
+{
+	int n = 2 + (int)(r * c->s * fabsf(a1 - a0) / 4.0f);
+	if (n > 16)
+		n = 16;
+	float px = x + cosf(a0) * r, py = y + sinf(a0) * r;
+	for (int i = 1; i <= n; i++) {
+		float a = a0 + (a1 - a0) * i / n;
+		float qx = x + cosf(a) * r, qy = y + sinf(a) * r;
+		hl(c, px, py, qx, qy, v, mat);
+		px = qx;
+		py = qy;
+	}
+}
+
+static void carve_crown(us_canvas *c, const tree_t *tr, float x, float y, float R, float keep, int lobed)
+{
+	float lmin = lobed ? tr->lmin : 1.0f, lmax = lobed ? tr->lmax : 1.0f;
+	float rmin2 = R * R * lmin * lmin, rmax2 = R * R * lmax * lmax;
+	float E = R * lmax, inv = 1.0f / c->s;
+	int y0 = (int)floorf((y - E) * c->s), y1 = (int)ceilf((y + E) * c->s);
+	int k8 = (int)(keep * 256.0f);
+	for (int j = y0 < 0 ? 0 : y0; j <= y1 && j < c->h; j++) {
+		float dy = (j + 0.5f) * inv - y, dy2 = dy * dy;
+		if (dy2 > rmax2)
+			continue;
+		/* row span of the outer disc, and of the inner disc that needs no outline test */
+		float ho = sqrtf(rmax2 - dy2), hi = dy2 < rmin2 ? sqrtf(rmin2 - dy2) : -1.0f;
+		int i0 = (int)floorf((x - ho) * c->s), i1 = (int)ceilf((x + ho) * c->s);
+		int a0 = hi >= 0 ? (int)ceilf((x - hi) * c->s - 0.5f) : 1 << 30, a1 = hi >= 0 ? (int)floorf((x + hi) * c->s - 0.5f) : -(1 << 30);
+		if (i0 < 0)
+			i0 = 0;
+		if (i1 > c->w - 1)
+			i1 = c->w - 1;
+		uint8_t *row = c->ink + (size_t)j * c->w;
+		for (int i = i0; i <= i1; i++) {
+			if (i >= a0 && i <= a1) {
+				row[i] = (uint8_t)((row[i] * k8) >> 8);
+				continue;
+			}
+			float dx = (i + 0.5f) * inv - x;
+			float r2 = dx * dx + dy2;
+			if (r2 > rmax2)
+				continue;
+			if (lobed) { /* only the rim band needs the lobed outline */
+				float th = fast_atan2(dy, dx);
+				if (th < 0)
+					th += US_TAU;
+				float fv = th / US_TAU * TREE_V;
+				int k = (int)fv % TREE_V;
+				float rr = R * us_lerp(tr->lob[k], tr->lob[(k + 1) % TREE_V], fv - floorf(fv));
+				if (r2 > rr * rr)
+					continue;
+			}
+			row[i] = (uint8_t)((row[i] * k8) >> 8);
+		}
+	}
+}
+
 static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 {
 	st_t *st = sp;
@@ -422,11 +635,14 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 	st->ice = us_approach(st->ice, us_smooth(0.55f, 0.95f, winter), 6.0f, dt);
 	st->swell_env = us_approach(st->swell_env, us_sat(0.7f * a->bass + 0.6f * a->kick + 0.3f * a->sub), 0.35f, ctx->real_dt);
 	float wl = w->water_level;
-	float w_target = 0.085f + 0.13f * wl + 0.025f * a->swell + 0.045f * st->swell_env;
-	st->width = us_approach(st->width, w_target, 1.4f, dt);
+	/* the water edge only follows the slow phrase swell: bass is shown as current, not as a pulsing
+	 * bank (a pulsing edge smears into a glow under the trails) */
+	float w_target = 0.085f + 0.13f * wl + 0.02f * a->swell;
+	st->width = us_approach(st->width, w_target, 4.0f, dt);
 	/* the floodplain terraces follow the water level only slowly; bass swells the water over them */
 	st->bank_w = us_approach(st->bank_w, 0.085f + 0.13f * wl + 0.03f, 25.0f, dt);
-	float s_target = (0.05f + 0.09f * wl + 0.16f * us_sat(0.6f * a->mid + 0.4f * a->lowmid) + 0.1f * a->level) *
+	float s_target = (0.05f + 0.09f * wl + 0.14f * us_sat(0.6f * a->mid + 0.4f * a->lowmid) + 0.08f * a->level +
+			  0.06f * st->swell_env) *
 			 (1.0f - 0.35f * st->ice);
 	st->speed = us_approach(st->speed, s_target, 0.8f, dt);
 	st->flow_t += dt * (0.3f + 4.0f * st->speed);
@@ -437,6 +653,32 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 
 	build_channel(st, A, t);
 	build_grid(st, A, t);
+
+	/* ---- surges: every kick sends a pulse of faster, brighter water downstream ---- */
+	if (a->beat && fmaxf(a->kick, 0.6f * a->onset) > 0.2f && st->nsg < MAX_SURGE) {
+		surge_t *g = &st->sg[st->nsg++];
+		g->x = -0.08f;
+		g->amp = us_sat(0.35f + 0.8f * fmaxf(a->kick, 0.6f * a->onset));
+	}
+	memset(st->sgx, 0, sizeof(st->sgx));
+	for (int k = 0; k < st->nsg;) {
+		surge_t *g = &st->sg[k];
+		g->x += (0.3f + 2.2f * st->speed) * dt;
+		g->amp *= expf(-dt * 0.3f);
+		if (g->x > A + 0.25f || g->amp < 0.04f) {
+			*g = st->sg[--st->nsg];
+			continue;
+		}
+		for (int i = 0; i < NX; i++) {
+			float d = (A * i / (NX - 1) - g->x) / 0.085f;
+			if (d > -3.0f && d < 3.0f)
+				/* steep front, longer tail: a bore rolling downstream */
+				st->sgx[i] += g->amp * expf(-d * d * (d > 0 ? 2.0f : 0.5f));
+		}
+		k++;
+	}
+	for (int i = 0; i < NX; i++)
+		st->sgx[i] = us_sat(st->sgx[i]);
 	st->nrocks = 2 + (int)(dens * 4.0f + 0.5f);
 	if (st->nrocks > MAX_ROCKS)
 		st->nrocks = MAX_ROCKS;
@@ -606,12 +848,61 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 		if (st->ice > 0.4f) /* snow cap */
 			draw_rock(c, ctx->crisp, rk, x - rk->r * 0.1f, y - rk->r * 0.2f, 0.55f * st->ice, 0.5f);
 		/* standing waves upstream: arcs facing into the current, brighter when fast */
-		float bw = us_sat(st->speed * 5.0f);
-		for (int q = 0; q < 3; q++) {
-			float rr = rk->r * (1.35f + 0.38f * q) + 0.002f * sinf(t * 6.0f + q * 2.0f);
-			us_arc(c, x, y, rr, ang + US_PI - 1.15f + 0.15f * q, ang + US_PI + 1.15f - 0.15f * q, 0.0011f,
-			       (0.55f - 0.15f * q) * (0.4f + 0.6f * bw), US_MAT_WATER);
+		float sg = surge_at(st, x);
+		float bw = us_sat(st->speed * 5.0f + sg);
+		/* the pillow of water piled against the stone: more crests, pushed further out, when a surge hits */
+		int nq = 3 + (int)(2.0f * sg + 0.5f);
+		for (int q = 0; q < nq; q++) {
+			float rr = rk->r * (1.35f + (0.38f + 0.12f * sg) * q) + 0.002f * sinf(t * (6.0f + 6.0f * sg) + q * 2.0f);
+			float spread = 1.15f - 0.15f * q + 0.2f * sg;
+			float av = (0.55f - 0.1f * q) * (0.4f + 0.6f * bw);
+			if (ctx->crisp)
+				us_arc(c, x, y, rr, ang + US_PI - spread, ang + US_PI + spread, 0.001f, av, US_MAT_WATER);
+			else
+				harc(c, x, y, rr, ang + US_PI - spread, ang + US_PI + spread, av * 1.1f, US_MAT_WATER);
 		}
+		/* white water: foam peels off both shoulders of the stone and rides the wake */
+		float frate = (2.0f + 30.0f * st->speed + 70.0f * sg) * (0.4f + 0.8f * dens);
+		st->foam_acc += frate * dt;
+		while (st->foam_acc >= 1.0f) {
+			st->foam_acc -= 1.0f;
+			if (st->nfm >= MAX_FOAM)
+				continue;
+			foam_t *f = &st->fm[st->nfm++];
+			float side = us_rand(r) < 0.5f ? -1.0f : 1.0f;
+			float th = ang + US_PI + side * us_randr(r, 0.5f, 1.4f);
+			float rr = rk->r * us_randr(r, 1.05f, 1.35f);
+			f->u = (x + cosf(th) * rr * 1.15f) / A;
+			f->y = y + sinf(th) * rr;
+			f->pu = f->u;
+			f->py = f->y;
+			f->life = 1.0f;
+			f->decay = us_randr(r, 0.35f, 0.9f);
+		}
+	}
+
+	/* ---- foam flecks ---- */
+	for (int i = 0; i < st->nfm;) {
+		foam_t *f = &st->fm[i];
+		float x = f->u * A, vx, vy, fo;
+		flow(st, x, f->y, t, &vx, &vy, &fo);
+		float sg = surge_at(st, x);
+		f->pu = f->u;
+		f->py = f->y;
+		x += vx * (1.0f + 0.9f * sg) * dt;
+		f->y += vy * (1.0f + 0.9f * sg) * dt;
+		f->u = x / A;
+		f->life -= dt * f->decay;
+		if (f->life <= 0 || x > A + 0.02f) {
+			*f = st->fm[--st->nfm];
+			continue;
+		}
+		float v = 0.85f * us_sat(f->life * 1.6f) * (1.0f - 0.3f * st->ice);
+		if (ctx->crisp)
+			us_point(c, x, f->y, 0.001f, v, US_MAT_WATER);
+		else
+			hl(c, f->pu * A, f->py, x, f->y, v, US_MAT_WATER);
+		i++;
 	}
 
 	/* ---- streamline particles ---- */
@@ -635,7 +926,8 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 		float x = q->u * A, y = q->y;
 		float vx, vy, foam;
 		flow(st, x, y, t, &vx, &vy, &foam);
-		float vx2 = vx, vy2 = vy;
+		float sg = surge_at(st, x);
+		float vx2 = vx * (1.0f + 0.9f * sg), vy2 = vy * (1.0f + 0.9f * sg);
 		float nxp = x + vx2 * dt, nyp = y + vy2 * dt;
 		q->age += dt;
 		float cc, h, s;
@@ -653,7 +945,7 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 		}
 		float sp = sqrtf(vx2 * vx2 + vy2 * vy2) * vnorm;
 		float fade = us_sat(q->age / 0.35f) * us_sat((q->life - q->age) / 0.5f);
-		float v = (0.16f + 0.3f * us_sat(sp) + 0.3f * energy + 0.35f * us_sat(foam)) * fade;
+		float v = (0.16f + 0.3f * us_sat(sp) + 0.3f * energy + 0.35f * us_sat(foam) + 0.22f * sg) * fade;
 		v *= (1.0f - 0.35f * st->ice) * (ctx->crisp ? 0.85f : 1.0f);
 		float px = q->u * A, py = q->y;
 		q->pu = q->u;
@@ -661,7 +953,43 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 		q->u = nxp / A;
 		q->y = nyp;
 		if (v > 0.02f)
-			hl(c, px, py, nxp, nyp, v, (foam > 0.5f) ? US_MAT_LIGHT : US_MAT_WATER);
+			hl(c, px, py, nxp, nyp, v, US_MAT_WATER);
+	}
+
+	/* ---- trout: shadows holding station against the current, darting upstream on hits ---- */
+	{
+		int nfish = 1 + (int)(dens * 3.0f + 0.5f);
+		float vis = 1.0f - 0.65f * st->ice;
+		for (int i = 0; i < nfish && i < MAX_FISH; i++) {
+			fish_t *f = &st->fish[i];
+			/* each fish has a favourite lie it slips back to after a dart */
+			float home = (i + 0.5f) / nfish + 0.12f * us_noise2(t * 0.02f, i * 7.1f);
+			f->hu = us_approach(f->hu, home, 7.0f, dt);
+			f->hs = us_clampf(f->hs + dt * 0.08f * us_noise2(t * 0.07f + i * 3.0f, 1.3f), -0.55f, 0.55f);
+			if (a->beat && us_rand(r) < 0.1f + 0.25f * a->onset) {
+				f->dart = 1.0f;
+				f->hu -= us_randr(r, 0.04f, 0.12f);
+				f->hs = us_clampf(f->hs + us_randr(r, -0.3f, 0.3f), -0.55f, 0.55f);
+			}
+			if (f->hu < 0.05f)
+				f->hu = 0.05f;
+			if (f->hu > 0.93f)
+				f->hu -= 0.002f;
+			float tau = 0.3f + 2.5f * (1.0f - f->dart);
+			float pu = f->u, ps = f->s;
+			f->u = us_approach(f->u, f->hu, tau, dt);
+			f->s = us_approach(f->s, f->hs, tau * 1.5f, dt);
+			f->dart = us_approach(f->dart, 0.0f, 0.5f, dt);
+			f->ph += dt * (4.0f + 14.0f * f->dart + 8.0f * st->speed);
+			float x = f->u * A, cc, h, sl;
+			chan(st, x, &cc, &h, &sl);
+			float y = cc + f->s * h * 0.85f;
+			/* head into the current, turned a little by sideways motion */
+			float vs = (f->s - ps) * h / fmaxf(dt, 1e-3f), vu = (f->u - pu) * A / fmaxf(dt, 1e-3f);
+			float tgt = US_PI + atanf(sl) - us_clampf(atan2f(vs, fmaxf(0.02f, -vu + 0.02f)), -0.35f, 0.35f);
+			f->hd = us_approach(f->hd, tgt, 0.25f, dt);
+			fish_draw(c, x, y, f->hd, f->len, sinf(f->ph) * (0.6f + 0.8f * f->dart), vis);
+		}
 	}
 
 	/* ---- floating leaves (autumn), petals (spring), bits of ice (winter) ---- */
@@ -719,6 +1047,57 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 		}
 	}
 
+	/* ---- sun glints: sparkles on the moving water, livelier with the highs ---- */
+	{
+		float sun = 0.25f + 0.75f * w->daylight;
+		float grate = (5.0f + 55.0f * us_sat(0.5f * a->high + 0.6f * a->air) + 25.0f * energy) * sun *
+			      (0.3f + 0.9f * dens) * (1.0f - 0.5f * st->ice);
+		st->glint_acc += grate * dt;
+		while (st->glint_acc >= 1.0f) {
+			st->glint_acc -= 1.0f;
+			if (st->ngl >= MAX_GLINT)
+				continue;
+			glint_t *g = &st->gl[st->ngl++];
+			float x = us_rand(r) * A, cc, h, sl;
+			chan(st, x, &cc, &h, &sl);
+			g->u = x / A;
+			g->y = cc + us_randr(r, -0.75f, 0.75f) * h;
+			g->age = 0;
+			g->life = us_randr(r, 0.15f, 0.45f);
+			g->sz = us_randr(r, 0.003f, 0.009f);
+		}
+		for (int i = 0; i < st->ngl;) {
+			glint_t *g = &st->gl[i];
+			g->age += ctx->real_dt;
+			if (g->age >= g->life) {
+				*g = st->gl[--st->ngl];
+				continue;
+			}
+			float x = g->u * A, cc, h, sl, vx, vy, fo;
+			flow(st, x, g->y, t, &vx, &vy, &fo);
+			g->u += vx * dt / A;
+			g->y += vy * dt;
+			float v = sinf(US_PI * g->age / g->life);
+			v = v * v * (0.75f + 0.25f * sun);
+			(void)cc, (void)h, (void)sl;
+			if (ctx->crisp) {
+				us_point(c, x, g->y, 0.001f, v, US_MAT_LIGHT);
+				if (g->sz > 0.006f && v > 0.5f) {
+					float q = 1.5f / c->s;
+					us_line(c, x - q, g->y, x + q, g->y, 0.001f, v * 0.6f, US_MAT_LIGHT);
+					us_line(c, x, g->y - q, x, g->y + q, 0.001f, v * 0.6f, US_MAT_LIGHT);
+				}
+			} else {
+				float L = g->sz * (0.5f + 0.5f * v);
+				hl(c, x - L, g->y, x + L, g->y, v, US_MAT_LIGHT);
+				hl(c, x, g->y - L * 0.7f, x, g->y + L * 0.7f, v, US_MAT_LIGHT);
+				hl(c, x - L * 0.3f, g->y - L * 0.3f, x + L * 0.3f, g->y + L * 0.3f, v * 0.5f, US_MAT_LIGHT);
+				hl(c, x - L * 0.3f, g->y + L * 0.3f, x + L * 0.3f, g->y - L * 0.3f, v * 0.5f, US_MAT_LIGHT);
+			}
+			i++;
+		}
+	}
+
 	/* ---- reed clumps on the banks: fans of blades seen from above, swaying with highs ---- */
 	{
 		int nr = (int)(MAX_REEDS * (0.3f + 0.7f * dens));
@@ -728,13 +1107,26 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 			reed_t *d = &st->rd[i];
 			float x = d->u * A, cc, h, s;
 			chan(st, x, &cc, &h, &s);
-			/* rooted on the (slow) bank, not the pulsing water edge */
+			/* rooted on the (slow) bank, not the water edge: in a flood they stand in the shallows */
 			float fi = us_clampf(x / A, 0, 1) * (NX - 1);
 			float hbk = st->hb[(int)fi];
-			float by = cc + d->side * (hbk - 0.026f + d->off);
+			float by = cc + d->side * (hbk - 0.014f + d->off);
 			float sway = us_noise2(x * 2.5f - st->wind_t * 0.7f, d->ph) * (0.1f + 0.7f * wind) +
 				     0.1f * sinf(st->wind_t * 2.3f + d->ph) * wind;
 			float base = (d->side > 0 ? -US_PI * 0.5f : US_PI * 0.5f) + d->lean * 0.5f;
+			if (ctx->crisp) {
+				/* at pixel scale a fan of 5-8 blades fills in to a blob: three long, distinct blades */
+				for (int b = 0; b < 3; b++) {
+					float spread = (b - 1) * 0.75f;
+					float L = d->len * (b == 1 ? 1.35f : 1.05f) * (0.75f + 0.25f * green);
+					float a0 = base + spread + sway * 0.8f;
+					float tx = x + cosf(a0) * L, ty = by + sinf(a0) * L;
+					us_line(c, x, by, tx, ty, 0.001f, 0.62f + 0.12f * green, rm);
+					if (b == 1 && (i % 2) == 0)
+						us_point(c, x + cosf(a0) * L * 0.85f, by + sinf(a0) * L * 0.85f, 0.0012f, 0.7f, US_MAT_STEM);
+				}
+				continue;
+			}
 			int nb = 5 + (i % 4);
 			for (int b = 0; b < nb; b++) {
 				float hsh = sinf(i * 12.9898f + b * 78.233f) * 43758.5f;
@@ -753,6 +1145,82 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 					us_line(c, x, by, hx, hy, 0.0011f, 0.5f, US_MAT_STEM);
 					us_line(c, x + cosf(a0) * L * 0.7f, by + sinf(a0) * L * 0.7f, hx, hy, 0.0036f, 0.62f, US_MAT_STEM);
 				}
+			}
+		}
+	}
+
+	/* ---- trees on the banks, seen from above: lobed crowns overhanging the water, casting shade;
+	 *      golden in autumn, bare branches in winter ---- */
+	{
+		int ntree = 3 + (int)(dens * 9.0f + 0.5f);
+		if (ntree > MAX_TREES)
+			ntree = MAX_TREES;
+		float bare = us_smooth(0.45f, 0.85f, winter);
+		float gold = us_smooth(0.35f, 0.8f, autumn);
+		uint8_t cm = gold > 0.5f ? US_MAT_LIGHT : US_MAT_LEAF;
+		for (int i = 0; i < ntree; i++) {
+			tree_t *tr = &st->tree[i];
+			float x = tr->u * A, cc, h, sl;
+			chan(st, x, &cc, &h, &sl);
+			float hbk = st->hb[(int)(us_clampf(tr->u, 0, 1) * (NX - 1))];
+			float y = cc + tr->side * (hbk + tr->off);
+			float sw = 0.004f * (0.3f + wind);
+			float ox = sw * us_noise2(st->wind_t * 0.6f, tr->ph), oy = sw * 0.6f * us_noise2(tr->ph, st->wind_t * 0.6f);
+			float R = tr->r * (0.75f + 0.25f * (1.0f - bare));
+			float crown = 1.0f - bare;
+			/* the crown's shadow falls on the water, down and to the right of it */
+			if (crown > 0.05f) {
+				carve_crown(c, tr, x + R * 0.35f, y + R * 0.3f, R * 0.95f, us_lerp(1.0f, 0.45f, crown), 0);
+				carve_crown(c, tr, x + ox, y + oy, R * (0.6f + 0.4f * crown), us_lerp(1.0f, 0.0f, crown), 1);
+			}
+			float cx = x + ox, cy = y + oy;
+			if (crown > 0.05f) {
+				float pts[2 * (TREE_V + 1)];
+				for (int v = 0; v <= TREE_V; v++) {
+					int k = v % TREE_V;
+					float th = US_TAU * k / TREE_V;
+					pts[2 * v] = cx + cosf(th) * R * tr->lob[k];
+					pts[2 * v + 1] = cy + sinf(th) * R * tr->lob[k];
+				}
+				if (ctx->crisp) {
+					for (int v = 0; v < TREE_V; v++)
+						us_tri(c, cx, cy, pts[2 * v], pts[2 * v + 1], pts[2 * v + 2], pts[2 * v + 3], 0.32f * crown, cm);
+					/* sunlit upper-left lump */
+					us_disc(c, cx - R * 0.22f, cy - R * 0.22f, R * 0.5f, 0.5f * crown, cm);
+					us_disc(c, cx - R * 0.34f, cy - R * 0.32f, R * 0.22f, 0.7f * crown, cm);
+					us_polyline(c, pts, TREE_V + 1, 0.001f, 0.45f * crown, cm);
+				} else {
+					hpoly(c, pts, TREE_V + 1, 0.5f * crown, cm);
+					/* leaf clumps: little crescents on their shaded (lower-right) side, the way a crown is
+					 * drawn from above; they shiver with the wind */
+					int nq = 26;
+					for (int q = 0; q < nq; q++) {
+						float h1 = sinf(q * 12.9898f + tr->ph * 3.1f) * 43758.5453f;
+						h1 -= floorf(h1);
+						float h2 = h1 * 9.17f - floorf(h1 * 9.17f);
+						float rr = R * 0.82f * sqrtf(h1), th = US_TAU * h2;
+						float qx = cx + cosf(th) * rr, qy = cy + sinf(th) * rr;
+						float qr = R * (0.13f + 0.08f * h2) * (1.0f - 0.35f * rr / R);
+						float jit = 0.25f * wind * us_noise2(st->wind_t * 1.3f, q + tr->ph);
+						harc(c, qx, qy, qr, -0.2f + jit, 2.0f + jit, (0.42f - 0.18f * rr / R) * crown, cm);
+					}
+				}
+			}
+			/* limbs: faint through the leaves, the whole picture in winter */
+			float lv = (ctx->crisp ? 0.0f : 0.05f) * crown + 0.5f * bare;
+			if (lv > 0.02f) {
+				for (int b = 0; b < 6; b++) {
+					float th = tr->ph + b * US_TAU / 6.0f + 0.2f * sinf(tr->ph * 3.0f + b);
+					float L1 = R * (0.55f + 0.1f * (b % 3));
+					float ex = cx + cosf(th) * L1, ey = cy + sinf(th) * L1;
+					hl(c, x, y, ex, ey, lv, US_MAT_STEM);
+					for (int k = -1; k <= 1; k += 2) {
+						float t2 = th + k * 0.45f;
+						hl(c, ex, ey, ex + cosf(t2) * R * 0.38f, ey + sinf(t2) * R * 0.38f, lv * 0.8f, US_MAT_STEM);
+					}
+				}
+				if (bare > 0.5f)
+					us_disc(c, x, y, R * 0.06f, 0.6f * bare, US_MAT_STEM);
 			}
 		}
 	}
