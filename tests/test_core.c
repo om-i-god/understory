@@ -1,4 +1,5 @@
 /* Core unit tests: analyser, world, rasteriser, compose, every scene survives every style. */
+#include "core/us_journey.h"
 #include "../src/core/us_scene.h"
 #include "../src/core/us_math.h"
 #include <stdio.h>
@@ -177,6 +178,46 @@ static void test_scenes(void)
 	us_analyzer_destroy(an);
 }
 
+static void test_journey(void)
+{
+	us_journey j;
+	us_journey_init(&j, 7);
+	us_world w;
+	us_world_init(&w);
+	us_audio a;
+	memset(&a, 0, sizeof(a));
+	a.active = 1;
+	int cur = 0, switches = 0, early = 0;
+	float since = 0, dt = 1.0f / 30;
+	for (int f = 0; f < 30 * 600; f++) {
+		float t = f * dt;
+		int loud = ((int)(t / 40)) % 2; /* 40 s quiet / 40 s loud sections */
+		a.level = loud ? 0.85f : 0.15f;
+		a.swell = us_approach(a.swell, a.level, 8, dt);
+		a.centroid = 0.4f;
+		a.beat = loud && (f % 15 == 0);
+		since += dt;
+		int nx = us_journey_step(&j, &a, &w, dt, cur, 30, 120);
+		if (nx >= 0) {
+			CHECK(nx != cur && nx < us_scene_count, "journey picked an invalid scene");
+			if (since < 30 - 1e-3f)
+				early++;
+			since = 0;
+			cur = nx;
+			switches++;
+		}
+	}
+	CHECK(early == 0, "journey switched before min dwell");
+	CHECK(switches >= 5 && switches <= 20, "journey switched %d times in 10 min", switches);
+	/* silence: no turning points, only the max-dwell timeout */
+	memset(&a, 0, sizeof(a));
+	switches = 0;
+	for (int f = 0; f < 30 * 100; f++)
+		if (us_journey_step(&j, &a, &w, dt, cur, 30, 120) >= 0)
+			switches++;
+	CHECK(switches <= 1, "journey wandered in silence (%d)", switches);
+}
+
 int main(void)
 {
 	test_raster();
@@ -184,6 +225,7 @@ int main(void)
 	test_audio();
 	test_world();
 	test_scenes();
+	test_journey();
 	if (fails) {
 		printf("%d failure(s)\n", fails);
 		return 1;

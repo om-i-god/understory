@@ -14,6 +14,7 @@
  */
 #include "../src/core/us_scene.h"
 #include "../src/core/us_math.h"
+#include "../src/core/us_journey.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -123,6 +124,7 @@ int main(int argc, char **argv)
 	const char *scene = "meadow", *audio = NULL, *out = "out", *world_in = NULL, *world_out = NULL, *at = NULL;
 	int style = US_STYLE_INK, fps = 30, ow = 1280, oh = 720, pixel = 4, every = 0, palette = 0, invert = 0, stats = 0;
 	int synth = 0, stats_every = 0;
+	float journey = 0; /* >0: follow-the-music director, value = min dwell seconds */
 	float start = 0, seconds = 10, prewarm = 0, wspeed = 1;
 	us_params prm = {0.5f, 0.5f, 0.5f};
 	float trails = 0;
@@ -158,6 +160,7 @@ int main(int argc, char **argv)
 		else if (ARG("--world")) world_in = v;
 		else if (ARG("--world-out")) world_out = v;
 		else if (ARG("--world-speed")) wspeed = (float)atof(v);
+		else if (ARG("--journey")) journey = (float)atof(v);
 		else { fprintf(stderr, "unknown arg %s\n", k); return 2; }
 #undef ARG
 	}
@@ -243,6 +246,24 @@ int main(int argc, char **argv)
 		us_analyzer_update(an, dt, 1.0f, 1.0f, 1.0f, 1.0f, &feat);
 		clock += dt;
 		double r0 = now_s();
+		if (journey > 0) {
+			static us_journey jn;
+			static int jinit;
+			if (!jinit) {
+				us_journey_init(&jn, seed);
+				jinit = 1;
+			}
+			int cur = 0;
+			for (int k = 0; k < us_scene_count; k++)
+				if (us_scene_list[k] == e.vt)
+					cur = k;
+			int nx = us_journey_step(&jn, &feat, us_engine_world(&e), dt, cur, journey, journey * 5);
+			if (nx >= 0) {
+				printf("journey t=%6.1f %s -> %s  (mood e=%.2f fast=%.2f bright=%.2f perc=%.2f)\n", t,
+				       e.vt->id, us_scene_list[nx]->id, jn.energy, jn.fast_energy, jn.bright, jn.perc);
+				us_engine_set_scene(&e, us_scene_list[nx]->id, e.seed);
+			}
+		}
 		us_engine_frame(&e, &feat, dt, clock);
 		render_time += now_s() - r0;
 		rendered++;

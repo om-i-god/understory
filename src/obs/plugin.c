@@ -7,9 +7,11 @@
 #include <pthread.h>
 #include <string.h>
 #include <stdio.h>
+#include <math.h>
 
 #include "core/us_scene.h"
 #include "core/us_math.h"
+#include "core/us_journey.h"
 
 OBS_DECLARE_MODULE()
 OBS_MODULE_USE_DEFAULT_LOCALE("understory", "en-US")
@@ -42,6 +44,8 @@ typedef struct us_src {
 	int scene_idx;
 	float sensitivity, bass_gain, mid_gain, high_gain;
 	float auto_cycle_min;
+	int scene_mode; /* 0 manual, 1 in order, 2 follow the music */
+	us_journey journey;
 	double cycle_timer;
 	int out_w, out_h;
 
@@ -159,6 +163,7 @@ static void apply_settings(us_src *s, obs_data_t *st)
 	s->mid_gain = (float)obs_data_get_double(st, "mid_gain");
 	s->high_gain = (float)obs_data_get_double(st, "high_gain");
 	s->auto_cycle_min = (float)obs_data_get_double(st, "auto_cycle");
+	s->scene_mode = (int)obs_data_get_int(st, "scene_mode");
 
 	const char *aname = obs_data_get_string(st, "audio_source");
 	int rehook = !s->audio_name || strcmp(s->audio_name, aname) != 0 || !s->audio_weak;
@@ -198,7 +203,8 @@ static void src_defaults(obs_data_t *st)
 	obs_data_set_default_bool(st, "link_world", true);
 	obs_data_set_default_double(st, "world_speed", 1.0);
 	obs_data_set_default_double(st, "xfade", 2.0);
-	obs_data_set_default_double(st, "auto_cycle", 0.0);
+	obs_data_set_default_int(st, "scene_mode", 0);
+	obs_data_set_default_double(st, "auto_cycle", 1.5);
 	obs_data_set_default_int(st, "seed", 1);
 }
 
@@ -256,6 +262,13 @@ static bool style_changed(obs_properties_t *props, obs_property_t *p, obs_data_t
 	return true;
 }
 
+static bool mode_changed(obs_properties_t *props, obs_property_t *p, obs_data_t *st)
+{
+	(void)p;
+	obs_property_set_visible(obs_properties_get(props, "auto_cycle"), obs_data_get_int(st, "scene_mode") != 0);
+	return true;
+}
+
 static obs_properties_t *src_properties(void *data)
 {
 	obs_properties_t *props = obs_properties_create();
@@ -296,7 +309,13 @@ static obs_properties_t *src_properties(void *data)
 	obs_properties_add_float_slider(nat, "reactivity", T_("Reactivity"), 0.0, 1.0, 0.01);
 	obs_properties_add_float_slider(nat, "trails", T_("Trails"), -0.5, 0.5, 0.01);
 	obs_properties_add_float_slider(nat, "xfade", T_("Crossfade"), 0.0, 10.0, 0.1);
-	p = obs_properties_add_float_slider(nat, "auto_cycle", T_("AutoCycle"), 0.0, 30.0, 0.5);
+	p = obs_properties_add_list(nat, "scene_mode", T_("SceneMode"), OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+	obs_property_list_add_int(p, T_("SceneMode.Manual"), 0);
+	obs_property_list_add_int(p, T_("SceneMode.Order"), 1);
+	obs_property_list_add_int(p, T_("SceneMode.Follow"), 2);
+	obs_property_set_long_description(p, T_("SceneMode.Help"));
+	obs_property_set_modified_callback(p, mode_changed);
+	p = obs_properties_add_float_slider(nat, "auto_cycle", T_("AutoCycle"), 0.25, 30.0, 0.25);
 	obs_property_set_long_description(p, T_("AutoCycle.Help"));
 	obs_properties_add_int(nat, "seed", T_("Seed"), 0, 99999, 1);
 	obs_properties_add_button2(nat, "reseed", T_("Reseed"), reseed_clicked, data);
@@ -371,6 +390,7 @@ static void *src_create(obs_data_t *settings, obs_source_t *source)
 	us_engine_init(&s->eng);
 	s->an = us_analyzer_create();
 	s->sensitivity = s->bass_gain = s->mid_gain = s->high_gain = 1.0f;
+	us_journey_init(&s->journey, (uint32_t)(uintptr_t)s);
 
 	obs_enter_graphics();
 	struct gs_sampler_info si = {0};
@@ -429,16 +449,26 @@ static void src_tick(void *data, float seconds)
 			obs_source_release(a);
 	}
 
-	if (s->auto_cycle_min > 0.01f) {
+	us_analyzer_update(s->an, seconds, s->sensitivity, s->bass_gain, s->mid_gain, s->high_gain, &s->last_audio);
+
+	float per_scene = fmaxf(s->auto_cycle_min, 0.25f) * 60.0f;
+	if (s->scene_mode == 1) {
 		s->cycle_timer += seconds;
-		if (s->cycle_timer > s->auto_cycle_min * 60.0) {
+		if (s->cycle_timer > per_scene) {
 			s->cycle_timer = 0;
 			s->scene_idx = (s->scene_idx + 1) % us_scene_count;
 			us_engine_set_scene(&s->eng, us_scene_list[s->scene_idx]->id, s->eng.seed);
 		}
+	} else if (s->scene_mode == 2) {
+		pthread_mutex_lock(&g_world_mu);
+		int nx = us_journey_step(&s->journey, &s->last_audio, us_engine_world(&s->eng), seconds, s->scene_idx,
+					 per_scene, per_scene * 4.0f);
+		pthread_mutex_unlock(&g_world_mu);
+		if (nx >= 0) {
+			s->scene_idx = nx;
+			us_engine_set_scene(&s->eng, us_scene_list[nx]->id, s->eng.seed);
+		}
 	}
-
-	us_analyzer_update(s->an, seconds, s->sensitivity, s->bass_gain, s->mid_gain, s->high_gain, &s->last_audio);
 	double clock = (double)obs_get_video_frame_time() * 1e-9;
 	pthread_mutex_lock(&g_world_mu);
 	us_engine_frame(&s->eng, &s->last_audio, seconds, clock);

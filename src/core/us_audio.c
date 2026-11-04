@@ -281,7 +281,8 @@ void us_analyzer_update(us_analyzer *an, float dt, float sens, float bass_gain, 
 	float w = (mid_e + side_e) > 1e-9f ? us_sat(sqrtf(side_e / (mid_e + 1e-12f)) * 1.5f) : 0;
 	st->width = follow(st->width, w, 0.2f, 0.6f, dt);
 
-	if (!have_audio || st->level < 0.06f)
+	/* silence is absolute (below ~-62 dBFS), so a soft pad still counts as music */
+	if (!have_audio || dbfs < -62.0f)
 		st->silence += dt;
 	else
 		st->silence = 0;
