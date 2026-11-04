@@ -28,6 +28,15 @@ breathing.
 | Coral | low-mids feed a slowly creeping reaction-diffusion reef |
 | Aurora | stereo width and shimmer ripple the curtains; bass surges their light |
 
+### Follow the music
+
+Set **Scene changes → Follow the music** and Understory becomes a director: it learns the character
+of your set (how loud, how bright, how percussive, relative to the set itself) and the state of the
+living world, and moves to a fitting scene at musical turning points — a drop landing might bring the
+murmuration or the storm, a breakdown opens onto the tide, coral or aurora. A long storm charge makes
+Storm Front more likely, a wet world favours the river, a summer night favours fireflies. Scenes
+dissolve into each other and always stay at least the minutes you set, so each has time to grow.
+
 ### One living world
 
 All Understory sources share a hidden ecosystem that remembers your set. A long storm swells the
@@ -42,17 +51,25 @@ between OBS sessions; **Reset world** in the source settings starts fresh.
 - **Pixel** — low resolution, crisp pixels, six palettes (Moss, Dusk, Riverbed, Ember, Glacier, Lichen).
 - **Mono-pixel** — pixel resolution, one colour, sixteen brightness levels.
 
-**Tint** colours Ink and Mono-pixel. **Paper** inverts to dark ink on a light ground.
+**Bloom** adds a soft two-scale light around bright lines in Ink — fireflies get halos, aurora and
+lightning glow. **Tint** colours Ink and Mono-pixel. **Paper** inverts to dark ink on a light ground.
 Style, tint and palette can change live without resetting the scene.
 
 ## Controls
 
 - **Scene**, **Listen to** (any audio source).
-- **Look:** style, tint, palette, pixel size, ink resolution, faint-line lift, paper, output size.
-- **Nature:** density, speed, reactivity, trails, scene crossfade time, auto-cycle (minutes), seed.
+- **Look:** style, tint, palette, pixel size, ink resolution, bloom, faint-line lift, paper, output size.
+- **Nature:** density, speed, reactivity, trails, scene crossfade time, scene changes (stay / cycle in
+  order / follow the music), minutes per scene, seed.
 - **Listening:** sensitivity, bass / mids / highs gain. The analyser auto-levels, so quiet and loud mixes both work.
 - **World:** share the living world (on by default), world speed, reset world.
 - **Hotkeys** (Settings → Hotkeys): next scene, previous scene, cycle style.
+
+## Performance
+
+Each Understory source draws on its own worker thread; OBS's video thread only uploads finished
+frames, so a busy moment in a scene never stalls your stream. Ink draws at 0.67× the output size by
+default (a 1080p source draws at ~720p and upscales smoothly); raise **Ink resolution** for finer lines.
 
 ## Install (macOS, Apple Silicon, OBS 32)
 
@@ -71,8 +88,9 @@ cmake -S . -B build -DUNDERSTORY_BUILD_PLUGIN=OFF && cmake --build build -j
 ./build/us_tests                                          # core + every scene × every style
 ./build/us_render --scene storm --synth --style ink --prewarm 40 --start 40 --seconds 10 --every 3 --out out/storm
 ./build-obs/obs_host_test build-obs/understory.plugin out/host meadow 4   # loads into OBS.app's libobs headless
+US_BIG=1 ./build-obs/obs_host_test build-obs/understory.plugin out/host storm 5  # 1080p: fails if OBS lags
 ```
 
 `us_render` renders any scene with real audio (`ffmpeg -i song.wav -f f32le -ac 2 -ar 48000 song.f32`
-then `--audio song.f32`) or a built-in test track, to frames you can turn into GIFs or video.
+then `--audio song.f32`) or a built-in test track (`--journey 30` runs the follow-the-music director with a 30 s minimum), to frames you can turn into GIFs or video.
 See `docs/design.md` for the architecture and `docs/scene-guide.md` for writing new scenes.
