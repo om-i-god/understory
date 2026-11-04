@@ -20,9 +20,12 @@
 
 #define MAX_NODES 10000
 #define MAX_TIPS 200
-#define MAX_PULSES 16
+#define MAX_PULSES 24
 #define MAX_LINKS 600
-#define MAX_MUSH 7
+#define MAX_MUSH 14
+#define MAX_GERM 8
+#define RX 8 /* coverage regions across the soil */
+#define RY 4
 #define MAX_SPORES 220
 #define MAX_PLANTS 4
 #define ROOT_SEGS 48
@@ -66,9 +69,15 @@ typedef struct {
 	float g;    /* growth 0..1 */
 	float age, life;
 	float h, r; /* stipe height, cap radius */
-	float lean, puff;
-	int alive;
+	float lean, puff, glow;
+	int alive, kind; /* kind 0 parasol, 1 inkcap bell, 2 spotted dome */
+	int feed;        /* the thread that feeds it (pulses arriving here make it glow + puff) */
+	float feed_born;
 } mush_t;
+
+typedef struct {
+	float x, y, t; /* fraction of width, y, sim time of germination */
+} germ_t;
 
 typedef struct {
 	float x, y, vx, vy, life;
@@ -121,6 +130,10 @@ typedef struct {
 	float pebble[8][3];
 
 	float bass_env, sway_t, glow_env, prev_kick, frame_dt;
+	float empty_t[RX * RY]; /* how long each soil region has been (nearly) empty */
+	float germ_cool;
+	germ_t germ[MAX_GERM];
+	int ngerm;
 	float dmin[256], dmin_next[256]; /* per colony: path distance of its oldest living thread (pulse source) */
 } st_t;
 
@@ -207,17 +220,28 @@ static void add_tip(st_t *st, int node, float ang, float vig)
 	t->vig = vig;
 }
 
-static void new_colony(st_t *st, float A)
+static void new_colony_at(st_t *st, float xf, float y)
 {
 	us_rng *r = &st->rng;
-	float xf = us_randr(r, 0.08f, 0.92f);
-	float y = us_randr(r, soil_y(xf) + 0.12f, 0.9f);
 	int c = st->ncolonies++ & 255;
 	int n = new_node(st, -1, xf, y, 0, c);
 	int k = 3 + (int)(us_rand(r) * 3);
 	float a0 = us_rand(r) * US_TAU;
 	for (int i = 0; i < k; i++)
 		add_tip(st, n, a0 + US_TAU * i / k + us_randn(r) * 0.2f, 1.0f);
+	/* the spore itself, swelling and sprouting */
+	germ_t *g = &st->germ[st->ngerm < MAX_GERM ? st->ngerm++ : (int)(us_rand(r) * MAX_GERM)];
+	g->x = xf;
+	g->y = y;
+	g->t = st->t;
+}
+
+static void new_colony(st_t *st, float A)
+{
+	us_rng *r = &st->rng;
+	float xf = us_randr(r, 0.08f, 0.92f);
+	float y = us_randr(r, soil_y(xf) + 0.12f, 0.9f);
+	new_colony_at(st, xf, y);
 	(void)A;
 }
 
@@ -280,6 +304,13 @@ static void grow(st_t *st, float A, float sp, float branch_p, float dt)
 			float dxv = cosf(t->ang), dyv = sinf(t->ang);
 			dyv += ty * 0.6f;
 			t->ang = atan2f(dyv, dxv);
+			/* avoidance: hyphae turn toward unexplored soil (fewer threads ahead-left vs ahead-right) */
+			{
+				float la = t->ang + 0.6f, ra = t->ang - 0.6f, L = STEP * 5.0f;
+				int cl = st->cell_cnt[cell_of((x + cosf(la) * L) / A, y + sinf(la) * L)];
+				int cr = st->cell_cnt[cell_of((x + cosf(ra) * L) / A, y + sinf(ra) * L)];
+				t->ang += us_clampf(0.05f * (float)(cr - cl), -0.25f, 0.25f);
+			}
 			float nx = x + cosf(t->ang) * STEP, ny = y + sinf(t->ang) * STEP;
 			if (nx < 0.006f || nx > A - 0.006f || ny > 0.99f || ny < sy + 0.008f ||
 			    st->cell_cnt[cell_of(nx / A, ny)] > CROWD) { /* edges + crowding: tips stop */
@@ -480,6 +511,28 @@ static void wu_line(us_canvas *c, float ax, float ay, float bx, float by, float 
 	}
 }
 
+/* 1-px crisp line for pixel canvases that always claims the material (ink still max-blends), so a bright
+ * LIGHT pulse head doesn't linger in the trails as gold threads: the thread's own STEM takes it back */
+static void px_line(us_canvas *c, float ax, float ay, float bx, float by, float v, uint8_t mat)
+{
+	float x0 = ax * c->s, y0 = ay * c->s, x1 = bx * c->s, y1 = by * c->s;
+	float dx = x1 - x0, dy = y1 - y0;
+	int n = (int)ceilf(fmaxf(fabsf(dx), fabsf(dy)));
+	if (n < 1)
+		n = 1;
+	float ix = dx / n, iy = dy / n;
+	int iv = (int)(us_sat(v) * 255.0f + 0.5f);
+	for (int k = 0; k <= n; k++) {
+		int px = (int)(x0 + ix * k), py = (int)(y0 + iy * k);
+		if ((unsigned)px >= (unsigned)c->w || (unsigned)py >= (unsigned)c->h)
+			continue;
+		size_t i = (size_t)py * c->w + px;
+		if (iv > c->ink[i])
+			c->ink[i] = (uint8_t)iv;
+		c->mat[i] = mat;
+	}
+}
+
 /* colony of a random living thread (bigger colonies fire more often) */
 static int pick_colony(st_t *st)
 {
@@ -507,9 +560,9 @@ static float pulse_glow(const st_t *st, const node_t *n, float *head)
 			continue;
 		/* sharp leading edge, softer tail */
 		float w = e < 0 ? PULSE_W * 0.6f : PULSE_W * 1.3f;
-		g += p->s * expf(-(e * e) / (w * w)) * expf(-front * 0.45f);
+		g += p->s * expf(-(e * e) / (w * w)) * expf(-front * 0.3f);
 		if (head && e >= 0 && e < STEP + PULSE_V * st->frame_dt * 1.3f)
-			*head = fmaxf(*head, p->s * expf(-front * 0.35f));
+			*head = fmaxf(*head, p->s * expf(-front * 0.3f));
 	}
 	return g;
 }
@@ -549,6 +602,39 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 		new_colony(st, A);
 		st->spore_t = us_randr(r, 20.0f, 45.0f);
 	}
+	/* coverage guarantee: soil regions that stay (nearly) empty get a spore germinating in them */
+	{
+		int cnt[RX * RY] = {0};
+		int y0 = (int)(0.2f * GY);
+		for (int cy = y0; cy < GY; cy++) {
+			int ry = (cy - y0) * RY / (GY - y0);
+			for (int cx = 0; cx < GX; cx++)
+				cnt[ry * RX + cx * RX / GX] += st->cell_cnt[cy * GX + cx];
+		}
+		float expect = (float)st->nalive / (RX * RY);
+		int best = -1;
+		float bt = 0;
+		for (int k = 0; k < RX * RY; k++) {
+			if (cnt[k] < 6 + 0.12f * expect)
+				st->empty_t[k] += dt;
+			else
+				st->empty_t[k] = 0;
+			if (st->empty_t[k] > bt) {
+				bt = st->empty_t[k];
+				best = k;
+			}
+		}
+		st->germ_cool -= dt * (0.6f + 1.2f * st->bass_env);
+		if (best >= 0 && bt > 1.5f && st->germ_cool <= 0) {
+			int rx = best % RX, ry = best / RX;
+			float xf = (rx + us_randr(r, 0.2f, 0.8f)) / RX;
+			float yy = 0.2f + (ry + us_randr(r, 0.2f, 0.8f)) * (0.8f / RY);
+			yy = fmaxf(yy, soil_y(xf) + 0.04f);
+			new_colony_at(st, xf, fminf(yy, 0.95f));
+			st->empty_t[best] = 0;
+			st->germ_cool = us_randr(r, 1.5f, 4.0f);
+		}
+	}
 	float frac = (float)(st->nalive - st->ndying) / MAX_NODES;
 	us_world_add(w, &w->mycelium, 0.01f * (us_sat(frac * 1.4f) - w->mycelium) + 0.002f * st->bass_env * moist, dt);
 
@@ -559,7 +645,12 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 	int kick_hit = a->kick > st->prev_kick + 0.2f && a->kick > 0.3f;
 	st->prev_kick = a->kick;
 	if (kick_hit && st->pulse_cool <= 0 && st->npulses < MAX_PULSES) {
-		st->pulse[st->npulses++] = (pulse_t){st->t, us_sat(0.6f + 0.6f * a->kick), pick_colony(st)};
+		int c0 = pick_colony(st);
+		st->pulse[st->npulses++] = (pulse_t){st->t, us_sat(0.7f + 0.6f * a->kick), c0};
+		/* a second colony answers (kicks light the web in two places) */
+		int c1 = pick_colony(st);
+		if (c1 != c0 && st->npulses < MAX_PULSES && us_rand(r) < 0.45f)
+			st->pulse[st->npulses++] = (pulse_t){st->t, us_sat(0.6f + 0.5f * a->kick), c1};
 		st->pulse_cool = 0.18f;
 	} else if (st->idle_pulse_t <= 0 && st->npulses < MAX_PULSES) {
 		/* in quiet the network still breathes: slow faint pulses */
@@ -569,7 +660,7 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 	if (kick_hit)
 		st->idle_pulse_t = us_randr(r, 3.0f, 7.0f);
 	for (int k = 0; k < st->npulses;) {
-		if ((st->t - st->pulse[k].t0) * PULSE_V > 4.0f) {
+		if ((st->t - st->pulse[k].t0) * PULSE_V > 3.0f) {
 			st->pulse[k] = st->pulse[--st->npulses];
 			continue;
 		}
@@ -659,15 +750,28 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 			v += 0.45f * g;
 			/* pixel styles keep threads in the STEM ramp: a LIGHT mat would linger through the trails */
 			uint8_t m = g > 0.5f && !ctx->crisp ? US_MAT_LIGHT : US_MAT_STEM;
-			if (head > 0.12f) { /* the nutrient packet itself: a bright segment (trails turn it into a comet) */
-				v = 0.55f + 0.5f * head;
-				m = ctx->crisp ? US_MAT_STEM : US_MAT_LIGHT;
-			}
 			float x0 = q->x * A, y0 = q->y, x1 = n->x * A, y1 = n->y;
-			if (ctx->crisp || cord > 0.55f)
-				us_line(c, x0, y0, x1, y1, 0.0009f + 0.0022f * cord * cord, us_sat(v), m);
-			else
-				wu_line(c, x0, y0, x1, y1, us_sat(v * (1.0f + 0.3f * cord)), m);
+			if (head > 0.12f) {
+				/* the nutrient packet itself: a bright bead racing along the thread (trails make it a comet) */
+				float hv = us_sat(0.6f + 0.5f * head);
+				if (ctx->crisp)
+					px_line(c, x0, y0, x1, y1, hv, US_MAT_LIGHT);
+				else
+					us_line(c, x0, y0, x1, y1, 0.0016f + 0.002f * cord, hv, US_MAT_LIGHT);
+				continue;
+			}
+			if (ctx->crisp) {
+				px_line(c, x0, y0, x1, y1, v, m);
+			} else {
+				float vv = us_sat(v * (1.0f + 0.3f * cord));
+				wu_line(c, x0, y0, x1, y1, vv, m);
+				if (cord > 0.6f) { /* thick cords: a second hairline a pixel across */
+					float dx = x1 - x0, dy = y1 - y0, l = sqrtf(dx * dx + dy * dy) + 1e-6f;
+					float o = (cord - 0.45f) * 2.2f / c->s;
+					float ox = -dy / l * o, oy = dx / l * o;
+					wu_line(c, x0 + ox, y0 + oy, x1 + ox, y1 + oy, vv * 0.85f, m);
+				}
+			}
 		}
 		/* fusion links */
 		for (int k = 0; k < st->nlinks; k++) {
@@ -679,7 +783,10 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 			float v = 0.3f + 0.5f * g;
 			if (na->die > 0 || nb->die > 0)
 				v *= 0.4f;
-			us_line(c, na->x * A, na->y, nb->x * A, nb->y, 0.001f, us_sat(v), g > 0.5f ? US_MAT_LIGHT : US_MAT_STEM);
+			if (ctx->crisp)
+				px_line(c, na->x * A, na->y, nb->x * A, nb->y, us_sat(v), US_MAT_STEM);
+			else
+				wu_line(c, na->x * A, na->y, nb->x * A, nb->y, us_sat(v), g > 0.5f ? US_MAT_LIGHT : US_MAT_STEM);
 		}
 		for (int k = 0; k < 256; k++)
 			st->dmin[k] = st->dmin_next[k] < 1e8f ? st->dmin_next[k] : 0.0f;
@@ -690,28 +797,64 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 		}
 	}
 
-	/* ---- fruiting bodies ---- */
+	/* ---- germinating spores: a seed swells and a ring of first hyphae flicks out ---- */
+	for (int k = 0; k < st->ngerm;) {
+		germ_t *g = &st->germ[k];
+		float age = st->t - g->t;
+		if (age > 2.5f || age < 0) {
+			*g = st->germ[--st->ngerm];
+			continue;
+		}
+		float x = g->x * A, y = g->y, f = age / 2.5f;
+		us_disc(c, x, y, ctx->crisp ? 0.004f : 0.0026f, 0.9f - 0.4f * f, US_MAT_ACCENT);
+		if (!ctx->crisp)
+			us_ring(c, x, y, 0.004f + 0.016f * f, 0.001f, 0.55f * (1.0f - f), US_MAT_ACCENT);
+		k++;
+	}
+
+	/* ---- fruiting bodies: pop up above the soil where the network is rich and the world is wet/green ---- */
 	{
-		float fruit_ok = us_smooth(0.18f, 0.45f, frac) * us_smooth(0.2f, 0.5f, moist);
-		if (us_rand(r) < dt * 0.08f * fruit_ok * (0.5f + st->bass_env)) {
-			for (int m = 0; m < MAX_MUSH; m++) {
-				if (st->mush[m].alive)
-					continue;
-				/* fruit above a thread that reaches near the surface */
-				for (int tries = 0; tries < 40; tries++) {
-					node_t *n = &st->nd[(int)(us_rand(r) * MAX_NODES)];
-					if (!n->alive || n->die > 0 || n->y > soil_y(n->x) + 0.07f)
-						continue;
-					mush_t *mu = &st->mush[m];
-					mu->alive = 1;
-					mu->x = n->x;
-					mu->g = 0;
-					mu->age = 0;
-					mu->life = us_randr(r, 35.0f, 70.0f);
-					mu->h = us_randr(r, 0.018f, 0.045f);
-					mu->r = mu->h * us_randr(r, 0.45f, 0.7f);
-					mu->lean = us_randn(r) * 0.12f;
+		float autumn = us_world_season_w(w, 2), winter = us_world_winter(w);
+		float lush = 0.6f * moist + 0.5f * w->growth + 0.3f * w->mycelium;
+		float fruit_ok = us_smooth(0.1f, 0.3f, frac) * us_smooth(0.12f, 0.45f, lush) * (1.0f + 1.5f * autumn) *
+				 (1.0f - 0.8f * winter);
+		if (us_rand(r) < dt * 0.22f * fruit_ok * (0.4f + 1.2f * st->bass_env)) {
+			int mi = -1;
+			for (int m = 0; m < MAX_MUSH; m++)
+				if (!st->mush[m].alive) {
+					mi = m;
 					break;
+				}
+			/* fruit above a thread that reaches near the surface */
+			for (int tries = 0; tries < 60 && mi >= 0; tries++) {
+				int ni = (int)(us_rand(r) * MAX_NODES);
+				node_t *n = &st->nd[ni];
+				if (!n->alive || n->die > 0 || n->y > soil_y(n->x) + 0.08f || n->x < 0.03f || n->x > 0.97f)
+					continue;
+				int kind = (int)(us_rand(r) * 3.0f);
+				int sib = us_rand(r) < 0.5f ? 1 + (int)(us_rand(r) * 2.0f) : 0; /* clusters */
+				float h0 = kind == 0 ? us_randr(r, 0.06f, 0.1f) : kind == 1 ? us_randr(r, 0.045f, 0.075f)
+							       : us_randr(r, 0.04f, 0.065f);
+				for (int sbi = 0; sbi <= sib && mi >= 0; sbi++) {
+					mush_t *mu = &st->mush[mi];
+					memset(mu, 0, sizeof(*mu));
+					mu->alive = 1;
+					mu->kind = kind;
+					mu->x = us_clampf(n->x + (sbi ? us_randr(r, -0.025f, 0.025f) : 0.0f), 0.01f, 0.99f);
+					mu->g = sbi ? -us_randr(r, 0.1f, 0.6f) : 0.0f; /* siblings come up a little later */
+					mu->life = us_randr(r, 30.0f, 60.0f);
+					mu->h = h0 * (sbi ? us_randr(r, 0.45f, 0.75f) : 1.0f);
+					mu->r = mu->h * (kind == 0 ? us_randr(r, 0.55f, 0.75f) : kind == 1 ? us_randr(r, 0.3f, 0.38f)
+										 : us_randr(r, 0.45f, 0.6f));
+					mu->lean = us_randn(r) * 0.1f + (sbi ? (mu->x - n->x) * 6.0f : 0.0f);
+					mu->feed = ni;
+					mu->feed_born = n->born;
+					mi = -1;
+					for (int m = 0; m < MAX_MUSH; m++)
+						if (!st->mush[m].alive) {
+							mi = m;
+							break;
+						}
 				}
 				break;
 			}
@@ -722,59 +865,114 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 				continue;
 			mu->age += dt;
 			float wilt = us_sat((mu->age - mu->life) / 8.0f);
-			mu->g = us_sat(mu->g + dt * (0.08f + 0.25f * st->bass_env) * (1.0f - wilt));
+			/* growth comes in pushes with the bass: mushrooms "pop" */
+			mu->g = fminf(1.0f, mu->g + dt * (0.06f + 0.55f * st->bass_env) * (1.0f - wilt));
 			if (wilt >= 1.0f) {
 				mu->alive = 0;
 				continue;
 			}
-			float g = mu->g * mu->g * (3 - 2 * mu->g);
+			if (mu->g <= 0)
+				continue;
+			/* is the feeding thread still there? pulses arriving through it light the mushroom */
+			node_t *fn = &st->nd[mu->feed];
+			int fed = fn->alive && fn->born == mu->feed_born;
+			float pg = fed ? pulse_glow(st, fn, NULL) : 0.0f;
+			mu->glow = fmaxf(mu->glow * expf(-dt * 2.5f), us_sat(pg));
+			float g = mu->g;
+			float gm = g - 1.0f;
+			float pop = 1.0f + 2.70158f * gm * gm * gm + 1.70158f * gm * gm; /* ease-out-back: overshoot */
 			float bx = mu->x * A, by = soil_y(mu->x);
-			float h = mu->h * g * (1.0f - 0.5f * wilt);
-			float lean = mu->lean + wilt * 0.25f;
+			float h = mu->h * pop * (1.0f - 0.45f * wilt);
+			float lean = mu->lean + wilt * 0.35f;
 			float tx = bx + sinf(lean) * h, ty = by - cosf(lean) * h;
-			float vv = 0.75f * (1.0f - 0.6f * wilt);
-			us_line(c, bx, by, tx, ty, ctx->crisp ? 0.003f : 0.0018f, vv, US_MAT_STEM);
-			float cr = mu->r * us_sat(g * 1.4f - 0.2f);
-			if (cr > 0.001f) {
-				float open = us_sat((g - 0.4f) * 1.7f); /* cap opens from a bud into a flat umbrella */
-				float a0 = US_PI + lean - (1.1f + 0.45f * open), a1 = US_PI + lean + (1.1f + 0.45f * open);
-				(void)a0;
-				(void)a1;
-				if (ctx->crisp) {
-					int nseg = 8;
-					for (int k = 0; k < nseg; k++) {
-						float u0 = US_PI + (US_PI * k) / nseg, u1 = US_PI + (US_PI * (k + 1)) / nseg;
-						float ry = cr * (0.9f - 0.45f * open);
-						us_tri(c, tx, ty, tx + cosf(u0) * cr, ty + sinf(u0) * ry, tx + cosf(u1) * cr,
-						       ty + sinf(u1) * ry, vv, US_MAT_BLOOM);
-					}
-				} else {
-					float pts[2 * 13];
-					float ry = cr * (0.9f - 0.45f * open);
-					for (int k = 0; k <= 12; k++) {
-						float u = US_PI + US_PI * k / 12.0f;
-						pts[2 * k] = tx + cosf(u) * cr;
-						pts[2 * k + 1] = ty + sinf(u) * ry;
-					}
-					us_polyline(c, pts, 13, 0.0015f, vv, US_MAT_BLOOM);
-					/* gills */
-					us_line(c, tx - cr, ty, tx + cr, ty, 0.001f, vv * 0.7f, US_MAT_BLOOM);
-					for (int k = -3; k <= 3; k++)
-						us_line(c, tx + cr * k / 4.0f, ty, tx + cr * k / 6.0f, ty + cr * 0.12f, 0.0008f, vv * 0.45f,
-							US_MAT_BLOOM);
+			float vv = us_sat((0.72f + 0.28f * mu->glow) * (1.0f - 0.6f * wilt));
+			/* rhizomorph: the cord down to the feeding thread */
+			if (fed)
+				us_line(c, bx, by, fn->x * A, fn->y, ctx->crisp ? 0.003f : 0.0014f, 0.45f + 0.5f * mu->glow,
+					mu->glow > 0.4f ? US_MAT_LIGHT : US_MAT_STEM);
+			/* stipe */
+			float sw = (mu->kind == 2 ? 0.0026f : 0.0016f) * (0.6f + 0.4f * pop);
+			us_line(c, bx, by, tx, ty, ctx->crisp ? 0.0045f : sw, vv * 0.85f, US_MAT_STEM);
+			if (mu->kind == 2)
+				us_disc(c, bx, by - 0.003f, ctx->crisp ? 0.0045f : 0.0032f, vv * 0.8f, US_MAT_STEM); /* volva */
+			float cr = mu->r * us_sat(pop * 1.3f - 0.15f);
+			if (cr < 0.001f)
+				continue;
+			float open = us_sat((g - 0.35f) * 1.6f) * (1.0f - 0.3f * wilt);
+			/* cap outline: half-width cw, height ch, profile per kind */
+			float cw, ch, flat;
+			if (mu->kind == 0) { /* parasol: egg -> wide flat umbrella with a central bump */
+				cw = cr * (0.45f + 0.55f * open);
+				ch = cr * (0.95f - 0.62f * open);
+				flat = open;
+			} else if (mu->kind == 1) { /* inkcap: tall bell */
+				cw = cr * (0.85f + 0.25f * open);
+				ch = cr * (2.4f - 0.5f * open);
+				flat = 0.0f;
+			} else { /* spotted dome */
+				cw = cr * (0.7f + 0.3f * open);
+				ch = cr * (0.95f - 0.3f * open);
+				flat = 0.2f * open;
+			}
+			uint8_t capm = mu->kind == 1 ? US_MAT_ACCENT : US_MAT_BLOOM;
+			float pts[2 * 15];
+			int np = 15;
+			float ca = cosf(lean), sa = sinf(lean);
+			for (int k = 0; k < np; k++) {
+				float u = -1.0f + 2.0f * k / (np - 1);
+				float dome = sqrtf(fmaxf(0.0f, 1.0f - u * u));
+				float prof = us_lerp(dome, 0.35f * (1.0f - u * u) + 0.6f * expf(-u * u * 30.0f), flat);
+				if (mu->kind == 1)
+					prof = powf(fmaxf(0.0f, 1.0f - u * u), 0.45f);
+				float lx = u * cw, ly = -ch * prof;
+				/* rotate with the lean */
+				pts[2 * k] = tx + lx * ca - ly * sa;
+				pts[2 * k + 1] = ty + lx * sa + ly * ca;
+			}
+			if (ctx->crisp) {
+				for (int k = 0; k + 1 < np; k++)
+					us_tri(c, tx, ty, pts[2 * k], pts[2 * k + 1], pts[2 * k + 2], pts[2 * k + 3], vv, capm);
+			} else {
+				us_polyline(c, pts, np, 0.0015f, vv, capm);
+				us_line(c, pts[0], pts[1], pts[2 * np - 2], pts[2 * np - 1], 0.001f, vv * 0.7f, capm);
+				/* gills: fine radiating lines under the cap, lit by arriving pulses */
+				float gv = vv * (0.35f + 0.6f * mu->glow);
+				for (int k = -4; k <= 4; k++) {
+					float u = k / 5.0f;
+					float gx0 = tx + u * cw * ca, gy0 = ty + u * cw * sa;
+					us_line(c, gx0, gy0, tx + u * cw * 0.3f * ca - 0.0035f * sa * (mu->kind == 1 ? 0 : 1),
+						ty + u * cw * 0.3f * sa + cr * 0.15f * ca, 0.0007f, gv, capm);
 				}
-				/* spore puffs on hits from mature caps */
-				mu->puff -= dt;
-				if (a->beat && open > 0.8f && wilt <= 0 && mu->puff <= 0 && us_rand(r) < 0.4f + 0.6f * a->onset) {
-					mu->puff = us_randr(r, 1.0f, 2.5f);
-					for (int k = 0; k < 4 && st->nspores < MAX_SPORES; k++) {
-						spore_t *s = &st->spore[st->nspores++];
-						s->x = tx + us_randr(r, -cr, cr);
-						s->y = ty + 0.002f;
-						s->vx = us_randr(r, -0.006f, 0.006f) + 0.003f * wind;
-						s->vy = us_randr(r, -0.006f, -0.001f);
-						s->life = 1.0f;
-					}
+			}
+			if (mu->kind == 2) { /* spots */
+				static const float SP[6][2] = {{-0.55f, 0.35f}, {-0.15f, 0.7f}, {0.3f, 0.5f}, {0.62f, 0.25f}, {0.05f, 0.3f}, {-0.35f, 0.15f}};
+				for (int k = 0; k < 6; k++) {
+					float u = SP[k][0], dome = sqrtf(fmaxf(0.0f, 1.0f - u * u));
+					float lx = u * cw, ly = -ch * dome * SP[k][1] - ch * 0.12f;
+					float sx = tx + lx * ca - ly * sa, sy = ty + lx * sa + ly * ca;
+					if (ctx->crisp)
+						us_put(c, (int)(sx * c->s), (int)(sy * c->s), vv, US_MAT_LIGHT);
+					else
+						us_disc(c, sx, sy, 0.0011f + 0.0006f * open, vv, US_MAT_LIGHT);
+				}
+			} else if (mu->kind == 0 && !ctx->crisp && open > 0.3f) { /* ring on the stipe */
+				float rx = bx + (tx - bx) * 0.72f, ry = by + (ty - by) * 0.72f;
+				us_line(c, rx - 0.004f, ry + 0.002f, rx + 0.004f, ry + 0.002f, 0.0009f, vv * 0.7f, US_MAT_STEM);
+			}
+			/* spore puffs: when a pulse arrives through the cord, or on hits from mature caps */
+			mu->puff -= dt;
+			int arrive = mu->glow > 0.45f;
+			if ((arrive || a->beat) && open > 0.7f && wilt <= 0 && mu->puff <= 0 &&
+			    (arrive || us_rand(r) < 0.3f + 0.5f * a->onset)) {
+				mu->puff = us_randr(r, 0.8f, 2.0f);
+				int ns = 2 + (int)(4.0f * mu->glow);
+				for (int k = 0; k < ns && st->nspores < MAX_SPORES; k++) {
+					spore_t *sp2 = &st->spore[st->nspores++];
+					sp2->x = tx + us_randr(r, -cw, cw);
+					sp2->y = ty + 0.002f;
+					sp2->vx = us_randr(r, -0.008f, 0.008f) + 0.003f * wind;
+					sp2->vy = us_randr(r, -0.012f, -0.002f);
+					sp2->life = 1.0f;
 				}
 			}
 		}
@@ -785,7 +983,7 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 			s->vx *= expf(-dt * 0.5f);
 			s->x += s->vx * dt;
 			s->y += s->vy * dt;
-			s->life -= dt * 0.15f;
+			s->life -= dt * 0.22f;
 			if (s->life <= 0 || s->y < -0.02f || s->x < -0.02f || s->x > A + 0.02f) {
 				*s = st->spore[--st->nspores];
 				continue;

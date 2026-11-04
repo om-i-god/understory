@@ -27,6 +27,10 @@
 #define N_STARS 140
 #define FW 220 /* foam lace grid */
 #define FH 22
+#define TW 192 /* per-column crest tables */
+#define LXN 176 /* sand lace grid: columns x rows (shore -> reach) */
+#define LZN 24
+#define MAX_GLINT 260
 
 #define HOR 0.34f /* horizon y */
 #define KP 0.38f  /* perspective constant: z = 1 -> y = HOR + KP */
@@ -43,7 +47,15 @@ typedef struct {
 	float zb;             /* break depth */
 	float hf;             /* current height (world units, camera height = 1) */
 	float steep;
+	float reach;          /* swash reach, frozen when the swash starts */
 } wave_t;
+
+/* foam lace left on the sand by one swash: a cellular web of thin lines that rides the sheet up the beach,
+ * is stranded as the backwash uncovers it, then breaks up and fades as the bubbles pop */
+typedef struct {
+	int on, wave;
+	float clock, Tu, Td, reach, seed;
+} lace_t;
 
 typedef struct {
 	float x, y, vx, vy, life;
@@ -62,6 +74,12 @@ typedef struct {
 	float bass_env, hi_env, swell_env, tide_s;
 	float chop_t;
 	float occ[NS + 1];                                     /* hidden-line horizon */
+	float cz_tab[MAX_WAVES][TW + 1], al_tab[MAX_WAVES][TW + 1]; /* crest depth + along-crest strength */
+	lace_t lace[2];
+	float shore_n[TW + 1];
+	float cusp_tab[LXN + 1];
+	int32_t llab[(LXN + 1) * LZN];
+	float lu[(LXN + 1) * LZN], lv[(LXN + 1) * LZN], lsx[(LXN + 1) * LZN], lsy[(LXN + 1) * LZN], lal[(LXN + 1) * LZN];
 	float lx[FH][FW + 1], ly[FH][FW + 1], lf[FH][FW + 1]; /* foam lace scratch */
 } st_t;
 
@@ -87,19 +105,37 @@ static float crest_z(const wave_t *w, float xf, float t)
 /* shoreline (still-water edge) depth per column */
 static float shore_z(const st_t *st, float xf)
 {
-	return st->tide_s * (1.0f + 0.03f * us_noise2(xf * 3.0f, 7.7f) + 0.06f * (xf - 0.5f) * (xf - 0.5f));
+	/* the beach's shape is fixed: its noise comes from a table filled once */
+	float ft = us_clampf(xf, 0.0f, 1.0f) * TW;
+	int i0 = (int)ft < TW ? (int)ft : TW - 1;
+	float n = us_lerp(st->shore_n[i0], st->shore_n[i0 + 1], ft - i0);
+	return st->tide_s * (1.0f + 0.03f * n + 0.06f * (xf - 0.5f) * (xf - 0.5f));
+}
+
+/* fast sine (parabolic, ~0.1% error) for the per-sample surface chop */
+static inline float fsin(float x)
+{
+	x *= 1.0f / US_TAU;
+	x -= floorf(x + 0.5f); /* [-0.5, 0.5) turns */
+	float y = 8.0f * x - 16.0f * x * fabsf(x);
+	return y * (0.775f + 0.225f * fabsf(y));
 }
 
 /* sea surface height at screen column xf, depth z */
 static float sea_h(const st_t *st, float xf, float z, float X, float level)
 {
-	float h = 0.006f * sinf(z * 2.2f - st->chop_t * 2.0f + 1.7f * us_noise2(xf * 3.0f, z * 0.3f));
-	h += (0.006f + 0.008f * level) * us_noise3(X * 0.7f, z * 2.2f - st->chop_t * 1.5f, st->chop_t * 0.2f);
+	float h = 0.006f * fsin(z * 2.2f - st->chop_t * 2.0f + 1.1f * fsin(xf * 7.3f + z * 0.41f) + 0.7f * fsin(xf * 17.9f - z * 0.27f));
+	h += (0.006f + 0.008f * level) * us_noise2(X * 0.7f + st->chop_t * 0.13f, z * 2.2f - st->chop_t * 1.5f);
+	float ft = us_clampf(xf, 0.0f, 1.0f) * TW;
+	int i0 = (int)ft;
+	if (i0 >= TW)
+		i0 = TW - 1;
+	float tt = ft - i0;
 	for (int i = 0; i < MAX_WAVES; i++) {
 		const wave_t *w = &st->wv[i];
 		if ((w->state != ROLL && w->state != BREAK) || w->hf < 0.002f)
 			continue;
-		float zc = crest_z(w, xf, st->t);
+		float zc = us_lerp(st->cz_tab[i][i0], st->cz_tab[i][i0 + 1], tt);
 		float wid = 0.2f + 0.16f * zc;
 		float u = (z - zc) / wid;
 		if (u < -3.0f || u > 5.0f)
@@ -107,7 +143,7 @@ static float sea_h(const st_t *st, float xf, float z, float X, float level)
 		/* asymmetric: steep shoreward face, long back slope */
 		float p = u < 0 ? expf(-u * u * (1.0f + 4.0f * w->steep) * 1.5f) : expf(-u * u * 0.3f);
 		/* the crest isn't uniform along its length */
-		float along = 0.15f + 0.85f * us_smooth(-0.5f, 0.45f, us_noise2(xf * 3.2f + w->seed, 3.3f));
+		float along = us_lerp(st->al_tab[i][i0], st->al_tab[i][i0 + 1], tt);
 		h += w->hf * p * along;
 	}
 	return h;
@@ -133,9 +169,9 @@ static void wu_line(us_canvas *c, float ax, float ay, float bx, float by, float 
 	int i0 = (int)floorf(x0 + 0.5f), i1 = (int)floorf(x1 + 0.5f);
 	for (int i = i0; i <= i1; i++) {
 		float cx = i + 0.5f;
+		/* full coverage at the ends: rows are chains of short segments max-blended, and partial end
+		 * coverage left a darker pixel at every joint (a faint vertical grid down the stacked rows) */
 		float cov = 1.0f;
-		if (i == i0) cov = us_sat(cx + 0.5f - x0);
-		if (i == i1) cov = us_sat(x1 - (cx - 0.5f)) * (i == i0 ? cov : 1.0f);
 		float y = y0 + g * (us_clampf(cx, x0, x1) - x0) - 0.5f;
 		int iy = (int)floorf(y);
 		float f = y - iy;
@@ -147,6 +183,18 @@ static void wu_line(us_canvas *c, float ax, float ay, float bx, float by, float 
 			us_put(c, i, iy + 1, v * cov * f, mat);
 		}
 	}
+}
+
+/* jittered feature point of lace cell (cx, cz) in cell units — fixed on the sand for a given swash */
+static inline uint32_t lace_feature(int cx, int cz, uint32_t seed, float *fx, float *fz)
+{
+	uint32_t h = (uint32_t)cx * 0x8da6b343u ^ (uint32_t)cz * 0xd8163841u ^ seed * 0x9e3779b9u;
+	h ^= h >> 13;
+	h *= 0x5bd1e995u;
+	h ^= h >> 15;
+	*fx = cx + 0.12f + 0.76f * ((h & 1023) / 1023.0f);
+	*fz = cz + 0.12f + 0.76f * (((h >> 10) & 1023) / 1023.0f);
+	return h;
 }
 
 static void spawn_wave(st_t *st, const us_ctx *ctx)
@@ -184,6 +232,8 @@ static void init_scene(st_t *st, const us_ctx *ctx)
 		st->star_p[i] = us_rand(r) * 30.0f;
 	}
 	st->tide_s = 1.15f - 0.4f * ctx->w->water_level;
+	for (int k = 0; k <= TW; k++)
+		st->shore_n[k] = us_noise2((float)k / TW * 3.0f, 7.7f);
 	for (int i = 0; i < NX; i++) {
 		st->wet_z[i] = shore_z(st, (i + 0.5f) / NX);
 		st->wet_a[i] = 0;
@@ -263,7 +313,31 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 				wv->state = SWASH;
 				wv->run_t = 0;
 				wv->hf = 0;
+				wv->reach = wv->run_max * (1.0f + 0.5f * st->bass_env);
+				/* a fresh lace layer for this swash (reuse the older slot) */
+				lace_t *L = !st->lace[0].on ? &st->lace[0]
+					    : !st->lace[1].on ? &st->lace[1]
+					    : st->lace[0].clock > st->lace[1].clock ? &st->lace[0] : &st->lace[1];
+				L->on = 1;
+				L->wave = i;
+				L->clock = 0;
+				L->Tu = 1.6f + 1.2f * wv->amp;
+				L->Td = 3.0f + 1.5f * wv->amp;
+				L->reach = wv->reach;
+				L->seed = wv->seed;
 			}
+		}
+	}
+
+	/* per-column crest tables (noise once per column per wave, not per sample) */
+	for (int i = 0; i < MAX_WAVES; i++) {
+		const wave_t *wv = &st->wv[i];
+		if (wv->state != ROLL && wv->state != BREAK)
+			continue;
+		for (int k = 0; k <= TW; k++) {
+			float xf = (float)k / TW;
+			st->cz_tab[i][k] = crest_z(wv, xf, t);
+			st->al_tab[i][k] = 0.15f + 0.85f * us_smooth(-0.5f, 0.45f, us_noise2(xf * 3.2f + wv->seed, 3.3f));
 		}
 	}
 
@@ -373,7 +447,7 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 	/* ---- the sea: ridge lines near -> far with hidden-line removal ---- */
 	{
 		int ns = ctx->crisp ? NS / 2 : NS;
-		int rows = ctx->crisp ? 26 + (int)(dens * 16) : 36 + (int)(dens * 40);
+		int rows = ctx->crisp ? 26 + (int)(dens * 16) : 32 + (int)(dens * 32);
 		float glit = body_x >= 0 ? 0.35f + 0.65f * body_v : 0.0f;
 		float tq = floorf(t * 7.0f);
 		for (int i = 0; i <= ns; i++)
@@ -384,7 +458,7 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 			/* rows evenly spaced on screen (a ridge plot), from the shoreline up to just below the horizon */
 			float ys = proj_y(zs0), ye = HOR + 0.006f;
 			float z = KP / (us_lerp(ys, ye, f) - HOR);
-			float base = (0.16f + 0.16f * day) * (1.0f - 0.8f * f * f);
+			float base = (0.22f + 0.16f * day) * (1.0f - 0.75f * f * f);
 			float px = 0, py = 0;
 			int pvis = 0;
 			for (int i = 0; i <= ns; i++) {
@@ -406,7 +480,7 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 						float dx = (x - body_x) / gw;
 						float pg = glit * expf(-dx * dx);
 						float hsh = hash1(tq * 0.131f + k * 1.37f + i * 0.711f);
-						if (hsh < pg * (0.55f + 0.3f * st->hi_env)) {
+						if (hsh < pg * (0.3f + 0.2f * st->hi_env)) {
 							v += pg * (0.5f + 0.5f * hash1(hsh * 17.0f));
 							m = US_MAT_LIGHT;
 						}
@@ -423,6 +497,35 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 				pvis = vis;
 			}
 		}
+		/* glitter path: loose glints scattered over the water under the moon / sun, wider toward the viewer,
+		 * re-rolled ~7x a second; highs make it sparkle harder */
+		if (glit > 0) {
+			int ng = (int)(MAX_GLINT * (0.35f + 0.35f * dens + 0.3f * st->hi_env) * us_sat(glit * 1.3f) * (ctx->crisp ? 0.35f : 1.0f));
+			for (int g = 0; g < ng; g++) {
+				float h1 = hash1(tq * 0.173f + g * 0.618f + 0.11f), h2 = hash1(h1 * 91.3f + g * 0.37f);
+				float h3 = hash1(h2 * 53.7f + 0.5f), h4 = hash1(h3 * 17.1f + g * 0.07f);
+				float ysn = proj_y(st->tide_s) - 0.004f;
+				float y = HOR + 0.004f + (ysn - HOR - 0.004f) * h1 * h1 * 0.98f + 0.02f * h1;
+				float z = KP / (y - HOR);
+				float gw = 0.015f + 0.22f * KP / z;
+				float gx = (h2 + h3 + h4 - 1.5f) * 1.4f; /* ~gaussian */
+				float x = body_x + gx * gw;
+				if (x < 0 || x > A)
+					continue;
+				float xf = x / A;
+				if (z < shore_z(st, xf) * 1.01f)
+					continue;
+				float X = (xf - 0.5f) * A * z / KP;
+				float yy = y - KP * sea_h(st, xf, z, X, a->level) / z;
+				float pg = glit * expf(-gx * gx);
+				float len = (0.0015f + 0.009f * KP / z) * (0.4f + h4);
+				float v = us_sat(pg * (0.45f + 0.55f * h3) * (0.8f + 0.4f * st->hi_env));
+				if (ctx->crisp)
+					us_put(c, (int)(x * c->s), (int)(yy * c->s), v, US_MAT_LIGHT);
+				else
+					wu_line(c, x - len, yy, x + len, yy, v, US_MAT_LIGHT);
+			}
+		}
 		/* horizon */
 		us_line(c, 0, HOR, A, HOR, 0.0012f, 0.3f + 0.2f * day, US_MAT_WATER);
 	}
@@ -435,16 +538,18 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 		/* iso-lines around the ridges of a noise field (|n| < thr): organic loops and holes like real
 		 * foam lace; dense at the broken front, thinning out behind it */
 		float(*lx)[FW + 1] = st->lx, (*ly)[FW + 1] = st->ly, (*lf)[FW + 1] = st->lf;
-		int fw = ctx->crisp ? 80 : FW, fh = ctx->crisp ? 10 : 12 + (int)(dens * (FH - 12));
+		int fw = ctx->crisp ? 80 : 140, fh = ctx->crisp ? 10 : 12 + (int)(dens * (FH - 12));
 		float band = (0.06f + 0.25f * wv->amp) * (1.0f + 1.5f * us_sat(wv->brk_age * 0.15f));
 		for (int i = 0; i <= fw; i++) {
 			float xf = (float)i / fw;
-			float zc = crest_z(wv, xf, t);
+			float ft = xf * TW;
+			int k0 = (int)ft < TW ? (int)ft : TW - 1;
+			float zc = us_lerp(st->cz_tab[wi][k0], st->cz_tab[wi][k0 + 1], ft - k0);
 			float X = (xf - 0.5f) * A * zc / KP;
 			for (int j = 0; j < fh; j++) {
 				float fj = (float)j / (fh - 1);
 				float fz = zc * (1.0f + band * fj * fj);
-				float lace = us_noise3(X * 2.0f, fz * 8.0f, t * 0.2f + wv->seed);
+				float lace = us_noise2(X * 2.0f + 0.07f * t + wv->seed, fz * 8.0f - 0.2f * t);
 				float thr = (0.08f + 0.14f * foam_k) * wv->foam * (1.2f - 0.8f * fj) + (j == 0 ? 0.6f : 0.0f);
 				float h = sea_h(st, xf, fz, X, a->level);
 				lx[j][i] = xf * A;
@@ -504,24 +609,226 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 		}
 	}
 
-	/* ---- wet line: dotted, drying ---- */
+	/* ---- wet sand: a dotted drying line, and a mirror sheen that reflects the moon / sun ---- */
 	for (int i = 0; i < NX; i++) {
 		st->wet_a[i] -= dt / 14.0f;
-		if (st->wet_a[i] <= 0) {
+		if (st->wet_a[i] < 0)
 			st->wet_a[i] = 0;
+	}
+	{
+		/* sheen: horizontal hairlines across the wet band; under the moon they become a soft reflected
+		 * column (steady, unlike the twinkling glitter on the water) */
+		int rows = ctx->crisp ? 4 : 7;
+		float gwid = 0.07f + 0.05f * day;
+		for (int k = 0; k < rows; k++) {
+			float f = (k + 0.5f) / rows;
+			float px = 0, py = 0, pv = 0;
+			for (int i = 0; i < NX; i++) {
+				float xf = (i + 0.5f) / NX;
+				float zs = shore_z(st, xf);
+				float zw = st->wet_z[i];
+				float wa = st->wet_a[i];
+				float z = zs + (zw - zs) * f;
+				float x = xf * A, y = proj_y(z) + 0.0008f * us_noise2(x * 30.0f, k * 3.0f);
+				float refl = 0.0f;
+				if (body_x >= 0) {
+					float dx = (x - body_x) / (gwid * (1.0f + 1.5f * f));
+					refl = body_v * expf(-dx * dx) * (0.75f + 0.25f * sinf(k * 1.7f + t * 0.6f + x * 9.0f));
+				}
+				float v = sqrtf(wa) * (0.06f + 0.06f * day + 1.1f * refl) * (1.0f - 0.3f * f);
+				if (i > 0 && (v > 0.02f || pv > 0.02f) && zw < zs - 0.002f) {
+					uint8_t m = refl > 0.25f ? US_MAT_LIGHT : US_MAT_WATER;
+					if (ctx->crisp)
+						us_line(c, px, py, x, y, 0.002f, fmaxf(v, pv), m);
+					else
+						wu_line(c, px, py, x, y, 0.5f * (v + pv), m);
+				}
+				px = x, py = y, pv = v;
+			}
+		}
+		/* the moon's (sun's) reflection on the wet sand: a soft column of fine engraved hatching */
+		if (body_x >= 0 && body_v > 0.05f) {
+			int hr = ctx->crisp ? 5 : 16;
+			for (int k = 0; k < hr; k++) {
+				float f = (k + 0.5f) / hr;
+				float span = gwid * (1.0f + 1.5f * f) * 2.2f;
+				int c0 = (int)((body_x - span) / A * NX), c1 = (int)((body_x + span) / A * NX) + 1;
+				c0 = c0 < 0 ? 0 : c0;
+				c1 = c1 > NX ? NX : c1;
+				float px = 0, py = 0, pv = 0;
+				for (int i = c0; i < c1; i++) {
+					float xf = (i + 0.5f) / NX;
+					float zs = shore_z(st, xf), zw = st->wet_z[i];
+					float z = zs + (zw - zs) * f;
+					float x = xf * A, y = proj_y(z);
+					float dx = (x - body_x) / (span * 0.45f);
+					float shimmer = 0.7f + 0.3f * us_noise2(x * 25.0f + t * 0.8f, k * 1.9f);
+					float v = sqrtf(st->wet_a[i]) * body_v * expf(-dx * dx) * shimmer * (1.0f - 0.4f * f);
+					if (i > c0 && zw < zs - 0.002f && (v > 0.03f || pv > 0.03f)) {
+						if (ctx->crisp)
+							us_line(c, px, py, x, y, 0.002f, fmaxf(v, pv), US_MAT_LIGHT);
+						else
+							wu_line(c, px, py, x, y, 0.5f * (v + pv), US_MAT_LIGHT);
+					}
+					px = x, py = y, pv = v;
+				}
+			}
+		}
+		/* the wrack line itself: dotted, drying */
+		for (int i = 0; i < NX; i++) {
+			if (st->wet_a[i] <= 0)
+				continue;
+			float xf = (i + 0.5f) / NX;
+			float y = proj_y(st->wet_z[i]);
+			int dots = ctx->crisp ? 1 : 3;
+			for (int k = 0; k < dots; k++) {
+				float xx = (xf + (k - 1) * 0.33f / NX) * A;
+				float jit = 0.0015f * us_noise2(xx * 40.0f, 3.0f);
+				us_point(c, xx, y + jit, ctx->crisp ? 0.0016f : 0.0012f, 0.5f * st->wet_a[i], US_MAT_EARTH);
+			}
+		}
+	}
+
+	/* ---- foam lace on the sand: cellular web riding the sheet, stranded by the backwash, popping ---- */
+	for (int li = 0; li < 2; li++) {
+		lace_t *L = &st->lace[li];
+		if (!L->on)
+			continue;
+		L->clock += dt;
+		if (L->clock > L->Tu + L->Td + 9.0f) {
+			L->on = 0;
 			continue;
 		}
-		float xf = (i + 0.5f) / NX;
-		float y = proj_y(st->wet_z[i]);
-		int dots = ctx->crisp ? 1 : 3;
-		for (int k = 0; k < dots; k++) {
-			float xx = (xf + (k - 1) * 0.33f / NX) * A;
-			float jit = 0.0015f * us_noise2(xx * 40.0f, 3.0f);
-			us_point(c, xx, y + jit, ctx->crisp ? 0.0016f : 0.001f, 0.4f * st->wet_a[i], US_MAT_EARTH);
+		const wave_t *wv = &st->wv[L->wave];
+		int nxl = ctx->crisp ? LXN / 3 : LXN, nzl = ctx->crisp ? LZN / 3 : LZN;
+		/* cells in sand-plane units (X across, z along the beach) */
+		float cxs = ctx->crisp ? 0.13f : 0.065f, czs = ctx->crisp ? 0.045f : 0.024f;
+		float pnow; /* sheet extent as a fraction of the reach */
+		if (L->clock < L->Tu) {
+			float u = L->clock / L->Tu;
+			pnow = 1.0f - (1.0f - u) * (1.0f - u);
+		} else {
+			float u = us_sat((L->clock - L->Tu) / L->Td);
+			pnow = 1.0f - u * u;
 		}
-		/* wet sand shine under the moon */
-		if (body_x >= 0 && fabsf(xf * A - body_x) < 0.06f)
-			us_point(c, xf * A, y + 0.004f, 0.0012f, 0.35f * body_v * st->wet_a[i], US_MAT_LIGHT);
+		uint32_t sk = (uint32_t)(L->seed * 1000.0f);
+		int any = 0;
+		for (int i = 0; i <= nxl; i++) {
+			float xf = (float)i / nxl;
+			st->cusp_tab[i] = shore_z(st, xf) * L->reach * (1.0f + 0.3f * us_noise2(xf * 4.0f + L->seed, 1.3f));
+		}
+		for (int j = 0; j < nzl; j++) {
+			float sfr = (float)j / (nzl - 1);
+			float t_reach = L->Tu * (1.0f - sqrtf(1.0f - sfr)), t_unc = L->Tu + L->Td * sqrtf(1.0f - sfr);
+			float alpha, off; /* foam rides with the water while it's under the sheet */
+			if (L->clock < t_reach) {
+				alpha = 0;
+				off = 0;
+			} else if (L->clock < t_unc) {
+				alpha = 1.0f;
+				off = pnow;
+			} else {
+				alpha = expf(-(L->clock - t_unc) / (1.4f + 2.6f * sfr)); /* the high-water lace lasts longest */
+				off = sfr;
+			}
+			for (int i = 0; i <= nxl; i++) {
+				float xf = (float)i / nxl;
+				float zs = shore_z(st, xf);
+				float span = st->cusp_tab[i];
+				float z = zs - sfr * span;
+				float X = (xf - 0.5f) * A * z / KP;
+				float zp = z + 0.35f * off * span; /* sample the lace where this foam came from */
+				float uu = X / cxs + L->seed * 7.0f, vv = zp / czs;
+				int ix = (int)floorf(uu), iz = (int)floorf(vv);
+				float best = 1e9f;
+				int32_t lab = 0;
+				for (int dz = -1; dz <= 1; dz++)
+					for (int dx = -1; dx <= 1; dx++) {
+						int cx = ix + dx, cz2 = iz + dz;
+						float fx, fz;
+						lace_feature(cx, cz2, sk, &fx, &fz);
+						float d = (fx - uu) * (fx - uu) + (fz - vv) * (fz - vv);
+						if (d < best) {
+							best = d;
+							lab = (int32_t)((uint32_t)(cx & 0xffff) << 16 | (uint32_t)(cz2 & 0xffff));
+						}
+					}
+				int id = j * (LXN + 1) + i;
+				st->llab[id] = lab;
+				st->lu[id] = uu;
+				st->lv[id] = vv;
+				st->lsx[id] = xf * A;
+				st->lsy[id] = proj_y(z);
+				st->lal[id] = alpha;
+				any |= alpha > 0.02f;
+			}
+		}
+		if (!any)
+			continue;
+		float vbase = (0.5f + 0.35f * foam_k) * (0.6f + 0.4f * wv->amp);
+		for (int j = 0; j + 1 < nzl; j++)
+			for (int i = 0; i < nxl; i++) {
+				int id[4] = {j * (LXN + 1) + i, j * (LXN + 1) + i + 1, (j + 1) * (LXN + 1) + i + 1,
+					     (j + 1) * (LXN + 1) + i};
+				float al = 0.25f * (st->lal[id[0]] + st->lal[id[1]] + st->lal[id[2]] + st->lal[id[3]]);
+				if (al < 0.02f)
+					continue;
+				int32_t l0 = st->llab[id[0]];
+				if (l0 == st->llab[id[1]] && l0 == st->llab[id[2]] && l0 == st->llab[id[3]])
+					continue;
+				float vx[4], vy[4];
+				int keep[4];
+				int nv = 0;
+				for (int e = 0; e < 4; e++) {
+					int p = id[e], q = id[(e + 1) & 3];
+					int32_t la = st->llab[p], lb = st->llab[q];
+					if (la == lb)
+						continue;
+					/* both features, rebuilt from their labels; vertex where their bisector crosses this edge */
+					float ax, ay, bx, by;
+					uint32_t ha = lace_feature((int16_t)((uint32_t)la >> 16), (int16_t)(la & 0xffff), sk, &ax, &ay);
+					uint32_t hb = lace_feature((int16_t)((uint32_t)lb >> 16), (int16_t)(lb & 0xffff), sk, &bx, &by);
+					float Px = st->lu[p], Py = st->lv[p], Qx = st->lu[q], Qy = st->lv[q];
+					float nx = bx - ax, ny = by - ay;
+					float den = nx * (Qx - Px) + ny * (Qy - Py);
+					float tt = 0.5f;
+					if (fabsf(den) > 1e-9f)
+						tt = us_sat((0.5f * (bx * bx + by * by - ax * ax - ay * ay) - (nx * Px + ny * Py)) / den);
+					vx[nv] = us_lerp(st->lsx[p], st->lsx[q], tt);
+					vy[nv] = us_lerp(st->lsy[p], st->lsy[q], tt);
+					/* neighbouring "hole" cells merge into bigger holes: the wall between two of them is gone */
+					float hole = 0.3f + 0.25f * (1.0f - al);
+					keep[nv] = !(((ha >> 22) & 1023) < hole * 1023.0f && ((hb >> 22) & 1023) < hole * 1023.0f);
+					nv++;
+				}
+				/* foam lies in rafts: a smooth density field; as the lace dries the rafts shrink to islands */
+				float fd = 0.5f + 0.5f * us_noise2(st->lu[id[0]] * 0.12f + L->seed, st->lv[id[0]] * 0.22f);
+				float edge = fd - (0.84f - 0.5f * al);
+				if (edge <= 0)
+					continue;
+				float v = vbase * (0.35f + 0.65f * al) * us_smooth(0.0f, 0.12f, edge);
+				if (nv == 2) {
+					if (!keep[0] || !keep[1])
+						continue;
+					if (ctx->crisp)
+						us_line(c, vx[0], vy[0], vx[1], vy[1], 0.002f, v, US_MAT_WATER);
+					else
+						wu_line(c, vx[0], vy[0], vx[1], vy[1], v, US_MAT_WATER);
+				} else if (nv > 2) {
+					float mx = 0, my = 0;
+					for (int k = 0; k < nv; k++)
+						mx += vx[k], my += vy[k];
+					mx /= nv, my /= nv;
+					for (int k = 0; k < nv; k++) {
+						if (!keep[k])
+							continue;
+						if (ctx->crisp)
+							us_line(c, vx[k], vy[k], mx, my, 0.002f, v, US_MAT_WATER);
+						else
+							wu_line(c, vx[k], vy[k], mx, my, v, US_MAT_WATER);
+					}
+				}
+			}
 	}
 
 	/* ---- swash: run up the sand, stall, slide back ---- */
@@ -532,7 +839,7 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 		const int N = ctx->crisp ? 64 : 96;
 		wv->run_t += dt;
 		float Tu = 1.6f + 1.2f * wv->amp, Td = 3.0f + 1.5f * wv->amp;
-		float reach = wv->run_max * (1.0f + 0.5f * st->bass_env);
+		float reach = wv->reach;
 		float p;
 		int back = wv->run_t > Tu;
 		if (!back) {
@@ -553,24 +860,31 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 			pts[2 * i + 1] = proj_y(zr) + 0.0012f * us_noise2(xf * 90.0f, t * 2.0f);
 			spts[2 * i] = xf * A;
 			spts[2 * i + 1] = proj_y(zs - (zs - zr) * 0.45f);
-			int col = (int)(xf * NX);
-			if (col >= NX)
-				col = NX - 1;
-			if (!back && (zr < st->wet_z[col] || st->wet_a[col] < 0.3f)) {
+		}
+		/* wet sand: every wet-line column follows the uprush */
+		for (int col = 0; col < NX && !back; col++) {
+			float xf = (col + 0.5f) / NX;
+			float zs = shore_z(st, xf);
+			float zr = zs - reach * p * (1.0f + 0.3f * us_noise2(xf * 4.0f + wv->seed, 1.3f)) * zs;
+			if (zr < st->wet_z[col] || st->wet_a[col] < 0.3f) {
 				st->wet_z[col] = zr;
 				st->wet_a[col] = 1.0f;
 			}
 		}
-		if (ctx->crisp)
-			us_polyline(c, pts, N + 1, 0.002f, (0.55f + 0.35f * foam_k) * fade, US_MAT_WATER);
-		else
+		/* the leading edge: a continuous frothy line (doubled on the uprush) */
+		float fv = us_sat((0.6f + 0.4f * foam_k) * fade);
+		if (ctx->crisp) {
+			us_polyline(c, pts, N + 1, 0.0025f, fv, US_MAT_WATER);
+		} else {
 			for (int i = 0; i < N; i++) {
-				float lace = us_noise2(i * 0.9f + wv->seed, t * 0.7f);
-				if (lace > -0.25f)
-					us_line(c, pts[2 * i], pts[2 * i + 1], pts[2 * i + 2], pts[2 * i + 3], 0.0014f,
-						us_sat((0.55f + 0.4f * foam_k) * fade * (0.6f + 0.6f * lace)), US_MAT_WATER);
+				float fr = 0.75f + 0.25f * us_noise2(i * 0.45f + wv->seed, t * 0.9f);
+				wu_line(c, pts[2 * i], pts[2 * i + 1], pts[2 * i + 2], pts[2 * i + 3], fv * fr, US_MAT_WATER);
+				if (!back)
+					wu_line(c, pts[2 * i], pts[2 * i + 1] + 0.0022f, pts[2 * i + 2], pts[2 * i + 3] + 0.0022f,
+						fv * fr * 0.55f, US_MAT_WATER);
 			}
-		us_polyline(c, spts, N + 1, 0.001f, 0.18f * fade, US_MAT_WATER);
+		}
+		us_polyline(c, spts, N + 1, 0.001f, 0.15f * fade, US_MAT_WATER);
 		/* bubbles in the sheet, popping on the backwash */
 		int nb = (int)((20 + 50 * dens) * (0.5f + foam_k));
 		for (int k = 0; k < nb; k++) {
@@ -583,7 +897,7 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 			float life = back ? us_sat(fade * 1.5f - hash1(k * 0.7f)) : 1.0f;
 			if (life <= 0)
 				continue;
-			us_point(c, xf * A, proj_y(z), ctx->crisp ? 0.0016f : 0.001f, 0.5f * life, US_MAT_WATER);
+			us_point(c, xf * A, proj_y(z), ctx->crisp ? 0.0016f : 0.001f, 0.55f * life, US_MAT_WATER);
 		}
 		if (back && wv->run_t > Tu + Td)
 			wv->state = DONE;
