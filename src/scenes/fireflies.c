@@ -7,7 +7,9 @@
  *   dense  -> strong coupling: neighbourhoods lock, and a slow drifting frequency gradient across the field
  *             turns the locked swarm into waves of synchronised flashing that roll across the meadow.
  * Beats nudge every phase toward its local mean (and gently entrain the swarm's mean frequency to the tempo).
- * Each flash leaves a short additive trail; low fireflies are mirrored as broken streaks in a still pool.
+ * Each flash glows in additive halos with a faint ring that widens as it fades, and every firefly keeps a
+ * ~1.2 s flight-path history drawn as a long-exposure trail lit wherever it flashed. Low fireflies are mirrored
+ * as broken streaks in a still pool, and flash light pools on the grass below (so sync waves sweep the bank).
  * World: reads calm, insects (population at open), daylight (by day far fewer and dimmer), season;
  *        writes insects (calm, dark music breeds them).
  */
@@ -26,6 +28,8 @@
 #define GY 7
 #define FW 112
 #define FH 64
+#define NHIST 18 /* flight-path history samples (long-exposure trails) */
+#define NGB 48    /* ground-light bins across the width */
 
 #define POOL_Y 0.885f
 #define FLY_TOP 0.36f
@@ -44,6 +48,8 @@ typedef struct {
 	float nz;     /* noise offset */
 	int state;    /* 0 dead, 1 alive, 2 leaving */
 	int cell;
+	float hx[NHIST], hy[NHIST], hb[NHIST]; /* ring buffer: x (already * aspect), y, flash brightness */
+	int hh;
 } fly_t;
 
 typedef struct {
@@ -68,6 +74,8 @@ typedef struct {
 	float wind_t;
 	float grad_t;
 	float sync;       /* global order parameter (smoothed), for diagnostics + glow */
+	float hist_acc;
+	float gbin[NGB], gbin_s[NGB]; /* flash light falling on the bank, per x bin */
 } st_t;
 
 static void *create(uint32_t seed)
@@ -78,6 +86,80 @@ static void *create(uint32_t seed)
 }
 
 static void destroy(void *p) { free(p); }
+
+/* a hairline circle drawn as bilinear splats around the circumference (much cheaper than us_ring) */
+static void hring(us_canvas *c, float x, float y, float r, float v)
+{
+	float rp = r * c->s;
+	int n = (int)(US_TAU * rp * 0.9f) + 8;
+	if (n > 2000)
+		n = 2000;
+	float cx = x * c->s - 0.5f, cy = y * c->s - 0.5f;
+	float ca = cosf(US_TAU / n), sa = sinf(US_TAU / n), dx = rp, dy = 0;
+	for (int i = 0; i < n; i++) {
+		float fx = cx + dx, fy = cy + dy;
+		int ix = (int)floorf(fx), iy = (int)floorf(fy);
+		float ax = fx - ix, ay = fy - iy;
+		us_put(c, ix, iy, v * (1 - ax) * (1 - ay), US_MAT_LIGHT);
+		us_put(c, ix + 1, iy, v * ax * (1 - ay), US_MAT_LIGHT);
+		us_put(c, ix, iy + 1, v * (1 - ax) * ay, US_MAT_LIGHT);
+		us_put(c, ix + 1, iy + 1, v * ax * ay, US_MAT_LIGHT);
+		float ndx = dx * ca - dy * sa;
+		dy = dx * sa + dy * ca;
+		dx = ndx;
+	}
+}
+
+/* a fine horizontal hairline (cheap: two rows of coverage, soft ends) */
+static void hline(us_canvas *c, float x0, float x1, float y, float v, uint8_t m)
+{
+	float fy = y * c->s - 0.5f;
+	int iy = (int)floorf(fy);
+	float ay = fy - iy;
+	int p0 = (int)(x0 * c->s), p1 = (int)(x1 * c->s);
+	if (p0 < 0)
+		p0 = 0;
+	if (p1 > c->w)
+		p1 = c->w;
+	for (int px = p0; px < p1; px++) {
+		float e = us_sat((px - p0) * 0.1f) * us_sat((p1 - px) * 0.1f);
+		us_put(c, px, iy, v * e * (1 - ay), m);
+		us_put(c, px, iy + 1, v * e * ay, m);
+	}
+}
+
+/* cheap anti-aliased hairline (Wu-style: two pixels per step along the major axis) */
+static void wline(us_canvas *c, float ax, float ay, float bx, float by, float v, uint8_t m)
+{
+	if (c->crisp) {
+		us_line(c, ax, ay, bx, by, 0.002f, v, m);
+		return;
+	}
+	float x0 = ax * c->s - 0.5f, y0 = ay * c->s - 0.5f, x1 = bx * c->s - 0.5f, y1 = by * c->s - 0.5f;
+	float dx = x1 - x0, dy = y1 - y0;
+	int steep = fabsf(dy) > fabsf(dx);
+	float len = steep ? fabsf(dy) : fabsf(dx);
+	int n = (int)len + 1;
+	if (n > 4000)
+		return;
+	float sx = dx / n, sy = dy / n;
+	for (int i = 0; i <= n; i++) {
+		float x = x0 + sx * i, y = y0 + sy * i;
+		if (steep) {
+			int ix = (int)floorf(x);
+			float f = x - ix;
+			int iy = (int)(y + 0.5f);
+			us_put(c, ix, iy, v * (1 - f), m);
+			us_put(c, ix + 1, iy, v * f, m);
+		} else {
+			int iy = (int)floorf(y);
+			float f = y - iy;
+			int ix = (int)(x + 0.5f);
+			us_put(c, ix, iy, v * (1 - f), m);
+			us_put(c, ix, iy + 1, v * f, m);
+		}
+	}
+}
 
 static float tree_at(const st_t *st, float xf)
 {
@@ -147,6 +229,11 @@ static void spawn_fly(st_t *st, fly_t *f, float A, float life0)
 	f->nz = us_rand(r) * 100.0f;
 	f->px = f->x * A;
 	f->py = f->y;
+	for (int k = 0; k < NHIST; k++) {
+		f->hx[k] = f->px;
+		f->hy[k] = f->py;
+		f->hb[k] = 0;
+	}
 }
 
 static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
@@ -233,7 +320,7 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 	for (int i = 0; i < MAXF; i++)
 		if (st->f[i].state == 1)
 			alive++;
-	float frac = (0.07f + 0.35f * w->insects + 0.9f * E * E) * dayf * (1.0f - 0.85f * winter);
+	float frac = (0.12f + 0.35f * w->insects + 0.9f * E * E) * dayf * (1.0f - 0.85f * winter);
 	int target = (int)(nmax * us_sat(frac));
 	if (alive < target) {
 		st->spawn_acc += dt * (3.0f + 40.0f * E);
@@ -321,7 +408,7 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 	float wind = us_sat(0.2f * w->wind + 0.8f * a->high + 0.3f * a->air);
 	st->wind_t += dt * (0.12f + 0.6f * wind);
 	float agit = 0.6f + 0.8f * a->high + 0.5f * E;
-	float lum = (0.55f + 0.45f * E) * (1.0f - 0.65f * day);
+	float lum = (0.72f + 0.28f * E) * (1.0f - 0.65f * day);
 
 	/* ================= drawing: sky glow + mist ================= */
 	{
@@ -361,11 +448,13 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 				if (v < 0.02f)
 					continue;
 				int run0 = -1;
+				float cl = 0;
 				for (int i = 0; i <= TREE_N; i++) {
 					float xf = (float)i / (TREE_N - 1);
 					int open = 0;
 					if (i < TREE_N) {
-						float cl = us_noise2(xf * 3.2f - t * 0.006f, y * 11.0f + k * 0.13f);
+						if (!(i & 3))
+							cl = us_noise2(xf * 3.2f - t * 0.006f, y * 11.0f + k * 0.13f);
 						open = st->tree[i] > y + 0.004f && cl > -0.28f;
 					}
 					if (open && run0 < 0)
@@ -373,29 +462,39 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 					else if (!open && run0 >= 0) {
 						float xa = (float)run0 / (TREE_N - 1) * A, xb = (float)(i - 1) / (TREE_N - 1) * A;
 						if (xb > xa)
-							us_line(c, xa, y, xb, y, 0.001f, v, US_MAT_BG);
+							hline(c, xa, xb, y, v * 0.75f, US_MAT_BG);
 						run0 = -1;
 					}
 				}
 			}
-			/* ground mist: a narrow low-res field only over the mist band */
-			const float m0 = 0.46f, m1 = 0.80f;
-			const int MH = 24;
-			for (int j = 0; j < MH; j++) {
-				float y = m0 + (m1 - m0) * (j + 0.5f) / MH;
-				for (int i = 0; i < FW; i++) {
-					float xf = (i + 0.5f) / FW;
-					float top = tree_at(st, xf);
-					float band = (y > top + 0.01f) * us_smooth(0.57f, 0.645f, y) * (1.0f - us_smooth(0.68f, 0.79f, y));
-					float v = 0;
-					if (band > 0) {
-						float n = us_fbm2(xf * 5.0f - t * 0.012f, y * 14.0f + t * 0.004f, 2);
-						v = band * (0.01f + 0.08f * us_sat(0.5f + n)) * (0.5f + 0.8f * w->calm);
+			/* ground mist: drifting engraved lines whose brightness swells and thins along their length */
+			enum { ML = 14, MS = 48 };
+			for (int j = 0; j < ML; j++) {
+				float u = (j + 0.5f) / ML;
+				float y = 0.585f + 0.19f * u + 0.004f * sinf(t * 0.13f + j * 1.7f);
+				float band = us_smooth(0.0f, 0.3f, u) * (1.0f - us_smooth(0.6f, 1.0f, u));
+				float prof[MS];
+				for (int i = 0; i < MS; i++) {
+					float xf = (float)i / (MS - 1);
+					float n = us_fbm2(xf * 5.0f - t * 0.012f * (1.0f + 0.2f * u), y * 14.0f + t * 0.004f, 2);
+					float open = y > tree_at(st, xf) + 0.01f;
+					prof[i] = open * band * us_smooth(0.05f, 0.6f, 0.5f + n) * (0.08f + 0.1f * w->calm + 0.25f * st->glow);
+				}
+				float fy = y * c->s - 0.5f;
+				int iy = (int)floorf(fy);
+				float ay = fy - iy;
+				for (int px = 0; px < c->w; px++) {
+					float q = (float)px / c->w * (MS - 1);
+					int qi = (int)q;
+					if (qi >= MS - 1)
+						qi = MS - 2;
+					float v = us_lerp(prof[qi], prof[qi + 1], q - qi);
+					if (v > 0.006f) {
+						us_put(c, px, iy, v * (1 - ay), US_MAT_BG);
+						us_put(c, px, iy + 1, v * ay, US_MAT_BG);
 					}
-					st->field[j * FW + i] = v;
 				}
 			}
-			us_field(c, st->field, FW, MH, 1.0f, US_MAT_BG, 0, m0, A, m1);
 		}
 	}
 
@@ -448,6 +547,15 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 
 	/* ================= fireflies: simulate ================= */
 	float gl_sum = 0;
+	st->hist_acc += dt;
+	int push_hist = 0;
+	if (st->hist_acc >= 1.0f / 15.0f) {
+		st->hist_acc -= 1.0f / 15.0f;
+		if (st->hist_acc > 0.2f)
+			st->hist_acc = 0;
+		push_hist = 1;
+	}
+	memset(st->gbin, 0, sizeof(st->gbin));
 	c->blend = US_BLEND_ADD;
 	for (int i = 0; i < MAXF; i++) {
 		fly_t *f = &st->f[i];
@@ -479,7 +587,7 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 
 		/* flight: steer along a slow noise flow, stay over the field */
 		float ang = us_noise3(f->x * 2.2f, f->y * 3.0f, t * 0.05f + f->nz) * US_TAU;
-		float spd = (0.010f + 0.016f * (0.4f + f->z)) * agit;
+		float spd = (0.012f + 0.02f * (0.4f + f->z)) * agit;
 		float tvx = cosf(ang) * spd + 0.01f * wind * (0.5f + 0.5f * us_noise2(t * 0.1f, 3.0f));
 		float tvy = sinf(ang) * spd * 0.6f;
 		float ylo = us_lerp(FLY_TOP, 0.62f, f->z), yhi = us_lerp(0.66f, FLY_BOT, f->z);
@@ -491,52 +599,115 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 		f->vy = us_approach(f->vy, tvy, 0.8f, dt);
 		f->x += f->vx * dt / A;
 		f->y += f->vy * dt + 0.004f * sinf(t * 1.3f + f->nz) * dt;
+		int wrapped = 0;
 		if (f->x < -0.02f)
-			f->x += 1.04f;
+			f->x += 1.04f, wrapped = 1;
 		if (f->x > 1.02f)
-			f->x -= 1.04f;
+			f->x -= 1.04f, wrapped = 1;
 
-		/* flash: short bright pulse at th ~ 0, a hint of body glow otherwise */
-		float cth = cosf(f->th - wave_k * ((f->x - 0.5f) * A * wdx + (f->y - 0.62f) * wdy));
+		/* flash: a bright pulse around th ~ 0 (lagged across the field so synced swarms flash in a
+		 * travelling front), a hint of body glow otherwise */
+		float lag = wave_k * ((f->x - 0.5f) * A * wdx + (f->y - 0.62f) * wdy);
+		float ph = f->th - lag;
+		float cth = cosf(ph);
 		float b = cth > 0 ? cth * cth : 0;
-		b = b * b;
-		b = b * b; /* cos^8 */
-		b = b * (0.6f + 0.4f * b); /* between cos^8 and cos^16 */
+		b = b * b * b; /* cos^6 */
 		float x = f->x * A, y = f->y;
 		float vis = f->life * lum;
 		float size = 0.65f + 0.75f * f->z;
-		float jump = fabsf(x - f->px) + fabsf(y - f->py);
-		if (b > 0.015f) {
-			float v = b * vis;
-			gl_sum += v;
-			if (ctx->crisp) {
-				us_disc(c, x, y, 0.0075f * size, 0.22f * v, US_MAT_LIGHT);
-				us_disc(c, x, y, 0.0036f * size, v, US_MAT_LIGHT);
-			} else {
-				us_disc(c, x, y, 0.0060f * size, 0.07f * v, US_MAT_LIGHT);
-				us_disc(c, x, y, 0.0028f * size, 0.30f * v, US_MAT_LIGHT);
-				us_disc(c, x, y, 0.0014f * size, v, US_MAT_LIGHT);
+		float v = b * vis;
+
+		/* long-exposure flight trail: the path remembers how bright it was where it was flown */
+		if (wrapped)
+			for (int k = 0; k < NHIST; k++)
+				f->hx[k] = x, f->hy[k] = y, f->hb[k] = 0;
+		if (push_hist) {
+			f->hh = (f->hh + 1) % NHIST;
+			f->hx[f->hh] = x;
+			f->hy[f->hh] = y;
+			f->hb[f->hh] = v;
+		} else if (v > f->hb[f->hh])
+			f->hb[f->hh] = v;
+		{
+			float px = x, py = y, pb = v;
+			int idx = f->hh;
+			for (int k = 0; k < NHIST - 1; k++) {
+				float hb = f->hb[idx];
+				float tv = 0.36f * (pb < hb ? pb : hb) * (1.0f - (float)k / NHIST);
+				if (tv > 0.015f) {
+					if (ctx->crisp)
+						us_line(c, px, py, f->hx[idx], f->hy[idx], 0.002f, tv * 0.7f, US_MAT_LIGHT);
+					else
+						wline(c, px, py, f->hx[idx], f->hy[idx], tv * (0.6f + 0.4f * size), US_MAT_LIGHT);
+				}
+				px = f->hx[idx], py = f->hy[idx], pb = hb;
+				idx = (idx + NHIST - 1) % NHIST;
 			}
-			if (jump < 0.05f)
-				us_line(c, f->px, f->py, x, y, (ctx->crisp ? 0.004f : 0.0018f) * size, 0.6f * v, US_MAT_LIGHT);
+		}
+
+		if (b > 0.01f) {
+			gl_sum += v;
+			{
+				int gb = (int)(f->x * NGB);
+				if (gb >= 0 && gb < NGB)
+					st->gbin[gb] += v * (0.3f + f->z);
+			}
+			/* the afterglow ring: a faint halo that widens as each flash fades */
+			float pw = ph;
+			while (pw > US_PI)
+				pw -= US_TAU;
+			while (pw < -US_PI)
+				pw += US_TAU;
+			float fade = us_sat(pw / 1.1f); /* 0 at the peak .. 1 as it dies */
+			if (ctx->crisp) {
+				us_disc(c, x, y, 0.0036f * size, v, US_MAT_LIGHT);
+				if (v > 0.6f) /* a cross-shaped glint on the brightest flashes */
+					for (int k = -1; k <= 1; k += 2) {
+						us_put(c, (int)(x * c->s) + k, (int)(y * c->s), 0.45f * v, US_MAT_LIGHT);
+						us_put(c, (int)(x * c->s), (int)(y * c->s) + k, 0.45f * v, US_MAT_LIGHT);
+					}
+			} else {
+				if (v > 0.2f)
+					us_disc(c, x, y, 0.012f * size, 0.05f * v, US_MAT_LIGHT);
+				us_disc(c, x, y, 0.006f * size, 0.13f * v, US_MAT_LIGHT);
+				us_disc(c, x, y, 0.0032f * size, 0.45f * v, US_MAT_LIGHT);
+				us_disc(c, x, y, 0.0016f * size, 1.1f * v, US_MAT_LIGHT);
+				if (pw > 0 && b > 0.05f) {
+					float rr = (0.008f + 0.026f * fade) * size;
+					hring(c, x, y, rr, 0.3f * vis * (1.0f - fade) * (1.0f - fade));
+					if (f->z > 0.5f)
+						hring(c, x, y, rr * 1.7f, 0.13f * vis * (1.0f - fade) * (1.0f - fade));
+				}
+			}
 			/* reflection in the pool: mirrored, compressed, broken into a shimmering streak */
 			float hgt = POOL_Y - y;
-			if (hgt > 0 && hgt < 0.3f) {
+			if (hgt > 0 && hgt < 0.32f) {
 				float ry = POOL_Y + hgt * 0.42f + 0.004f;
-				float rv = v * (ctx->crisp ? 0.3f : 0.5f) * (1.0f - hgt / 0.3f);
+				float rv = v * (ctx->crisp ? 0.35f : 0.6f) * (1.0f - hgt / 0.32f);
 				float wob = 0.003f * sinf(t * 2.3f + ry * 140.0f) + 0.002f * us_noise2(x * 30.0f, t * 0.8f);
-				float rl = (0.004f + 0.012f * b) * size;
-				us_line(c, x + wob, ry - rl, x - wob, ry + rl, (ctx->crisp ? 0.004f : 0.0016f) * size, rv,
-					US_MAT_WATER);
+				float rl = (0.005f + 0.016f * b) * size;
+				if (ctx->crisp)
+					us_line(c, x + wob, ry - rl, x - wob, ry + rl, 0.004f * size, rv, US_MAT_WATER);
+				else {
+					wline(c, x + wob, ry - rl, x - wob, ry + rl, rv, US_MAT_WATER);
+					us_disc(c, x, ry, 0.005f * size, 0.06f * rv, US_MAT_WATER);
+				}
 			}
 		} else if (!ctx->crisp) {
-			us_point(c, x, y, 0.0009f * size, 0.05f * vis, US_MAT_LIGHT);
+			us_point(c, x, y, 0.0009f * size, 0.07f * vis, US_MAT_LIGHT);
 		}
 		f->px = x;
 		f->py = y;
 	}
 	c->blend = US_BLEND_MAX;
 	st->glow = us_approach(st->glow, us_sat(gl_sum / 30.0f), 0.12f, rdt);
+	/* light pooling on the bank: blur the bins a little and let them decay softly */
+	for (int k = 0; k < NGB; k++) {
+		float l = st->gbin[k > 0 ? k - 1 : 0], m = st->gbin[k], r = st->gbin[k < NGB - 1 ? k + 1 : NGB - 1];
+		float g = us_sat((0.25f * l + 0.5f * m + 0.25f * r) * 0.12f);
+		st->gbin_s[k] = g > st->gbin_s[k] ? us_approach(st->gbin_s[k], g, 0.05f, rdt)
+						  : us_approach(st->gbin_s[k], g, 0.35f, rdt);
+	}
 
 	/* ================= foreground: pool, cattails, grass ================= */
 	{
@@ -560,8 +731,10 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 			float yy = st->rip_y[k] + 0.0015f * sinf(t * 0.7f + k);
 			float x0 = st->rip_x[k] * A, len = st->rip_len[k] * (0.6f + 0.4f * sinf(t * 0.23f + k * 1.7f));
 			float depth = (yy - POOL_Y) / (1.0f - POOL_Y);
-			us_line(c, x0, yy, x0 + len, yy, ctx->crisp ? 0.003f : 0.001f, (0.10f + 0.12f * depth) * (1.0f + st->glow),
-				US_MAT_WATER);
+			if (ctx->crisp)
+				us_line(c, x0, yy, x0 + len, yy, 0.003f, (0.10f + 0.12f * depth) * (1.0f + st->glow), US_MAT_WATER);
+			else
+				hline(c, x0, x0 + len, yy, (0.10f + 0.12f * depth) * (1.0f + st->glow), US_MAT_WATER);
 		}
 		/* moon reflection */
 		if (moon_v > 0.02f && moon_x > 0)
@@ -596,7 +769,7 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 	/* grass silhouettes along the near bank */
 	{
 		int nb = (int)(NBLADES * (0.45f + 0.55f * dens) * (ctx->crisp ? 0.6f : 1.0f));
-		float gv = (ctx->crisp ? 0.3f : 0.24f) + 0.35f * st->glow;
+		float gv = (ctx->crisp ? 0.3f : 0.26f) + 0.2f * st->glow;
 		for (int b = 0; b < nb; b++) {
 			float xf = st->blade_x[b];
 			float x0 = xf * A, h = st->blade_h[b] * (1.0f - 0.35f * winter);
@@ -608,8 +781,13 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 				pts[2 * q] = x0 + (st->blade_lean[b] + sw * 0.5f) * h * u * u;
 				pts[2 * q + 1] = POOL_Y + 0.002f - h * u;
 			}
-			us_polyline(c, pts, 5, ctx->crisp ? 0.002f : 0.001f, gv * (0.7f + 0.3f * h / 0.18f),
-				    ctx->crisp ? US_MAT_EARTH : US_MAT_LEAF);
+			/* lit from above by whichever fireflies are flashing over this stretch of bank */
+			int gb = (int)(xf * NGB);
+			float lit = st->gbin_s[gb < 0 ? 0 : (gb >= NGB ? NGB - 1 : gb)];
+			float bvv = (gv + 0.7f * lit) * (0.7f + 0.3f * h / 0.18f);
+			for (int q = 0; q < 4; q++)
+				wline(c, pts[2 * q], pts[2 * q + 1], pts[2 * q + 2], pts[2 * q + 3], bvv,
+				      ctx->crisp ? US_MAT_EARTH : US_MAT_LEAF);
 		}
 	}
 

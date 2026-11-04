@@ -6,7 +6,9 @@
  *   sub / bass    -> the slow vortices: curl strength and eddy size swell with the low end
  *   level         -> overall breeze
  *   onsets        -> seed heads along the bottom release new parachutes (and pollen puffs from flowers)
- * By day, faint parallel sunbeam shafts slant down and particles inside them catch the light.
+ * Near seeds are full 3-D dandelion parachutes (achene, beak, a turning umbrella of barbed bristles); seed clocks
+ * are spheres of tiny parachutes. The wind itself is drawn: streamlines (stream-function contours) ring each eddy
+ * in drifting patches. Slanted light shafts (warm at dusk, pale by day) catch the particles inside them.
  * World: reads bloom (flowers vs seed heads), pollen (how much is airborne), daylight, season, wind;
  *        writes pollen. In winter the air holds slow snow motes instead and the heads are bare.
  */
@@ -21,6 +23,8 @@
 #define CGX 36
 #define CGY 20
 #define NBEAM 3
+#define KX 52 /* streamline (contour) grid */
+#define KY 29
 
 enum { K_GRAIN = 0, K_SPORE, K_SEED, K_SNOW };
 
@@ -50,7 +54,7 @@ typedef struct {
 	part_t p[MAXP];
 	head_t hd[NHEADS];
 	float blade_x[NBLADE], blade_h[NBLADE], blade_ph[NBLADE];
-	float psi[(CGX + 1) * (CGY + 1)];
+	float psi[(CGX + 1) * (CGY + 1)], psi_t[(KX + 1) * (KY + 1)];
 	float fvx[CGX * CGY], fvy[CGX * CGY];
 	float bass_s, high_s, lvl_s, swirl_t, wind_t;
 	float spawn_acc;
@@ -108,29 +112,126 @@ static void spawn(st_t *st, part_t *q, float winter, int anywhere, float A)
 	q->ttl = us_randr(r, 25.0f, 60.0f);
 }
 
-/* a dandelion pappus: short beak + radial hairs; crisp = fewer, bolder strokes */
-static void pappus(us_canvas *c, int crisp, float x, float y, float sz, float rot, float v, uint8_t mat)
+/* cheap anti-aliased hairline (Wu-style: two pixels per step along the major axis), brightness v0 -> v1 */
+static void wline2(us_canvas *c, float ax, float ay, float bx, float by, float v0, float v1, uint8_t m)
 {
-	float cx = x + sinf(rot) * sz * 0.9f, cy = y - cosf(rot) * sz * 0.9f; /* crown above the seed */
+	if (c->crisp) {
+		us_line(c, ax, ay, bx, by, 0.002f, 0.5f * (v0 + v1), m);
+		return;
+	}
+	float x0 = ax * c->s - 0.5f, y0 = ay * c->s - 0.5f, x1 = bx * c->s - 0.5f, y1 = by * c->s - 0.5f;
+	float dx = x1 - x0, dy = y1 - y0;
+	int steep = fabsf(dy) > fabsf(dx);
+	float len = steep ? fabsf(dy) : fabsf(dx);
+	int n = (int)len + 1;
+	if (n > 4000)
+		return;
+	float sx = dx / n, sy = dy / n, dv = (v1 - v0) / n;
+	for (int i = 0; i <= n; i++) {
+		float x = x0 + sx * i, y = y0 + sy * i, v = v0 + dv * i;
+		if (steep) {
+			int ix = (int)floorf(x);
+			float f = x - ix;
+			int iy = (int)(y + 0.5f);
+			us_put(c, ix, iy, v * (1 - f), m);
+			us_put(c, ix + 1, iy, v * f, m);
+		} else {
+			int iy = (int)floorf(y);
+			float f = y - iy;
+			int ix = (int)(x + 0.5f);
+			us_put(c, ix, iy, v * (1 - f), m);
+			us_put(c, ix, iy + 1, v * f, m);
+		}
+	}
+}
+static inline void wline(us_canvas *c, float ax, float ay, float bx, float by, float v, uint8_t m)
+{
+	wline2(c, ax, ay, bx, by, v, v, m);
+}
+
+/* a tiny hairline circle as bilinear splats (much cheaper than us_ring for spores) */
+static void hring(us_canvas *c, float x, float y, float r, float v, uint8_t m)
+{
+	float rp = r * c->s;
+	int n = (int)(US_TAU * rp * 0.9f) + 6;
+	if (n > 400)
+		n = 400;
+	float cx = x * c->s - 0.5f, cy = y * c->s - 0.5f;
+	float ca = cosf(US_TAU / n), sa = sinf(US_TAU / n), dx = rp, dy = 0;
+	for (int i = 0; i < n; i++) {
+		float fx = cx + dx, fy = cy + dy;
+		int ix = (int)floorf(fx), iy = (int)floorf(fy);
+		float ax = fx - ix, ay = fy - iy;
+		us_put(c, ix, iy, v * (1 - ax) * (1 - ay), m);
+		us_put(c, ix + 1, iy, v * ax * (1 - ay), m);
+		us_put(c, ix, iy + 1, v * (1 - ax) * ay, m);
+		us_put(c, ix + 1, iy + 1, v * ax * ay, m);
+		float ndx = dx * ca - dy * sa;
+		dy = dx * sa + dy * ca;
+		dx = ndx;
+	}
+}
+
+/* a dandelion seed in flight, seen in 3-D: spindle-shaped achene below, a long thin beak, and the pappus —
+ * an open umbrella of bristles around the beak's tip. `tilt` leans the whole parachute, `spin` turns the
+ * bristle ring about its axis so the umbrella foreshortens and its near side brightens; near seeds show the
+ * fine side-barbs on each bristle. */
+static void pappus(us_canvas *c, int crisp, float x, float y, float sz, float tilt, float spin, float v, uint8_t mat,
+		   int maxn)
+{
+	float axx = sinf(tilt), axy = -cosf(tilt); /* up along the beak */
+	float pxx = cosf(tilt), pxy = sinf(tilt);  /* across */
+	float cx = x + axx * sz * 1.05f, cy = y + axy * sz * 1.05f; /* crown */
+	float bx = x - axx * sz * 0.3f, by = y - axy * sz * 0.3f;   /* achene base */
 	if (crisp) {
-		us_line(c, x, y, cx, cy, 0.002f, v * 0.7f, mat);
-		int n = sz > 0.012f ? 6 : 4;
+		us_line(c, bx, by, cx, cy, 0.002f, v * 0.6f, mat);
+		int n = sz > 0.016f ? 7 : 5;
 		for (int k = 0; k < n; k++) {
-			float a = rot - US_PI * 0.5f + (k + 0.5f) * US_PI / n - US_PI * 0.5f * 0.0f;
-			float ax = cx + cosf(a - US_PI * 0.5f) * sz * 0.8f, ay = cy + sinf(a - US_PI * 0.5f) * sz * 0.8f;
-			us_line(c, cx, cy, ax, ay, 0.002f, v, mat);
+			float ph = spin + US_TAU * k / n;
+			float sp = sinf(1.0f) * cosf(ph);
+			float el = 0.38f * sinf(1.0f) * sinf(ph);
+			float ex = cx + (axx * (cosf(1.0f) + el) + pxx * sp) * sz, ey = cy + (axy * (cosf(1.0f) + el) + pxy * sp) * sz;
+			us_line(c, cx, cy, ex, ey, 0.002f, v * (0.7f + 0.3f * sinf(ph)), mat);
 		}
 		return;
 	}
-	us_line(c, x, y, cx, cy, 0.0008f, v * 0.6f, mat);
-	us_disc(c, x, y, sz * 0.09f, v * 0.8f, mat);
-	const int n = 11;
+	/* achene: a short brighter spindle, then the hair-fine beak */
+	wline(c, bx, by, x, y, v * 0.9f, mat);
+	us_disc(c, x - axx * sz * 0.15f, y - axy * sz * 0.15f, sz * 0.05f + 0.0006f, v * 0.6f, mat);
+	wline2(c, x, y, cx, cy, v * 0.55f, v * 0.35f, mat);
+	int n = sz > 0.02f ? 22 : (sz > 0.012f ? 15 : 9);
+	if (n > maxn)
+		n = maxn;
+	int barbs = sz > 0.024f;
+	const float cone = 1.0f; /* half-angle of the umbrella */
+	float cc = cosf(cone), sc = sinf(cone);
 	for (int k = 0; k < n; k++) {
-		/* hairs fan over the upper hemisphere of the crown, tips curling slightly */
-		float a = rot - US_PI + (k + 0.5f) * US_PI / n;
-		float ex = cx + cosf(a) * sz, ey = cy + sinf(a) * sz;
-		us_line(c, cx, cy, ex, ey, 0.0007f, v * 0.75f, mat);
-		us_point(c, ex, ey, 0.0009f, v, mat);
+		float ph = spin + US_TAU * (k + 0.37f * (k & 1)) / n;
+		float lat = sc * cosf(ph), dep = sinf(ph);
+		/* seen from a little below: the far rim of the ring rides higher than the near rim */
+		float el = 0.38f * sc * dep;
+		float dx = axx * (cc + el) + pxx * lat, dy = axy * (cc + el) + pxy * lat;
+		float L = sz * (0.92f + 0.08f * sinf(k * 2.3f));
+		/* bristles droop a touch at their tips */
+		float mx = cx + dx * L * 0.6f, my = cy + dy * L * 0.6f;
+		float ex = cx + dx * L - axx * L * 0.1f, ey = cy + dy * L - axy * L * 0.1f;
+		float hv = v * (0.45f + 0.35f * (0.5f + 0.5f * dep));
+		if (maxn < 12) /* tiny: one straight stroke */
+			wline2(c, cx, cy, ex, ey, hv * 0.8f, hv * 0.8f, mat);
+		else {
+			wline2(c, cx, cy, mx, my, hv * 0.8f, hv, mat);
+			wline2(c, mx, my, ex, ey, hv, hv * 0.7f, mat);
+		}
+		if (barbs && dep > -0.3f) {
+			/* feathery side barbs near the tip */
+			for (int q = 0; q < 1; q++) {
+				float u = 0.72f;
+				float qx = cx + dx * L * u, qy = cy + dy * L * u;
+				float bl = L * 0.16f;
+				wline(c, qx, qy, qx + (dx - dy * 0.9f) * bl, qy + (dy + dx * 0.9f) * bl, hv * 0.4f, mat);
+				wline(c, qx, qy, qx + (dx + dy * 0.9f) * bl, qy + (dy - dx * 0.9f) * bl, hv * 0.4f, mat);
+			}
+		}
 	}
 }
 
@@ -152,7 +253,7 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 		for (int i = 0; i < NHEADS; i++) {
 			head_t *h = &st->hd[i];
 			h->x = (i + 0.5f) / NHEADS + us_randr(r, -0.35f, 0.35f) / NHEADS;
-			h->h = us_randr(r, 0.10f, 0.22f);
+			h->h = us_randr(r, 0.10f, 0.30f);
 			h->seeds = us_randr(r, 0.4f, 1.0f);
 			h->flower = us_rand(r) < w->bloom ? 1.0f : 0.0f;
 			h->ph = us_rand(r) * 30.0f;
@@ -211,26 +312,83 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 			}
 	}
 
-	/* ---- sunbeams (day): faint parallel slanted hairlines ---- */
+	/* ---- the wind made visible: streamlines are contours of the stream function (curl + breeze + lift),
+	 * so closed loops ring each eddy; they surface in drifting patches like threads of warm air ---- */
+	{
+		float breeze0 = 0.008f + 0.025f * wind, lift0 = 0.004f + 0.03f * st->high_s;
+		float k_sw = swirl / eddy;
+		float lo = 1e9f, hi = -1e9f;
+		int gx = ctx->crisp ? KX / 2 : KX, gy = ctx->crisp ? KY / 2 : KY;
+		for (int j = 0; j <= gy; j++)
+			for (int i = 0; i <= gx; i++) {
+				float x = (float)i / gx * A, y = (float)j / gy;
+				float ps = us_noise3(x * eddy, y * eddy, st->swirl_t) +
+					   0.4f * us_noise3(x * eddy * 2.3f, y * eddy * 2.3f, st->swirl_t * 1.7f + 5.0f);
+				float P = ps * k_sw + breeze0 * y * 0.6f + lift0 * x * 0.5f;
+				st->psi_t[j * (gx + 1) + i] = P;
+				lo = P < lo ? P : lo;
+				hi = P > hi ? P : hi;
+			}
+		int nlev = ctx->crisp ? 7 : 13;
+		float step = (hi - lo) / (nlev + 1);
+		float sv = (ctx->crisp ? 0.2f : 0.22f) * (0.55f + 0.6f * st->bass_s) * (1.0f - 0.5f * winter);
+		float hx = A / gx, hy = 1.0f / gy;
+		for (int j = 0; j < gy; j++)
+			for (int i = 0; i < gx; i++) {
+				float x0 = i * hx, y0 = j * hy;
+				/* only patches of the field show at a time, and never right down in the grass */
+				float patch = us_smooth(-0.05f, 0.45f, us_noise3(x0 * 1.4f, y0 * 1.6f, t * 0.04f)) *
+					      (1.0f - us_smooth(0.72f, 0.9f, y0));
+				if (patch < 0.02f)
+					continue;
+				float p00 = st->psi_t[j * (gx + 1) + i], p10 = st->psi_t[j * (gx + 1) + i + 1];
+				float p01 = st->psi_t[(j + 1) * (gx + 1) + i], p11 = st->psi_t[(j + 1) * (gx + 1) + i + 1];
+				float cmin = fminf(fminf(p00, p10), fminf(p01, p11)), cmax = fmaxf(fmaxf(p00, p10), fmaxf(p01, p11));
+				int l0 = (int)ceilf((cmin - lo) / step), l1 = (int)floorf((cmax - lo) / step);
+				for (int l = l0 < 1 ? 1 : l0; l <= l1 && l <= nlev; l++) {
+					float L = lo + l * step;
+					/* marching squares: edge crossings (bottom, right, top, left) */
+					float ex[4], ey[4];
+					int ne = 0;
+					if ((p00 < L) != (p10 < L))
+						ex[ne] = x0 + hx * (L - p00) / (p10 - p00), ey[ne++] = y0;
+					if ((p10 < L) != (p11 < L))
+						ex[ne] = x0 + hx, ey[ne++] = y0 + hy * (L - p10) / (p11 - p10);
+					if ((p01 < L) != (p11 < L))
+						ex[ne] = x0 + hx * (L - p01) / (p11 - p01), ey[ne++] = y0 + hy;
+					if ((p00 < L) != (p01 < L))
+						ex[ne] = x0, ey[ne++] = y0 + hy * (L - p00) / (p01 - p00);
+					for (int e = 0; e + 1 < ne; e += 2)
+						wline(c, ex[e], ey[e], ex[e + 1], ey[e + 1], sv * patch, ctx->crisp ? US_MAT_WATER : US_MAT_BG);
+				}
+			}
+	}
+
+	/* ---- light shafts: slanted bundles of hairlines, warm at dusk, pale by day ---- */
 	const float bdx = 0.42f; /* beam slant: x shift per unit of y */
 	float beam_v[NBEAM];
 	for (int k = 0; k < NBEAM; k++) {
 		float flick = 0.5f + 0.5f * us_noise2(t * 0.07f, st->beam_ph[k]);
-		beam_v[k] = day * (1.0f - winter * 0.5f) * us_smooth(0.2f, 0.8f, flick) * (0.6f + 0.4f * st->high_s);
+		beam_v[k] = (0.35f + 0.65f * day) * (1.0f - winter * 0.5f) * us_smooth(0.15f, 0.75f, flick) * (0.6f + 0.4f * st->high_s);
 		st->beam_x[k] += dt * 0.004f;
 		if (st->beam_x[k] > 1.3f)
 			st->beam_x[k] -= 1.5f;
 		if (beam_v[k] < 0.02f)
 			continue;
 		float x0 = st->beam_x[k] * A, wdt = st->beam_w[k];
-		int nl = ctx->crisp ? 4 : 9;
+		int nl = ctx->crisp ? 4 : 12;
 		for (int l = 0; l < nl; l++) {
 			float off = (l / (float)(nl - 1) - 0.5f) * wdt;
-			float edge = 1.0f - fabsf(off) / (wdt * 0.5f + 1e-4f) * 0.6f;
-			float yb = 0.88f;
-			/* pixel palettes: the BG ramp gives a soft slate shaft instead of a hard gold wire */
-			us_line(c, x0 + off, -0.02f, x0 + off + bdx * (yb + 0.02f), yb, ctx->crisp ? 0.004f : 0.001f,
-				(ctx->crisp ? 0.7f : 0.26f) * beam_v[k] * edge, ctx->crisp ? US_MAT_BG : US_MAT_LIGHT);
+			float e = fabsf(off) / (wdt * 0.5f + 1e-4f);
+			float edge = 1.0f - e * e * 0.85f;
+			float yb = 0.88f - 0.12f * us_noise2(l * 0.7f, st->beam_ph[k]); /* strands fade out at uneven depths */
+			if (ctx->crisp)
+				/* pixel palettes: the BG ramp gives a soft slate shaft instead of a hard gold wire */
+				us_line(c, x0 + off, -0.02f, x0 + off + bdx * (yb + 0.02f), yb, 0.004f, us_sat(1.3f * beam_v[k] * edge),
+					US_MAT_BG);
+			else
+				wline2(c, x0 + off, -0.02f, x0 + off + bdx * (yb + 0.02f), yb, 0.42f * beam_v[k] * edge,
+				       0.03f * beam_v[k], US_MAT_LIGHT);
 		}
 	}
 
@@ -253,7 +411,9 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 				bp[2 * q] = x0 + sw * h * u * u;
 				bp[2 * q + 1] = gy - h * u;
 			}
-			us_polyline(c, bp, 4, ctx->crisp ? 0.002f : 0.001f, 0.3f, autumn > 0.5f ? US_MAT_EARTH : US_MAT_LEAF);
+			for (int q = 0; q < 3; q++)
+				wline(c, bp[2 * q], bp[2 * q + 1], bp[2 * q + 2], bp[2 * q + 3], 0.3f,
+				      autumn > 0.5f ? US_MAT_EARTH : US_MAT_LEAF);
 		}
 	}
 
@@ -320,15 +480,30 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 						}
 		} else {
 			/* dandelion clock: a sphere of radial hairs, thinning as seeds blow away */
-			float cr = 0.022f + 0.012f * (H / 0.22f);
+			float cr = 0.026f + 0.022f * (H / 0.3f);
 			int nh = ctx->crisp ? 14 : 34;
 			int keep = (int)(nh * h->seeds + 0.5f);
 			for (int k = 0; k < keep; k++) {
-				float ang = US_TAU * (k * 0.618034f) + h->ph * 0.1f;
-				float rr = cr * (0.85f + 0.15f * sinf(k * 3.7f));
-				float ex = hx + cosf(ang) * rr, ey = hy + sinf(ang) * rr;
-				us_line(c, hx, hy, ex, ey, ctx->crisp ? 0.002f : 0.0007f, 0.32f, US_MAT_ACCENT);
-				us_point(c, ex, ey, ctx->crisp ? 0.002f : 0.0012f, 0.7f, US_MAT_ACCENT);
+				/* a sphere of seeds: fibonacci directions, the far half dimmer and foreshortened */
+				float zz = 1.0f - 2.0f * (k + 0.5f) / nh;
+				float rr0 = sqrtf(1.0f - zz * zz);
+				float ang = US_TAU * (k * 0.618034f) + h->ph * 0.1f + sw * 2.0f;
+				float ux = cosf(ang) * rr0, uy = sinf(ang) * rr0 * 0.9f - zz * 0.1f;
+				float dep = sinf(ang) * 0.0f + zz; /* +1 near */
+				float rr = cr * (0.88f + 0.12f * sinf(k * 3.7f));
+				float ex = hx + ux * rr * 0.55f, ey = hy + uy * rr * 0.55f; /* beak ends, pappus begins */
+				float hv = 0.75f * (0.55f + 0.45f * (0.5f + 0.5f * dep));
+				if (ctx->crisp) {
+					us_line(c, hx, hy, hx + ux * rr, hy + uy * rr, 0.002f, 0.32f, US_MAT_ACCENT);
+					us_point(c, hx + ux * rr, hy + uy * rr, 0.002f, 0.7f, US_MAT_ACCENT);
+				} else {
+					wline(c, hx, hy, ex, ey, 0.32f * hv, US_MAT_ACCENT);
+					/* each seed's own little umbrella, opening outward */
+					float pl = sqrtf(ux * ux + uy * uy) + 1e-4f;
+					float tilt = atan2f(ux / pl, -uy / pl);
+					pappus(c, 0, ex - ux / pl * 0.003f, ey - uy / pl * 0.003f, rr * 0.42f * (0.6f + 0.4f * pl), tilt,
+					       k * 1.3f, hv, US_MAT_ACCENT, 8);
+				}
 			}
 			us_disc(c, hx, hy, cr * 0.12f, 0.6f, US_MAT_EARTH);
 			/* onsets (and strong thermals) blow seeds free */
@@ -444,11 +619,13 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 			mat = US_MAT_LIGHT;
 		switch (q->kind) {
 		case K_SEED: {
-			float sz = 0.006f + 0.016f * q->z * q->z;
-			if (q->z < 0.3f || (ctx->crisp && sz < 0.008f))
+			float sz = 0.007f + 0.03f * q->z * q->z;
+			float spin = q->seedv * US_TAU + q->age * (0.3f + 0.5f * q->seedv) + q->vx * 4.0f;
+			if (q->z < 0.2f || (ctx->crisp && sz < 0.008f))
 				us_point(c, X, q->y, ctx->crisp ? 0.003f : 0.0014f, us_sat(v * 0.9f), US_MAT_ACCENT);
 			else
-				pappus(c, ctx->crisp, X, q->y, sz, q->rot * 0.4f, us_sat(v * (ctx->crisp ? 0.8f : 0.55f)), US_MAT_ACCENT);
+				pappus(c, ctx->crisp, X, q->y, sz, q->rot * 0.4f, spin, us_sat(v * (ctx->crisp ? 0.8f : 0.75f)),
+				       US_MAT_ACCENT, 24);
 			break;
 		}
 		case K_SPORE: {
@@ -456,7 +633,7 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 			if (ctx->crisp)
 				us_point(c, X, q->y, 0.003f, us_sat(v * 0.6f), mat);
 			else {
-				us_ring(c, X, q->y, r, 0.0007f, us_sat(v * 0.5f), mat);
+				hring(c, X, q->y, r, us_sat(v * 0.4f), mat);
 				us_point(c, X, q->y, 0.0007f, us_sat(v * 0.6f), mat);
 			}
 			break;
@@ -482,4 +659,4 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 	c->blend = US_BLEND_MAX;
 }
 
-const us_scene_vt us_scene_pollen = {"pollen", "Pollen & Seeds", 0.2f, create, destroy, frame};
+const us_scene_vt us_scene_pollen = {"pollen", "Pollen & Seeds", 0.12f, create, destroy, frame};
