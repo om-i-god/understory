@@ -64,7 +64,9 @@ typedef struct us_engine {
 	float xfade_len; /* seconds; 0 = hard cut */
 	float xf_t;      /* 1 -> 0 while dissolving */
 	uint8_t *xf_ink, *xf_mat;
-	us_canvas disp;  /* composited display canvas used during a dissolve */
+	us_canvas disp;  /* composited display canvas used during a dissolve (and for bloom) */
+	float *bloom_buf;
+	size_t bloom_n;
 } us_engine;
 
 void us_engine_init(us_engine *e);

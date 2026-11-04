@@ -38,6 +38,9 @@ void us_engine_free(us_engine *e)
 	free(e->rgba);
 	free(e->xf_ink);
 	free(e->xf_mat);
+	free(e->bloom_buf);
+	e->bloom_buf = NULL;
+	e->bloom_n = 0;
 	memset(e, 0, sizeof(*e));
 }
 
@@ -169,8 +172,23 @@ void us_engine_frame(us_engine *e, const us_audio *a_in, float dt, double clock_
 				e->disp.mat[i] = e->canvas.mat[i];
 			}
 		}
-		us_compose(&e->disp, &e->look, e->rgba);
+	} else if (e->look.style == US_STYLE_INK && e->look.bloom > 0.001f && e->disp.ink) {
+		size_t n = (size_t)e->canvas.w * e->canvas.h;
+		memcpy(e->disp.ink, e->canvas.ink, n);
+		memcpy(e->disp.mat, e->canvas.mat, n);
 	} else {
 		us_compose(&e->canvas, &e->look, e->rgba);
+		return;
 	}
+	if (e->look.style == US_STYLE_INK && e->look.bloom > 0.001f) {
+		size_t need = us_bloom_scratch(e->disp.w, e->disp.h);
+		if (need > e->bloom_n) {
+			free(e->bloom_buf);
+			e->bloom_buf = malloc(need * sizeof(float));
+			e->bloom_n = e->bloom_buf ? need : 0;
+		}
+		if (e->bloom_buf)
+			us_bloom(&e->disp, e->look.bloom, e->bloom_buf);
+	}
+	us_compose(&e->disp, &e->look, e->rgba);
 }

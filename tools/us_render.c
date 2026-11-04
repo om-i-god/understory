@@ -124,6 +124,7 @@ int main(int argc, char **argv)
 	const char *scene = "meadow", *audio = NULL, *out = "out", *world_in = NULL, *world_out = NULL, *at = NULL;
 	int style = US_STYLE_INK, fps = 30, ow = 1280, oh = 720, pixel = 4, every = 0, palette = 0, invert = 0, stats = 0;
 	int synth = 0, stats_every = 0;
+	float bloom = 0.5f;
 	float journey = 0; /* >0: follow-the-music director, value = min dwell seconds */
 	float start = 0, seconds = 10, prewarm = 0, wspeed = 1;
 	us_params prm = {0.5f, 0.5f, 0.5f};
@@ -160,6 +161,7 @@ int main(int argc, char **argv)
 		else if (ARG("--world")) world_in = v;
 		else if (ARG("--world-out")) world_out = v;
 		else if (ARG("--world-speed")) wspeed = (float)atof(v);
+		else if (ARG("--bloom")) bloom = (float)atof(v);
 		else if (ARG("--journey")) journey = (float)atof(v);
 		else { fprintf(stderr, "unknown arg %s\n", k); return 2; }
 #undef ARG
@@ -200,7 +202,7 @@ int main(int argc, char **argv)
 	e.world_speed = wspeed;
 	if (world_in && !us_world_load(us_world_shared(), world_in))
 		fprintf(stderr, "warning: could not load world %s\n", world_in);
-	us_look look = {.style = style, .palette = palette, .invert = invert, .glow = 0.3f};
+	us_look look = {.style = style, .palette = palette, .invert = invert, .glow = 0.3f, .bloom = bloom};
 	memcpy(look.tint, tint, 3);
 	us_engine_set_scene(&e, scene, seed);
 	us_engine_configure(&e, &look, ow, oh, pixel, 1.0f);

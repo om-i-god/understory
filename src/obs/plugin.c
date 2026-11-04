@@ -147,6 +147,7 @@ static void apply_settings(us_src *s, obs_data_t *st)
 	look.palette = (int)obs_data_get_int(st, "palette");
 	look.invert = obs_data_get_bool(st, "invert");
 	look.glow = (float)obs_data_get_double(st, "glow");
+	look.bloom = (float)obs_data_get_double(st, "bloom");
 	s->out_w = (int)obs_data_get_int(st, "width");
 	s->out_h = (int)obs_data_get_int(st, "height");
 	us_engine_configure(&s->eng, &look, s->out_w, s->out_h, (int)obs_data_get_int(st, "pixel_size"),
@@ -188,6 +189,7 @@ static void src_defaults(obs_data_t *st)
 	obs_data_set_default_int(st, "palette", 0);
 	obs_data_set_default_bool(st, "invert", false);
 	obs_data_set_default_double(st, "glow", 0.3);
+	obs_data_set_default_double(st, "bloom", 0.5);
 	obs_data_set_default_int(st, "pixel_size", 6);
 	obs_data_set_default_double(st, "ink_scale", 1.0);
 	obs_data_set_default_int(st, "width", 1920);
@@ -259,6 +261,7 @@ static bool style_changed(obs_properties_t *props, obs_property_t *p, obs_data_t
 	obs_property_set_visible(obs_properties_get(props, "tint"), style != US_STYLE_PIXEL);
 	obs_property_set_visible(obs_properties_get(props, "pixel_size"), style != US_STYLE_INK);
 	obs_property_set_visible(obs_properties_get(props, "ink_scale"), style == US_STYLE_INK);
+	obs_property_set_visible(obs_properties_get(props, "bloom"), style == US_STYLE_INK);
 	return true;
 }
 
@@ -297,6 +300,7 @@ static obs_properties_t *src_properties(void *data)
 	obs_properties_add_int_slider(look, "pixel_size", T_("PixelSize"), 2, 16, 1);
 	obs_properties_add_float_slider(look, "ink_scale", T_("InkScale"), 0.25, 1.0, 0.05);
 	obs_properties_add_float_slider(look, "glow", T_("Glow"), 0.0, 1.0, 0.05);
+	obs_properties_add_float_slider(look, "bloom", T_("Bloom"), 0.0, 1.0, 0.05);
 	obs_properties_add_bool(look, "invert", T_("Invert"));
 	obs_properties_add_int(look, "width", T_("Width"), 64, 7680, 1);
 	obs_properties_add_int(look, "height", T_("Height"), 36, 4320, 1);

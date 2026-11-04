@@ -132,3 +132,111 @@ void us_compose(const us_canvas *c, const us_look *look, uint8_t *rgba)
 		o[3] = 255;
 	}
 }
+
+/* ---------------------------------------------------------------- bloom */
+
+#define BLOOM_DS 4
+
+size_t us_bloom_scratch(int w, int h)
+{
+	size_t bw = (size_t)(w + BLOOM_DS - 1) / BLOOM_DS, bh = (size_t)(h + BLOOM_DS - 1) / BLOOM_DS;
+	return bw * bh * 3 + bw * 2 + (size_t)w / 4 + 4; /* blur buffers + one row of upsample scratch */
+}
+
+static void box_blur(float *a, float *tmp, int w, int h, int r)
+{
+	float inv = 1.0f / (2 * r + 1);
+	for (int y = 0; y < h; y++) {
+		float *row = a + (size_t)y * w, *o = tmp + (size_t)y * w;
+		float acc = row[0] * (r + 1);
+		for (int i = 1; i <= r; i++)
+			acc += row[i < w ? i : w - 1];
+		for (int x = 0; x < w; x++) {
+			o[x] = acc * inv;
+			int add = x + r + 1, sub = x - r;
+			acc += row[add < w ? add : w - 1] - row[sub > 0 ? sub : 0];
+		}
+	}
+	for (int x = 0; x < w; x++) {
+		float acc = tmp[x] * (r + 1);
+		for (int i = 1; i <= r; i++)
+			acc += tmp[(size_t)(i < h ? i : h - 1) * w + x];
+		for (int y = 0; y < h; y++) {
+			a[(size_t)y * w + x] = acc * inv;
+			int add = y + r + 1, sub = y - r;
+			acc += tmp[(size_t)(add < h ? add : h - 1) * w + x] - tmp[(size_t)(sub > 0 ? sub : 0) * w + x];
+		}
+	}
+}
+
+void us_bloom(us_canvas *c, float amount, float *scratch)
+{
+	if (amount <= 0.001f || !c->ink)
+		return;
+	int w = c->w, h = c->h;
+	int bw = (w + BLOOM_DS - 1) / BLOOM_DS, bh = (h + BLOOM_DS - 1) / BLOOM_DS;
+	float *a = scratch, *tmp = scratch + (size_t)bw * bh;
+	/* downsample: per block, mix of mean and max (thin 1px lines in a 4x4 block still bloom) — row-linear */
+	int *bsum = (int *)tmp, *bmax = bsum + bw; /* tmp holds bw*bh floats >= 2*bw ints */
+	for (int by = 0; by < bh; by++) {
+		memset(bsum, 0, sizeof(int) * 2 * bw);
+		int y1 = by * BLOOM_DS + BLOOM_DS < h ? by * BLOOM_DS + BLOOM_DS : h, rows = y1 - by * BLOOM_DS;
+		for (int y = by * BLOOM_DS; y < y1; y++) {
+			const uint8_t *row = c->ink + (size_t)y * w;
+			for (int x = 0; x < w; x++) {
+				int v = row[x], b = x / BLOOM_DS;
+				bsum[b] += v;
+				if (v > bmax[b])
+					bmax[b] = v;
+			}
+		}
+		for (int bx = 0; bx < bw; bx++) {
+			int cols = (bx + 1) * BLOOM_DS <= w ? BLOOM_DS : w - bx * BLOOM_DS;
+			float v = (0.5f * bsum[bx] / (float)(cols * rows) + 0.5f * bmax[bx]) / 255.0f;
+			a[(size_t)by * bw + bx] = v * v;
+		}
+	}
+	/* two scales: a tight halo (point lights, lines) and a wide haze (big bright areas) */
+	float *wide = scratch + (size_t)bw * bh * 2;
+	memcpy(wide, a, sizeof(float) * (size_t)bw * bh);
+	box_blur(a, tmp, bw, bh, 1);
+	box_blur(a, tmp, bw, bh, 1);
+	int r = bw > 200 ? 4 : 2;
+	box_blur(wide, tmp, bw, bh, r);
+	box_blur(wide, tmp, bw, bh, r);
+	for (size_t i = 0, n = (size_t)bw * bh; i < n; i++)
+		a[i] = 0.55f * a[i] + 1.1f * wide[i];
+	/* upsample bilinear + add. With a 4x factor the 4 pixels of block k sample at fixed offsets:
+	 * k-0.375, k-0.125 (between k-1 and k) and k+0.125, k+0.375 (between k and k+1). */
+	float gain = 255.0f * 2.0f * amount;
+	float *ir = tmp; /* one interpolated row, bw wide (tmp is free after the blur) */
+	static const float TX[4] = {0.625f, 0.875f, 0.125f, 0.375f};
+	for (int y = 0; y < h; y++) {
+		float fy = (y + 0.5f) / BLOOM_DS - 0.5f;
+		int y0 = (int)floorf(fy);
+		float ty = fy - y0;
+		int ya = y0 < 0 ? 0 : (y0 >= bh ? bh - 1 : y0), yb = y0 + 1 >= bh ? bh - 1 : (y0 + 1 < 0 ? 0 : y0 + 1);
+		const float *ra = a + (size_t)ya * bw, *rb = a + (size_t)yb * bw;
+		for (int bx = 0; bx < bw; bx++)
+			ir[bx] = (ra[bx] + (rb[bx] - ra[bx]) * ty) * gain;
+		uint8_t *row = c->ink + (size_t)y * w;
+		uint8_t *addrow = (uint8_t *)(ir + bw); /* w bytes after the interpolated row */
+		int any = 0;
+		for (int k = 0; k < bw; k++) {
+			float l = ir[k > 0 ? k - 1 : 0], m = ir[k], r = ir[k + 1 < bw ? k + 1 : bw - 1];
+			int x = k * BLOOM_DS;
+			for (int j = 0; j < BLOOM_DS && x + j < w; j++) {
+				float v = j < 2 ? l + (m - l) * TX[j] : m + (r - m) * TX[j];
+				int ad = v > 255.0f ? 255 : (int)v;
+				addrow[x + j] = (uint8_t)ad;
+				any |= ad;
+			}
+		}
+		if (!any)
+			continue;
+		for (int x = 0; x < w; x++) { /* saturating add, vectorises */
+			unsigned o = (unsigned)row[x] + addrow[x];
+			row[x] = (uint8_t)(o > 255 ? 255 : o);
+		}
+	}
+}
