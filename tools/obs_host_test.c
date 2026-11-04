@@ -124,8 +124,9 @@ int main(int argc, char **argv)
 		obs_data_t *st = obs_data_create();
 		obs_data_set_string(st, "scene", scene);
 		obs_data_set_int(st, "style", style);
-		obs_data_set_int(st, "width", W);
-		obs_data_set_int(st, "height", H);
+		const char *big = getenv("US_BIG"); /* stress: render the source at 1920x1080 */
+		obs_data_set_int(st, "width", big ? 1920 : W);
+		obs_data_set_int(st, "height", big ? 1080 : H);
 		obs_data_set_int(st, "pixel_size", 4);
 		if (style == 2)
 			obs_data_set_int(st, "tint", 0xff3cb0ff); /* amber, ABGR */
@@ -144,7 +145,14 @@ int main(int argc, char **argv)
 		       obs_source_get_height(src), nprops);
 
 		obs_set_output_source(0, src); /* makes it 'showing', OBS's video thread now ticks it */
+		uint32_t lag0 = obs_get_lagged_frames(), tot0 = obs_get_total_frames();
 		sleep((unsigned)secs);
+		uint32_t lag = obs_get_lagged_frames() - lag0, tot = obs_get_total_frames() - tot0;
+		printf("video frames %u, lagged %u\n", tot, lag);
+		if (tot > 0 && lag * 10 > tot) {
+			printf("FAIL: OBS video thread lagging\n");
+			fails++;
+		}
 		char path[1024];
 		snprintf(path, sizeof(path), "%s/obs_%s_%s.ppm", out, scene, styles[style]);
 		snap(src, path);

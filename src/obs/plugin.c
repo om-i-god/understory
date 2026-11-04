@@ -53,10 +53,24 @@ typedef struct us_src {
 	gs_texture_t *tex;
 	gs_samplerstate_t *point, *linear;
 	int tex_w, tex_h;
-	int dirty;
 
 	obs_hotkey_id hk_next, hk_prev, hk_style;
 	us_audio last_audio;
+
+	/* worker thread: simulation + raster + compose run here, never on OBS's video thread */
+	pthread_t thr;
+	int thr_ok;
+	pthread_mutex_t job_mu;
+	pthread_cond_t job_cv;
+	float job_dt;
+	double job_clock;
+	int job, quit;
+	pthread_mutex_t audio_mu; /* guards audio_name / audio_weak */
+
+	/* finished frame handed to the renderer */
+	pthread_mutex_t front_mu;
+	uint8_t *front;
+	int front_w, front_h, front_crisp, fresh;
 } us_src;
 
 /* ---------------------------------------------------------------- audio */
@@ -167,6 +181,7 @@ static void apply_settings(us_src *s, obs_data_t *st)
 	s->scene_mode = (int)obs_data_get_int(st, "scene_mode");
 
 	const char *aname = obs_data_get_string(st, "audio_source");
+	pthread_mutex_lock(&s->audio_mu);
 	int rehook = !s->audio_name || strcmp(s->audio_name, aname) != 0 || !s->audio_weak;
 	if (rehook) {
 		bfree(s->audio_name);
@@ -174,7 +189,7 @@ static void apply_settings(us_src *s, obs_data_t *st)
 		hook_audio(s);
 		us_analyzer_reset(s->an);
 	}
-	s->dirty = 1;
+	pthread_mutex_unlock(&s->audio_mu);
 	pthread_mutex_unlock(&s->mu);
 }
 
@@ -191,7 +206,7 @@ static void src_defaults(obs_data_t *st)
 	obs_data_set_default_double(st, "glow", 0.3);
 	obs_data_set_default_double(st, "bloom", 0.5);
 	obs_data_set_default_int(st, "pixel_size", 6);
-	obs_data_set_default_double(st, "ink_scale", 1.0);
+	obs_data_set_default_double(st, "ink_scale", 0.67);
 	obs_data_set_default_int(st, "width", 1920);
 	obs_data_set_default_int(st, "height", 1080);
 	obs_data_set_default_double(st, "density", 0.5);
@@ -386,11 +401,17 @@ static void hk_style(void *data, obs_hotkey_id id, obs_hotkey_t *hk, bool presse
 
 /* ---------------------------------------------------------------- lifecycle */
 
+static void *worker_main(void *data);
+
 static void *src_create(obs_data_t *settings, obs_source_t *source)
 {
 	us_src *s = bzalloc(sizeof(*s));
 	s->self = source;
 	pthread_mutex_init(&s->mu, NULL);
+	pthread_mutex_init(&s->job_mu, NULL);
+	pthread_cond_init(&s->job_cv, NULL);
+	pthread_mutex_init(&s->audio_mu, NULL);
+	pthread_mutex_init(&s->front_mu, NULL);
 	us_engine_init(&s->eng);
 	s->an = us_analyzer_create();
 	s->sensitivity = s->bass_gain = s->mid_gain = s->high_gain = 1.0f;
@@ -410,13 +431,23 @@ static void *src_create(obs_data_t *settings, obs_source_t *source)
 	s->hk_style = obs_hotkey_register_source(source, "understory.style", T_("Hotkey.Style"), hk_style, s);
 
 	apply_settings(s, settings);
+	s->thr_ok = pthread_create(&s->thr, NULL, worker_main, s) == 0;
 	return s;
 }
 
 static void src_destroy(void *data)
 {
 	us_src *s = data;
+	pthread_mutex_lock(&s->audio_mu);
 	unhook_audio(s);
+	pthread_mutex_unlock(&s->audio_mu);
+	if (s->thr_ok) {
+		pthread_mutex_lock(&s->job_mu);
+		s->quit = 1;
+		pthread_cond_signal(&s->job_cv);
+		pthread_mutex_unlock(&s->job_mu);
+		pthread_join(s->thr, NULL);
+	}
 	obs_enter_graphics();
 	if (s->tex)
 		gs_texture_destroy(s->tex);
@@ -427,7 +458,12 @@ static void src_destroy(void *data)
 	us_analyzer_destroy(s->an);
 	bfree(s->audio_name);
 	bfree(s->applied_scene_setting);
+	bfree(s->front);
 	pthread_mutex_destroy(&s->mu);
+	pthread_mutex_destroy(&s->job_mu);
+	pthread_cond_destroy(&s->job_cv);
+	pthread_mutex_destroy(&s->audio_mu);
+	pthread_mutex_destroy(&s->front_mu);
 	bfree(s);
 	world_save();
 }
@@ -435,24 +471,10 @@ static void src_destroy(void *data)
 static uint32_t src_width(void *data) { return (uint32_t)((us_src *)data)->out_w; }
 static uint32_t src_height(void *data) { return (uint32_t)((us_src *)data)->out_h; }
 
-static void src_tick(void *data, float seconds)
+/* one simulation step on the worker thread */
+static void step(us_src *s, float seconds, double clock)
 {
-	us_src *s = data;
-	if (!obs_source_showing(s->self))
-		return;
 	pthread_mutex_lock(&s->mu);
-
-	/* audio source may appear after us (scene collection load order) or be recreated */
-	s->rehook_timer += seconds;
-	if (s->rehook_timer > 2.0) {
-		s->rehook_timer = 0;
-		obs_source_t *a = s->audio_weak ? obs_weak_source_get_source(s->audio_weak) : NULL;
-		if (!a)
-			hook_audio(s);
-		else
-			obs_source_release(a);
-	}
-
 	us_analyzer_update(s->an, seconds, s->sensitivity, s->bass_gain, s->mid_gain, s->high_gain, &s->last_audio);
 
 	float per_scene = fmaxf(s->auto_cycle_min, 0.25f) * 60.0f;
@@ -473,27 +495,97 @@ static void src_tick(void *data, float seconds)
 			us_engine_set_scene(&s->eng, us_scene_list[nx]->id, s->eng.seed);
 		}
 	}
-	double clock = (double)obs_get_video_frame_time() * 1e-9;
 	pthread_mutex_lock(&g_world_mu);
 	us_engine_frame(&s->eng, &s->last_audio, seconds, clock);
+	int save = clock - g_last_save > WORLD_SAVE_INTERVAL;
+	if (save)
+		g_last_save = clock;
 	pthread_mutex_unlock(&g_world_mu);
-	s->dirty = 1;
+
+	/* hand the finished frame to the renderer */
+	int cw = s->eng.canvas.w, ch = s->eng.canvas.h;
+	if (s->eng.rgba && cw > 0 && ch > 0) {
+		pthread_mutex_lock(&s->front_mu);
+		if (s->front_w != cw || s->front_h != ch || !s->front) {
+			bfree(s->front);
+			s->front = bmalloc((size_t)cw * ch * 4);
+			s->front_w = cw;
+			s->front_h = ch;
+		}
+		memcpy(s->front, s->eng.rgba, (size_t)cw * ch * 4);
+		s->front_crisp = s->eng.canvas.crisp;
+		s->fresh = 1;
+		pthread_mutex_unlock(&s->front_mu);
+	}
 	pthread_mutex_unlock(&s->mu);
 
-	if (clock - g_last_save > WORLD_SAVE_INTERVAL) {
-		g_last_save = clock;
+	if (save)
 		world_save();
+}
+
+static void *worker_main(void *data)
+{
+	us_src *s = data;
+	os_set_thread_name("understory");
+	for (;;) {
+		pthread_mutex_lock(&s->job_mu);
+		while (!s->job && !s->quit)
+			pthread_cond_wait(&s->job_cv, &s->job_mu);
+		if (s->quit) {
+			pthread_mutex_unlock(&s->job_mu);
+			break;
+		}
+		float dt = s->job_dt;
+		double clock = s->job_clock;
+		s->job = 0;
+		s->job_dt = 0;
+		pthread_mutex_unlock(&s->job_mu);
+		step(s, dt, clock);
 	}
+	return NULL;
+}
+
+/* OBS video thread: cheap. Queues time for the worker; if the worker is behind, time accumulates
+ * (capped) and the next step simply covers it, so OBS never waits on us. */
+static void src_tick(void *data, float seconds)
+{
+	us_src *s = data;
+	if (!obs_source_showing(s->self))
+		return;
+
+	/* audio source may appear after us (scene collection load order) or be recreated */
+	s->rehook_timer += seconds;
+	if (s->rehook_timer > 2.0 && pthread_mutex_trylock(&s->audio_mu) == 0) {
+		s->rehook_timer = 0;
+		obs_source_t *a = s->audio_weak ? obs_weak_source_get_source(s->audio_weak) : NULL;
+		if (!a)
+			hook_audio(s);
+		else
+			obs_source_release(a);
+		pthread_mutex_unlock(&s->audio_mu);
+	}
+
+	double clock = (double)obs_get_video_frame_time() * 1e-9;
+	if (!s->thr_ok) {
+		step(s, seconds, clock);
+		return;
+	}
+	pthread_mutex_lock(&s->job_mu);
+	s->job_dt = fminf(s->job_dt + seconds, 0.25f);
+	s->job_clock = clock;
+	s->job = 1;
+	pthread_cond_signal(&s->job_cv);
+	pthread_mutex_unlock(&s->job_mu);
 }
 
 static void src_render(void *data, gs_effect_t *unused)
 {
 	(void)unused;
 	us_src *s = data;
-	pthread_mutex_lock(&s->mu);
-	int cw = s->eng.canvas.w, ch = s->eng.canvas.h;
-	if (!s->eng.rgba || cw <= 0) {
-		pthread_mutex_unlock(&s->mu);
+	pthread_mutex_lock(&s->front_mu);
+	int cw = s->front_w, ch = s->front_h;
+	if (!s->front || cw <= 0) {
+		pthread_mutex_unlock(&s->front_mu);
 		return;
 	}
 	if (!s->tex || s->tex_w != cw || s->tex_h != ch) {
@@ -502,14 +594,14 @@ static void src_render(void *data, gs_effect_t *unused)
 		s->tex = gs_texture_create(cw, ch, GS_RGBA, 1, NULL, GS_DYNAMIC);
 		s->tex_w = cw;
 		s->tex_h = ch;
-		s->dirty = 1;
+		s->fresh = 1;
 	}
-	if (s->tex && s->dirty) {
-		gs_texture_set_image(s->tex, s->eng.rgba, (uint32_t)cw * 4, false);
-		s->dirty = 0;
+	if (s->tex && s->fresh) {
+		gs_texture_set_image(s->tex, s->front, (uint32_t)cw * 4, false);
+		s->fresh = 0;
 	}
-	int crisp = s->eng.canvas.crisp;
-	pthread_mutex_unlock(&s->mu);
+	int crisp = s->front_crisp;
+	pthread_mutex_unlock(&s->front_mu);
 	if (!s->tex)
 		return;
 
