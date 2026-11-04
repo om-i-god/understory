@@ -10,6 +10,9 @@
  * cloud undersides around the channel, then lingers as an afterimage. Medium hits at moderate
  * charge become cloud-to-cloud crawlers. In silence: distant heat lightning flickers inside the
  * clouds now and then, and the clouds keep drifting.
+ * Under a heavy charge the deck's base sags into mammatus pouches and a tiered shelf cloud leads the
+ * front. Smaller hits flicker deep inside the clouds (distant, unseen strokes). A near ridge with a
+ * lone oak stands in the foreground, a black silhouette until a flash reveals it.
  * World: reads storm_charge, moisture, wind, daylight; writes storm_charge (up with swell, down
  *        with every strike) and moisture (rain).
  */
@@ -24,7 +27,7 @@
 #define MAX_SEG 900
 #define MAX_DROP 1400
 #define MAX_TREES 7
-#define MAX_TSEG 40
+#define MAX_TSEG 120
 #define MAX_STROKES 4
 
 typedef struct {
@@ -66,6 +69,10 @@ typedef struct {
 
 	tree_t tree[MAX_TREES];
 	int ntrees;
+	tree_t oak;   /* the big tree on the near ridge */
+	float ridge_side; /* +1: the ridge rises on the right */
+	float hit_x;  /* where the last ground strike landed */
+	float heat_amp, small_cool;
 
 	float drift, evo;
 	float A; /* aspect cached for the recursive bolt builder */
@@ -81,9 +88,9 @@ static float horizon_y(float u)
 }
 
 /* ---- trees on the horizon (tiny static silhouettes, they give scale) ---- */
-static void tree_branch(tree_t *t, us_rng *r, float x, float y, float ang, float len, float w, int depth)
+static void tree_branch_d(tree_t *t, us_rng *r, float x, float y, float ang, float len, float w, int depth, int maxd)
 {
-	if (t->nseg >= MAX_TSEG || depth > 4 || len < 0.003f)
+	if (t->nseg >= MAX_TSEG || depth > maxd || len < 0.003f)
 		return;
 	float ex = x + cosf(ang) * len, ey = y + sinf(ang) * len;
 	int i = t->nseg++;
@@ -95,7 +102,57 @@ static void tree_branch(tree_t *t, us_rng *r, float x, float y, float ang, float
 	int kids = depth == 0 ? 3 : 2;
 	for (int k = 0; k < kids; k++) {
 		float a = ang + us_randr(r, -0.75f, 0.75f) + (k - (kids - 1) * 0.5f) * 0.45f;
-		tree_branch(t, r, ex, ey, a, len * us_randr(r, 0.55f, 0.78f), w * 0.65f, depth + 1);
+		tree_branch_d(t, r, ex, ey, a, len * us_randr(r, 0.55f, 0.78f), w * 0.65f, depth + 1, maxd);
+	}
+}
+
+static void tree_branch(tree_t *t, us_rng *r, float x, float y, float ang, float len, float w, int depth)
+{
+	tree_branch_d(t, r, x, y, ang, len, w, depth, 4);
+}
+
+/* the near ridge: a low rise toward one side of the frame */
+static float ridge_y(float u, float side)
+{
+	float hill = us_smooth(0.3f, 0.92f, side > 0 ? u : 1.0f - u);
+	return 0.975f - 0.15f * hill + 0.012f * us_noise2(u * 4.0f, 2.7f) + 0.004f * us_noise2(u * 17.0f, 1.3f);
+}
+
+/* fast thin antialiased line for ink (two-pixel Wu spans); us_line for crisp / wide lines */
+static void wline(us_canvas *c, float ax, float ay, float bx, float by, float width, float v, uint8_t mat)
+{
+	float wp = width * c->s;
+	if (c->crisp || wp > 1.6f) {
+		us_line(c, ax, ay, bx, by, width, v, mat);
+		return;
+	}
+	v *= us_clampf(wp, 0.35f, 1.0f);
+	float x0 = ax * c->s - 0.5f, y0 = ay * c->s - 0.5f, x1 = bx * c->s - 0.5f, y1 = by * c->s - 0.5f;
+	int steep = fabsf(y1 - y0) > fabsf(x1 - x0);
+	if (steep) {
+		float t = x0; x0 = y0; y0 = t;
+		t = x1; x1 = y1; y1 = t;
+	}
+	if (x0 > x1) {
+		float t = x0; x0 = x1; x1 = t;
+		t = y0; y0 = y1; y1 = t;
+	}
+	float g = fabsf(x1 - x0) > 1e-6f ? (y1 - y0) / (x1 - x0) : 0.0f;
+	int i0 = (int)floorf(x0 + 0.5f), i1 = (int)floorf(x1 + 0.5f);
+	int lim = steep ? c->h : c->w;
+	if (i0 < 0) i0 = 0;
+	if (i1 > lim - 1) i1 = lim - 1;
+	for (int i = i0; i <= i1; i++) {
+		float yy = y0 + g * (i - x0);
+		int j = (int)floorf(yy);
+		float f = yy - j;
+		if (steep) {
+			us_put(c, j, i, v * (1.0f - f), mat);
+			us_put(c, j + 1, i, v * f, mat);
+		} else {
+			us_put(c, i, j, v * (1.0f - f), mat);
+			us_put(c, i, j + 1, v * f, mat);
+		}
 	}
 }
 
@@ -110,6 +167,9 @@ static void *create(uint32_t seed)
 		t->h = us_randr(&s->rng, 0.025f, 0.05f);
 		tree_branch(t, &s->rng, 0, 0, -US_PI * 0.5f + us_randn(&s->rng) * 0.05f, t->h * 0.45f, 1.0f, 0);
 	}
+	s->ridge_side = us_rand(&s->rng) < 0.5f ? -1.0f : 1.0f;
+	tree_branch_d(&s->oak, &s->rng, 0, 0, -US_PI * 0.5f + us_randn(&s->rng) * 0.06f, 0.085f, 1.0f, 0, 5);
+	s->heat_amp = 1.0f;
 	s->heat_next = us_randr(&s->rng, 2.0f, 6.0f);
 	s->evo = us_rand(&s->rng) * 100.0f;
 	s->drift = us_rand(&s->rng) * 50.0f;
@@ -185,6 +245,7 @@ static void strike(st_t *s, float A, int ground, float dens, float energy)
 				y1 = horizon_y(s->tree[i].x) - s->tree[i].h;
 			}
 		bolt(s, x0, y0, x1, y1, 0.16f * (y1 - y0 + 0.1f), 7, 1.0f, 1.0f, fork);
+		s->hit_x = x1;
 		s->bolt_x = x0;
 		s->bolt_y = y0;
 		s->bolt_amp = 1.0f;
@@ -197,6 +258,7 @@ static void strike(st_t *s, float A, int ground, float dens, float energy)
 		s->bolt_x = (x0 + x1) * 0.5f;
 		s->bolt_y = y0;
 		s->bolt_amp = 0.65f;
+		s->hit_x = s->bolt_x;
 	}
 	s->bolt_t = 0;
 	s->nstrokes = 1 + (int)(us_rand(r) * (ground ? 3.5f : 2.0f));
@@ -433,6 +495,16 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 			s->cool = 0.3f;
 		}
 	}
+	/* smaller hits: a flicker deep inside the deck (a stroke we do not see) */
+	s->small_cool -= rdt;
+	if (a->beat && !(big && s->cool > 0 && s->bolt_t < 0.05f) && s->bolt_t > 0.25f && a->onset > 0.2f &&
+	    s->small_cool <= 0 && ch > 0.08f) {
+		s->heat_t = 0;
+		s->heat_x = us_randr(r, 0.05f, 0.95f) * A;
+		s->heat_y = us_randr(r, 0.12f, base);
+		s->heat_amp = (0.55f + 0.7f * a->onset) * (0.5f + 0.8f * ch);
+		s->small_cool = us_randr(r, 0.25f, 0.6f);
+	}
 	/* flash envelope from the return strokes */
 	s->flash = 0;
 	if (s->nseg > 0)
@@ -452,6 +524,7 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 		s->heat_y = us_randr(r, 0.15f, base + 0.05f);
 		float quiet = 1.0f - a->level;
 		s->heat_next = us_randr(r, 3.0f, 12.0f) * (1.4f - 0.6f * quiet) * (1.2f - 0.5f * cv);
+		s->heat_amp = 1.0f;
 	}
 	s->heat_t += rdt;
 	{
@@ -461,7 +534,7 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 			v = (expf(-ht / 0.06f) + 0.7f * (ht > 0.18f ? expf(-(ht - 0.18f) / 0.05f) : 0) +
 			     0.5f * (ht > 0.4f ? expf(-(ht - 0.4f) / 0.08f) : 0)) *
 			    0.5f;
-		s->heat_v = v * (0.6f + 0.4f * (1.0f - a->level));
+		s->heat_v = v * (s->heat_amp < 1.0f ? s->heat_amp : (0.6f + 0.4f * (1.0f - a->level)) * s->heat_amp);
 	}
 
 	/* ---- clouds ---- */
@@ -473,6 +546,74 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 		if (s->flash > 0.12f || s->heat_v > 0.12f)
 			draw_contours(s, c, A, nlev * 2 + 1, cv, base, 1);
 		draw_hatch(s, c, A, 0.62f - 0.1f * cv, dens > 0.6f ? 1 : 2, cv, base);
+	}
+
+	/* ---- the deck's underside: mammatus pouches + a tiered shelf leading the front ---- */
+	{
+		float mam = us_smooth(0.3f, 0.75f, cv);
+		/* the visible underside: lowest crossing of the outermost contour level, per column, smoothed */
+		float vb[GW], sb[GW];
+		float iso0 = 1.0f / (3 + (int)(dens * 4.0f + 0.5f) + 1.0f);
+		for (int i = 0; i < GW; i++) {
+			vb[i] = 0;
+			for (int j = GH - 1; j > 0; j--) {
+				float d1 = s->D[j * GW + i], d0 = s->D[(j - 1) * GW + i];
+				if (d0 > iso0 && d1 <= iso0) {
+					vb[i] = SKY_Y * (j - 1 + (d0 - iso0) / (d0 - d1 + 1e-6f)) / (GH - 1);
+					break;
+				}
+			}
+		}
+		for (int i = 0; i < GW; i++) {
+			float acc = 0, wsum = 0;
+			for (int k = -2; k <= 2; k++) {
+				int j = i + k < 0 ? 0 : (i + k >= GW ? GW - 1 : i + k);
+				float wk = 1.0f - fabsf((float)k) / 3.0f;
+				acc += vb[j] * wk;
+				wsum += wk;
+			}
+			sb[i] = acc / wsum;
+		}
+		float cw = A / (GW - 1);
+		if (mam > 0.02f) {
+			int step = ctx->crisp ? 4 : 3;
+			for (int i = 1; i < GW - 1; i += step) {
+				float heavy = us_smooth(0.5f, 0.85f, s->col[i]);
+				if (heavy < 0.05f)
+					continue;
+				float jit = us_noise2(i * 0.9f + s->drift * 2.0f, 4.0f);
+				float rr = cw * step * (0.55f + 0.15f * jit) * (0.6f + 0.4f * mam) * (0.6f + 0.6f * heavy);
+				float cx = (i + 0.5f + jit) * cw, cy = sb[i] - rr * 0.25f;
+				float L = lit(s, cx, cy, base);
+				float v = (0.14f + 0.2f * heavy) * mam + 0.8f * L;
+				if (ctx->crisp)
+					us_disc(c, cx, cy, rr, us_sat(0.22f * (1.0f - 0.35f * cv) * us_sat(mam * 2.0f) + 0.9f * L), US_MAT_WATER); /* scallops the outer band */
+				else {
+					/* pouches hang in two staggered rows: lit lower rims, fainter upper folds */
+					us_arc(c, cx, cy, rr, 0.2f, US_PI - 0.2f, 0.0012f, us_sat(v), US_MAT_WATER);
+					us_arc(c, cx + rr, cy - rr * 0.7f, rr * 0.8f, 0.4f, US_PI - 0.4f, 0.001f, us_sat(v * 0.6f), US_MAT_WATER);
+				}
+			}
+		}
+		/* shelf: stacked, sweeping tiers under the leading (left, the deck rolls leftward) edge */
+		float shelf = us_smooth(0.15f, 0.55f, cv);
+		if (shelf > 0.02f && !ctx->crisp)
+			for (int k = 1; k <= 4; k++) {
+				float px = 0, py = 0;
+				for (int i = 0; i < GW; i += 2) {
+					float u = (float)i / (GW - 1);
+					float wedge = us_smooth(0.62f, 0.05f, u) * shelf;
+					float x = i * cw;
+					float y = sb[i] + wedge * (0.006f + 0.013f * k) + 0.003f * us_noise2(x * 6.0f + k, s->evo);
+					if (i > 0 && wedge > 0.05f) {
+						float L = lit(s, x, y, base);
+						wline(c, px, py, x, y, 0.0011f, us_sat((0.1f + 0.25f * wedge) * (1.0f - 0.15f * k) + 0.7f * L),
+						      US_MAT_WATER);
+					}
+					px = x;
+					py = y;
+				}
+			}
 	}
 
 	/* ---- rain curtains under heavy columns ---- */
@@ -514,7 +655,7 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 				k++;
 				continue;
 			}
-			us_line(c, x, d->y, x - d->vx * tl, d->y - d->vy * tl, 0.0009f, us_sat(v), US_MAT_WATER);
+			wline(c, x, d->y, x - d->vx * tl, d->y - d->vy * tl, 0.0009f, us_sat(v), US_MAT_WATER);
 			k++;
 		}
 	}
@@ -529,9 +670,11 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 			for (int k = 0; k < s->nseg; k++) {
 				seg_t *g = &s->seg[k];
 				float v = us_sat(fv * g->v * (s->flash > after ? 1.0f : 0.8f));
-				if (!ctx->crisp && s->flash > 0.2f)
-					us_line(c, g->x0, g->y0, g->x1, g->y1, 0.010f * g->w, v * 0.18f, US_MAT_LIGHT);
-				us_line(c, g->x0, g->y0, g->x1, g->y1, (ctx->crisp ? 0.003f : 0.0028f) * g->w, v, US_MAT_LIGHT);
+				if (!ctx->crisp && s->flash > 0.2f) {
+					us_line(c, g->x0, g->y0, g->x1, g->y1, 0.016f * g->w, v * 0.12f, US_MAT_LIGHT);
+					us_line(c, g->x0, g->y0, g->x1, g->y1, 0.0065f * g->w, v * 0.35f, US_MAT_LIGHT);
+				}
+				us_line(c, g->x0, g->y0, g->x1, g->y1, (ctx->crisp ? 0.003f : 0.0032f) * g->w, us_sat(v * 1.15f), US_MAT_LIGHT);
 			}
 		}
 	}
@@ -573,6 +716,67 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 			for (int k = 0; k < t->nseg; k++)
 				us_line(c, tx + t->sx0[k], ty + t->sy0[k], tx + t->sx1[k], ty + t->sy1[k],
 					0.0022f * t->sw[k] + 0.0008f, us_sat(0.45f + 0.5f * L), US_MAT_STEM);
+		}
+	}
+
+	/* ---- the near ridge + its oak: black until a flash reveals them ---- */
+	{
+		float side = s->ridge_side;
+		float Lg = s->flash * s->bolt_amp;
+		/* light falls off away from where the stroke came down */
+		float hx = s->hit_x;
+		int iv0 = 0;
+		uint8_t fm = US_MAT_EARTH;
+		if (ctx->crisp) { /* a dark silhouette against the far fields until the sky lights it */
+			float lv = 0.45f * Lg + 0.1f * s->heat_v;
+			fm = lv > 0.12f ? US_MAT_EARTH : US_MAT_BG;
+			iv0 = (int)(us_sat(lv > 0.12f ? 0.1f + lv : 0.0f) * 255.0f);
+		}
+		for (int px = 0; px < c->w; px++) {
+			float u = (px + 0.5f) / c->s / A;
+			int y0 = (int)ceilf(ridge_y(u, side) * c->s);
+			for (int py = y0 < 0 ? 0 : y0; py < c->h; py++) {
+				size_t i = (size_t)py * c->w + px;
+				c->ink[i] = (uint8_t)iv0;
+				c->mat[i] = fm;
+			}
+		}
+		float pts[2 * 97];
+		for (int i = 0; i <= 96; i++) {
+			float u = i / 96.0f;
+			pts[2 * i] = u * A;
+			pts[2 * i + 1] = ridge_y(u, side);
+		}
+		for (int i = 0; i < 96; i++) {
+			float x = pts[2 * i];
+			float dx = x - hx;
+			float L = Lg * (0.4f + 0.6f * expf(-dx * dx / 0.15f)) + 0.15f * s->heat_v;
+			wline(c, pts[2 * i], pts[2 * i + 1], pts[2 * i + 2], pts[2 * i + 3], 0.0016f, us_sat(0.2f + 0.8f * L), US_MAT_EARTH);
+			/* wet grass on the crest, combed by the storm wind */
+			if ((!ctx->crisp || (i & 1) == 0) && pts[2 * i + 1] < 0.95f)
+				for (int q = 0; q < 3; q++) {
+					float gx = x + (q + us_noise2(i * 1.3f, q * 2.1f)) * A / 96.0f / 3.0f;
+					float gy = ridge_y(gx / A, side);
+					float gh = 0.008f + 0.008f * (0.5f + 0.5f * us_noise2(gx * 9.0f, 3.3f));
+					float lean = 0.006f + 0.01f * wind * 20.0f * (0.5f + 0.5f * us_noise2(gx * 3.0f - (float)ctx->t * 2.0f, 1.0f));
+					wline(c, gx, gy, gx - lean, gy - gh, 0.001f, us_sat(0.1f + 0.75f * L), US_MAT_LEAF);
+				}
+		}
+		/* the oak on the crest: limbs thrash a little in the gusts */
+		float ou = side > 0 ? 0.8f : 0.2f;
+		float ox = ou * A, oy = ridge_y(ou, side) + 0.004f;
+		float dxo = ox - hx;
+		float Lo = Lg * (0.45f + 0.55f * expf(-dxo * dxo / 0.15f)) + 0.2f * s->heat_v;
+		tree_t *t = &s->oak;
+		float sway = (0.4f + 30.0f * wind) * 0.012f;
+		for (int k = 0; k < t->nseg; k++) {
+			float h0 = -t->sy0[k], h1 = -t->sy1[k];
+			float ws = sway * us_noise2(k * 0.2f, (float)ctx->t * 0.9f);
+			float x0 = ox + t->sx0[k] * 1.2f + ws * h0 * 6.0f, y0 = oy + t->sy0[k] * 1.2f;
+			float x1 = ox + t->sx1[k] * 1.2f + ws * h1 * 6.0f, y1 = oy + t->sy1[k] * 1.2f;
+			float wd = 0.0075f * t->sw[k] + 0.001f;
+			float v = us_sat((ctx->crisp ? 0.2f : 0.1f) + 0.85f * Lo);
+			(wd * c->s > 1.6f || ctx->crisp ? us_line : wline)(c, x0, y0, x1, y1, wd, v, US_MAT_STEM);
 		}
 	}
 }
