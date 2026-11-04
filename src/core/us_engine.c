@@ -24,6 +24,7 @@ void us_engine_init(us_engine *e)
 	e->ink_scale = 1.0f;
 	e->linked = 1;
 	e->world_speed = 1.0f;
+	e->xfade_len = 2.0f;
 	e->params.density = e->params.speed = e->params.reactivity = 0.5f;
 	us_world_init(&e->private_world);
 }
@@ -33,7 +34,10 @@ void us_engine_free(us_engine *e)
 	if (e->vt && e->scene)
 		e->vt->destroy(e->scene);
 	us_canvas_free(&e->canvas);
+	us_canvas_free(&e->disp);
 	free(e->rgba);
+	free(e->xf_ink);
+	free(e->xf_mat);
 	memset(e, 0, sizeof(*e));
 }
 
@@ -42,13 +46,22 @@ void us_engine_set_scene(us_engine *e, const char *id, uint32_t seed)
 	const us_scene_vt *vt = us_scene_find(id);
 	if (vt == e->vt && seed == e->seed && e->scene)
 		return;
-	if (e->vt && e->scene)
+	int had = e->vt && e->scene;
+	if (had)
 		e->vt->destroy(e->scene);
 	e->vt = vt;
 	e->seed = seed;
 	e->scene = vt->create(seed);
-	if (e->canvas.ink)
+	if (e->canvas.ink) {
+		size_t n = (size_t)e->canvas.w * e->canvas.h;
+		if (had && e->xfade_len > 0.01f && e->xf_ink && e->xf_mat) {
+			/* snapshot what is on screen now and dissolve it out */
+			memcpy(e->xf_ink, e->xf_t > 0 && e->disp.ink ? e->disp.ink : e->canvas.ink, n);
+			memcpy(e->xf_mat, e->xf_t > 0 && e->disp.mat ? e->disp.mat : e->canvas.mat, n);
+			e->xf_t = 1.0f;
+		}
 		us_canvas_clear(&e->canvas);
+	}
 }
 
 void us_engine_configure(us_engine *e, const us_look *look, int out_w, int out_h, int pixel_size, float ink_scale)
@@ -64,10 +77,18 @@ void us_engine_configure(us_engine *e, const us_look *look, int out_w, int out_h
 	if (e->canvas.ink && e->canvas.w == cw && e->canvas.h == ch && e->canvas.crisp == crisp)
 		return;
 	us_canvas_free(&e->canvas);
+	us_canvas_free(&e->disp);
 	free(e->rgba);
+	free(e->xf_ink);
+	free(e->xf_mat);
 	e->rgba = NULL;
-	if (us_canvas_init(&e->canvas, cw, ch, crisp))
+	e->xf_ink = e->xf_mat = NULL;
+	e->xf_t = 0; /* a canvas change cancels any dissolve */
+	if (us_canvas_init(&e->canvas, cw, ch, crisp) && us_canvas_init(&e->disp, cw, ch, crisp)) {
 		e->rgba = calloc((size_t)cw * ch * 4, 1);
+		e->xf_ink = calloc((size_t)cw * ch, 1);
+		e->xf_mat = calloc((size_t)cw * ch, 1);
+	}
 }
 
 us_world *us_engine_world(us_engine *e) { return e->linked ? us_world_shared() : &e->private_world; }
@@ -130,5 +151,26 @@ void us_engine_frame(us_engine *e, const us_audio *a_in, float dt, double clock_
 		.crisp = e->canvas.crisp,
 	};
 	e->vt->frame(e->scene, &ctx, &e->canvas);
-	us_compose(&e->canvas, &e->look, e->rgba);
+
+	if (e->xf_t > 0 && e->xf_ink && e->disp.ink) {
+		e->xf_t -= dt / (e->xfade_len > 0.01f ? e->xfade_len : 0.01f);
+		if (e->xf_t < 0)
+			e->xf_t = 0;
+		float k = us_smooth(0, 1, e->xf_t);
+		unsigned ko = (unsigned)(k * 256), kn = 256 - ko;
+		size_t n = (size_t)e->canvas.w * e->canvas.h;
+		for (size_t i = 0; i < n; i++) {
+			unsigned o = (e->xf_ink[i] * ko) >> 8, nw = (e->canvas.ink[i] * kn) >> 8;
+			if (o > nw) {
+				e->disp.ink[i] = (uint8_t)o;
+				e->disp.mat[i] = e->xf_mat[i];
+			} else {
+				e->disp.ink[i] = (uint8_t)nw;
+				e->disp.mat[i] = e->canvas.mat[i];
+			}
+		}
+		us_compose(&e->disp, &e->look, e->rgba);
+	} else {
+		us_compose(&e->canvas, &e->look, e->rgba);
+	}
 }

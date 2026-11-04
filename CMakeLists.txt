@@ -43,7 +43,7 @@ if(UNDERSTORY_BUILD_PLUGIN AND APPLE)
     file(WRITE "${GEN_INC}/obsconfig.h"
       "#pragma once\n#define OBS_DATA_PATH \"../Resources\"\n#define OBS_PLUGIN_PATH \"../PlugIns\"\n#define OBS_PLUGIN_DESTINATION \"PlugIns\"\n#define OBS_RELEASE_CANDIDATE 0\n#define OBS_BETA 0\n#define OBS_INSTALL_PREFIX \"\"\n")
     add_library(understory MODULE src/obs/plugin.c)
-    target_include_directories(understory PRIVATE "${OBS_SRC}/libobs" "${GEN_INC}" src)
+    target_include_directories(understory PRIVATE "${OBS_SRC}/libobs" "${GEN_INC}" "${CMAKE_SOURCE_DIR}/deps/simde" src)
     target_link_libraries(understory PRIVATE us_core "-F${OBS_APP}/Contents/Frameworks" "-framework libobs")
     target_compile_options(understory PRIVATE -Wall -Wno-unused-parameter -Wno-deprecated-declarations)
     set_target_properties(understory PROPERTIES
@@ -54,6 +54,7 @@ if(UNDERSTORY_BUILD_PLUGIN AND APPLE)
       MACOSX_BUNDLE_GUI_IDENTIFIER "wtf.omigod.understory"
       MACOSX_BUNDLE_BUNDLE_VERSION "${PROJECT_VERSION}"
       MACOSX_BUNDLE_SHORT_VERSION_STRING "${PROJECT_VERSION}"
+      BUILD_WITH_INSTALL_RPATH TRUE
       INSTALL_RPATH "@executable_path/../Frameworks")
     # data/ -> Contents/Resources
     file(GLOB_RECURSE DATA_FILES RELATIVE "${CMAKE_SOURCE_DIR}/data" "${CMAKE_SOURCE_DIR}/data/*")
@@ -65,4 +66,13 @@ if(UNDERSTORY_BUILD_PLUGIN AND APPLE)
   else()
     message(WARNING "deps/obs-studio not found — skipping OBS plugin. Run tools/fetch-obs-headers.sh")
   endif()
+endif()
+
+# headless OBS load/render test (macOS): loads the plugin into OBS.app's libobs with a throwaway config
+if(TARGET understory)
+  add_executable(obs_host_test tools/obs_host_test.c)
+  target_include_directories(obs_host_test PRIVATE "${OBS_SRC}/libobs" "${GEN_INC}" "${CMAKE_SOURCE_DIR}/deps/simde")
+  target_link_libraries(obs_host_test PRIVATE "-F${OBS_APP}/Contents/Frameworks" "-framework libobs" "-Wl,-rpath,${OBS_APP}/Contents/Frameworks")
+  target_compile_options(obs_host_test PRIVATE -Wno-deprecated-declarations)
+  add_dependencies(obs_host_test understory)
 endif()

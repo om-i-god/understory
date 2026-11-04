@@ -3,3 +3,4 @@ build*/
 out/
 .superpowers/
 *.f32
+.claude/

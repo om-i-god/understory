@@ -59,6 +59,12 @@ typedef struct us_engine {
 	float trails_bias; /* -0.5..0.5 added to the scene's default trails */
 	double sim_t;
 	double clock_t; /* wall clock used to de-duplicate world steps */
+
+	/* scene-change dissolve */
+	float xfade_len; /* seconds; 0 = hard cut */
+	float xf_t;      /* 1 -> 0 while dissolving */
+	uint8_t *xf_ink, *xf_mat;
+	us_canvas disp;  /* composited display canvas used during a dissolve */
 } us_engine;
 
 void us_engine_init(us_engine *e);
