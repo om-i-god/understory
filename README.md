@@ -2,6 +2,8 @@
 
 Living, generative, nature-inspired visuals for OBS that listen to your music.
 
+![All thirteen scenes, alternating Ink and Pixel looks](docs/scenes.png)
+
 Understory adds a video source to OBS. Point it at any audio (Desktop Audio, a mic, a media source)
 and it grows a small world on screen: plants that bloom with the bass and sway in the highs, rivers
 that run faster when the mids push, rain that falls on the drum hits, storms that charge through long
