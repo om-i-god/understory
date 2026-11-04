@@ -116,6 +116,9 @@ static float sea_h(const st_t *st, float xf, float z, float X, float level)
 /* fast thin AA line (Wu) — many short row segments in Ink */
 static void wu_line(us_canvas *c, float ax, float ay, float bx, float by, float v, uint8_t mat)
 {
+	/* hairlines in Ink read too dim on projectors: lift them (pixel styles are already bold) */
+	if (!c->crisp)
+		v = v * 1.8f > 1.0f ? 1.0f : v * 1.8f;
 	float x0 = ax * c->s, y0 = ay * c->s, x1 = bx * c->s, y1 = by * c->s;
 	int steep = fabsf(y1 - y0) > fabsf(x1 - x0);
 	if (steep) {
