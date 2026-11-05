@@ -7,6 +7,10 @@
  *   fern (fiddleheads that unfurl with the bass)     oat grass (drooping panicles, anthers dangle in bloom)
  *   foxglove spike (bells open bottom-up)            vine (bindweed climbing last year's stalk, trumpets)
  * Butterflies and bees visit open blooms when the world has insects / pollen.
+ * Sky: blue ridged mountains and a wooded ridge behind the meadow (aerial perspective: fainter, finer,
+ * cooler with distance), valley mist, cirrus combs, cumulus that drift downwind and swell with the
+ * phrase (rims lit from the sun / moon side), a sun with breathing halo + crepuscular shafts, twilight
+ * afterglow over the mountains, a haloed moon, stars; swallows (bats after dark) and skeins of geese.
  * Bass drives growth and opens flowers; highs + world wind drive sway; kicks nudge blooms.
  * World: reads moisture, mycelium (growth speed), season (autumn colour + leaf fall, bare snow-capped
  *        winter stems and snowfall), daylight, insects; writes growth + bloom + pollen.
@@ -24,6 +28,9 @@
 #define MAX_ANCH 160
 #define MAX_FLY 8
 #define MAX_BEE 10
+#define MAX_CLOUD 7
+#define MAX_BUMP 11
+#define MAX_BIRD 16
 
 enum { GROW = 0, BLOOM, SEED, WITHER };
 enum { SP_WILD = 0, SP_UMBEL, SP_FERN, SP_GRASS, SP_SPIKE, SP_VINE, SP_COUNT };
@@ -74,6 +81,19 @@ typedef struct {
 } fly_t;
 
 typedef struct {
+	float x, y, s; /* x: 0..1 of (width + margin), y: base line, s: scale */
+	float spd, depth; /* depth 0 far (small, faint) .. 1 near */
+	int nb;
+	float bx[MAX_BUMP], by[MAX_BUMP], br[MAX_BUMP]; /* bumps relative to (x, y), units of s */
+} cloud_t;
+
+typedef struct {
+	float x, y, vx, vy, ph, size;
+	int alive, kind; /* kind 0 skein member, 1 swallow */
+	int slot;
+} bird_t;
+
+typedef struct {
 	us_rng rng;
 	int npl[NL];
 	plant_t pl[NL][MAX_PL];
@@ -87,6 +107,13 @@ typedef struct {
 	int inited;
 	float bass_env;
 	float wind_t;
+	/* sky */
+	int sky_inited;
+	cloud_t cloud[MAX_CLOUD];
+	bird_t bird[MAX_BIRD];
+	float skein_x, skein_y, skein_t, skein_dir, skein_wait;
+	int skein_n;
+	float swell_env;
 } st_t;
 
 /* per-frame drawing context */
@@ -192,6 +219,26 @@ static void wpoly(us_canvas *c, const float *xy, int n, float width, float v, ui
 {
 	for (int i = 0; i + 1 < n; i++)
 		wline(c, xy[2 * i], xy[2 * i + 1], xy[2 * i + 2], xy[2 * i + 3], width, v, mat);
+}
+
+/* fast ring from Wu lines (us_ring is exact but costly for big faint halos) */
+static void wring(us_canvas *c, float x, float y, float r, float width, float v, uint8_t mat)
+{
+	if (c->crisp) {
+		us_ring(c, x, y, r, width, v, mat);
+		return;
+	}
+	int n = (int)(r * c->s * 0.6f);
+	if (n < 6) n = 6;
+	if (n > 128) n = 128;
+	float px = x + r, py = y;
+	for (int i = 1; i <= n; i++) {
+		float a = US_TAU * i / n;
+		float qx = x + cosf(a) * r, qy = y + sinf(a) * r;
+		wline(c, px, py, qx, qy, width, v, mat);
+		px = qx;
+		py = qy;
+	}
 }
 
 /* petal: filled lens in crisp mode, outlined lens in ink mode */
@@ -733,83 +780,135 @@ static void draw_spike(dc_t *d, plant_t *p, int pi, float gx, float gy, float vb
 	us_rng_seed(&gr, p->gene);
 	float H = p->height;
 	float lf = leafy(d);
+	float face = us_rand(&gr) < 0.5f ? -1.0f : 1.0f; /* foxglove bells all hang to one side of the raceme */
 	if (lf > 0.05f)
-		for (int k = 0; k < 4; k++) {
-			float la = -US_PI * 0.5f + (k < 2 ? -1.0f : 1.0f) * (0.75f + 0.35f * (k & 1)) + 0.12f * sway_n(d, gx, k + 9.0f);
-			float ll = H * 0.16f * us_sat(p->g * 2.5f) * lf;
-			petal(c, d->crisp, gx, gy, la, ll, ll * 0.17f, 0.65f * vbase, leaf_mat(d, p->gene + k));
+		for (int k = 0; k < 6; k++) {
+			float la = -US_PI * 0.5f + (k & 1 ? -1.0f : 1.0f) * (0.65f + 0.22f * (k >> 1)) + 0.12f * sway_n(d, gx, k + 9.0f);
+			float ll = H * (0.18f - 0.025f * (k >> 1)) * us_sat(p->g * 2.5f) * lf;
+			petal(c, d->crisp, gx, gy, la, ll, ll * 0.2f, 0.62f * vbase, leaf_mat(d, p->gene + k));
 		}
-	float pts[2 * 13];
+	enum { NS = 14 };
+	float pts[2 * (NS + 1)];
 	float frac = us_sat(p->g * 1.1f);
 	if (frac < 0.05f)
 		return;
-	stalk(d, gx, gy, H, frac, us_randn(&gr) * 0.05f, us_randn(&gr) * 0.012f, pi + 0.3f, 12, pts);
-	wpoly(c, pts, 13, lw(d, 0.0022f), 0.8f * vbase, d->winter > 0.5f ? US_MAT_EARTH : US_MAT_STEM);
+	/* the stalk: gently curved, the flowering tip nods over toward the bells and sways */
+	{
+		float lean = us_randn(&gr) * 0.05f, curve = us_randn(&gr) * 0.008f;
+		float ang = -US_PI * 0.5f + lean, x = gx, y = gy, seg = H * frac / NS;
+		float sw = sway_n(d, gx, pi + 0.3f);
+		pts[0] = x;
+		pts[1] = y;
+		for (int k = 0; k < NS; k++) {
+			float hgt = (float)k / NS;
+			float nod = face * 0.07f * us_smooth(0.6f, 1.0f, hgt) * frac;
+			ang += curve + nod + sw * (0.2f + hgt) * 0.5f;
+			x += cosf(ang) * seg;
+			y += sinf(ang) * seg;
+			pts[2 * k + 2] = x;
+			pts[2 * k + 3] = y;
+		}
+	}
+	uint8_t sm = d->winter > 0.5f ? US_MAT_EARTH : US_MAT_STEM;
+	for (int k = 0; k < NS; k++) /* tapering stem */
+		wline(c, pts[2 * k], pts[2 * k + 1], pts[2 * k + 2], pts[2 * k + 3], lw(d, 0.0026f - 0.0013f * k / NS), 0.8f * vbase, sm);
 	/* small stem leaves on the lower half */
 	if (lf > 0.05f)
-		for (int i = 2; i < 6; i++) {
+		for (int i = 2; i < 7; i++) {
 			float dx = pts[2 * i + 2] - pts[2 * i], dy = pts[2 * i + 3] - pts[2 * i + 1];
 			float ha = atan2f(dy, dx);
-			petal(c, d->crisp, pts[2 * i], pts[2 * i + 1], ha + ((i & 1) ? 0.9f : -0.9f), H * 0.07f * lf,
-			      H * 0.018f * lf, 0.6f * vbase, leaf_mat(d, p->gene + 31 + i));
+			float ll = H * (0.085f - 0.009f * i) * lf;
+			petal(c, d->crisp, pts[2 * i], pts[2 * i + 1], ha + ((i & 1) ? 0.85f : -0.85f), ll, ll * 0.24f, 0.6f * vbase,
+			      leaf_mat(d, p->gene + 31 + i));
 		}
-	if (frac < 0.6f)
+	if (frac < 0.55f)
 		return;
-	int nbell = d->L == 0 ? 6 : 12;
+	int nbell = d->L == 0 ? 8 : 16;
 	uint8_t fm = flower_mat(p);
 	float op = p->open;
 	int dry = d->winter > 0.5f || p->phase == WITHER;
 	for (int b = 0; b < nbell; b++) {
-		float s = 0.5f + 0.48f * b / nbell; /* position up the stem */
-		float t = s * 12.0f;
-		int i0 = (int)t;
-		if (i0 > 11)
-			i0 = 11;
-		float ft = t - i0;
-		float nx = us_lerp(pts[2 * i0], pts[2 * i0 + 2], ft), ny = us_lerp(pts[2 * i0 + 1], pts[2 * i0 + 3], ft);
+		float bf = (float)b / nbell;
+		float s = 0.4f + 0.58f * powf(bf, 0.85f); /* crowding toward the tip */
 		if (s > frac)
 			break;
-		float sd = (b & 1) ? 1.0f : -1.0f;
-		float bf = (float)b / nbell;
-		/* opening wave climbs the spike */
-		float ob = us_sat(op * 1.6f - bf * 0.9f);
+		float t = s * NS;
+		int i0 = (int)t;
+		if (i0 > NS - 1)
+			i0 = NS - 1;
+		float ft = t - i0;
+		float nx = us_lerp(pts[2 * i0], pts[2 * i0 + 2], ft), ny = us_lerp(pts[2 * i0 + 1], pts[2 * i0 + 3], ft);
+		float sang = atan2f(pts[2 * i0 + 3] - pts[2 * i0 + 1], pts[2 * i0 + 2] - pts[2 * i0]);
+		/* slight spiral: most bells face out, every third peeks round the front or back */
+		float sd = face * ((b % 3) == 2 ? -0.55f : 1.0f);
+		float jit = 0.25f * (hashf(p->gene + b * 7u) - 0.5f);
 		if (p->phase == SEED || dry) {
-			float cap = us_sat(1.0f - bf * 1.2f);
-			if (cap > 0.1f)
-				us_disc(c, nx + sd * 0.004f * LSCALE[d->L], ny, 0.0022f * LSCALE[d->L] + 0.0008f, 0.6f * vbase,
-					dry ? US_MAT_EARTH : US_MAT_ACCENT);
+			float cap = us_sat(1.0f - bf * 1.1f);
+			if (cap > 0.1f) {
+				float cx = nx + sd * 0.004f * LSCALE[d->L], cy = ny + 0.002f;
+				us_disc(c, cx, cy, 0.0024f * LSCALE[d->L] + 0.0008f, 0.6f * vbase, dry ? US_MAT_EARTH : US_MAT_ACCENT);
+				if (!d->crisp)
+					wline(c, cx, cy, cx + sd * 0.002f, cy - 0.004f * LSCALE[d->L], 0.001f, 0.5f * vbase, dry ? US_MAT_EARTH : US_MAT_ACCENT);
+			}
 			continue;
 		}
-		float bl = H * (0.06f - 0.025f * bf);
-		if (ob < 0.15f) {
-			us_point(c, nx + sd * 0.003f, ny, 0.0012f + 0.001f * LSCALE[d->L], 0.6f * vbase, US_MAT_LEAF);
+		/* opening wave climbs the spike: lower bells are open, the tip stays in tight buds */
+		float ob = us_sat(op * 1.7f - bf * 1.1f);
+		float bl = H * (0.075f - 0.042f * bf);
+		if (ob < 0.12f || bf > 0.82f) {
+			float br = (0.0011f + 0.0016f * LSCALE[d->L]) * (1.0f - 0.5f * bf);
+			float bx = nx + sd * br * 1.2f, by = ny + br * 0.4f;
+			if (d->crisp)
+				us_disc(c, bx, by, br, 0.6f * vbase, US_MAT_LEAF);
+			else {
+				petal(c, 0, nx, ny, sang + US_PI * 0.5f * sd + 0.4f * sd, br * 2.6f, br * 0.8f, 0.6f * vbase, ob > 0.05f ? fm : US_MAT_LEAF);
+			}
 			continue;
 		}
-		/* a nodding bell on a short pedicel: tube hanging out and down, flared mouth */
-		float ba = US_PI * 0.5f - sd * (0.75f - 0.3f * ob);
-		float x0 = nx + sd * bl * 0.25f, y0 = ny + bl * 0.08f;
-		wline(c, nx, ny, x0, y0, lw(d, 0.0009f), 0.6f * vbase, US_MAT_STEM);
-		float L2 = bl * (0.5f + 0.5f * ob);
+		/* a nodding bell: tube hanging out and down from a short pedicel, flared lower lip */
+		float ba = US_PI * 0.5f - sd * (0.95f - 0.45f * ob) + jit + 0.6f * sway_n(d, gx, pi + b * 0.37f);
+		float x0 = nx + sd * bl * 0.18f, y0 = ny - bl * 0.02f;
+		float bv = (0.6f + 0.4f * ob) * vbase;
+		float L2 = bl * (0.55f + 0.45f * ob);
 		float ux = cosf(ba), uy = sinf(ba), vx = -uy, vy = ux;
-		float w0 = bl * 0.13f, w1 = bl * (0.17f + 0.13f * ob);
+		float w0 = bl * 0.12f, w1 = bl * (0.2f + 0.14f * ob);
 		float mx = x0 + ux * L2, my = y0 + uy * L2;
-		float bv = (0.55f + 0.45f * ob) * vbase;
 		if (d->crisp) {
+			wline(c, nx, ny, x0, y0, 0.003f, 0.6f * vbase, US_MAT_STEM);
 			us_tri(c, x0 + vx * w0, y0 + vy * w0, x0 - vx * w0, y0 - vy * w0, mx + vx * w1, my + vy * w1, bv, fm);
 			us_tri(c, x0 - vx * w0, y0 - vy * w0, mx - vx * w1, my - vy * w1, mx + vx * w1, my + vy * w1, bv, fm);
-		} else {
-			float q[] = {mx + vx * w1 * 1.25f + ux * bl * 0.05f, my + vy * w1 * 1.25f + uy * bl * 0.05f,
-				     mx + vx * w1, my + vy * w1, x0 + vx * w0, y0 + vy * w0, x0 - vx * w0, y0 - vy * w0,
-				     mx - vx * w1, my - vy * w1, mx - vx * w1 * 1.25f + ux * bl * 0.05f, my - vy * w1 * 1.25f + uy * bl * 0.05f};
-			wpoly(c, q, 6, lw(d, 0.0011f), bv, fm);
-			us_point(c, x0 + ux * L2 * 0.6f, y0 + uy * L2 * 0.6f, 0.0009f, bv * 0.8f, US_MAT_LIGHT); /* freckles in the throat */
+			continue;
+		}
+		float wl = lw(d, 0.0012f);
+		wline(c, nx, ny, x0, y0, lw(d, 0.001f), 0.6f * vbase, US_MAT_STEM);
+		/* the two sides of the tube bulge gently; the lower lip reaches further than the upper */
+		float sx = vx * (sd > 0 ? 1.0f : -1.0f), sy = vy * (sd > 0 ? 1.0f : -1.0f); /* +s = upper side */
+		float up[] = {x0 + sx * w0, y0 + sy * w0, x0 + ux * L2 * 0.5f + sx * w1 * 0.95f, y0 + uy * L2 * 0.5f + sy * w1 * 0.95f,
+			      mx + sx * w1, my + sy * w1, mx + sx * w1 * 1.3f + ux * bl * 0.06f, my + sy * w1 * 1.3f + uy * bl * 0.06f};
+		float lo[] = {x0 - sx * w0, y0 - sy * w0, x0 + ux * L2 * 0.5f - sx * w1 * 0.85f, y0 + uy * L2 * 0.5f - sy * w1 * 0.85f,
+			      mx - sx * w1, my - sy * w1, mx - sx * w1 * 1.15f + ux * bl * 0.22f, my - sy * w1 * 1.15f + uy * bl * 0.22f};
+		wpoly(c, up, 4, wl, bv, fm);
+		wpoly(c, lo, 4, wl, bv, fm);
+		/* the mouth: an open ellipse seen at an angle */
+		float q[2 * 9];
+		float mr = w1 * 1.05f;
+		for (int e = 0; e <= 8; e++) {
+			float ea = e * US_TAU / 8;
+			q[2 * e] = mx + ux * bl * 0.04f + sx * mr * cosf(ea) + ux * mr * 0.4f * sinf(ea);
+			q[2 * e + 1] = my + uy * bl * 0.04f + sy * mr * cosf(ea) + uy * mr * 0.4f * sinf(ea);
+		}
+		wpoly(c, q, 9, wl, bv * 0.85f, fm);
+		/* freckles down the throat */
+		for (int f = 0; f < 3; f++) {
+			float ft2 = 0.45f + 0.18f * f;
+			us_point(c, x0 + ux * L2 * ft2 - sx * w1 * 0.3f, y0 + uy * L2 * ft2 - sy * w1 * 0.3f, 0.0009f, bv * 0.75f, US_MAT_LIGHT);
 		}
 		if (d->L > 0 && b % 3 == 0)
 			add_anchor(st, mx, my, ob);
 		if (d->L > 0 && d->a->beat && ob > 0.8f && us_rand(&st->rng) < 0.04f * d->a->onset)
 			spawn(st, mx, my, us_randr(&st->rng, 0.0f, 0.05f), 0.0f, bl * 0.5f, fm, 0);
 	}
-	snowcap(d, pts[24], pts[25], 0.004f);
+	snowcap(d, pts[2 * NS], pts[2 * NS + 1], 0.004f);
 }
 
 /* bindweed climbing last year's dead stalk; tendrils search, trumpets open with the bass */
@@ -922,16 +1021,29 @@ static void draw_butterfly(us_canvas *c, int crisp, float x, float y, float sz, 
 			us_tri(c, RX(0, -sz * 0.15f), RY(0, -sz * 0.15f), RX(a1x, a1y), RY(a1x, a1y), RX(a2x, a2y), RY(a2x, a2y), v, m);
 			us_tri(c, RX(0, sz * 0.05f), RY(0, sz * 0.05f), RX(b1x, b1y), RY(b1x, b1y), RX(b2x, b2y), RY(b2x, b2y), v * 0.8f, m);
 		} else {
-			float p1[] = {RX(0, -sz * 0.2f), RY(0, -sz * 0.2f), RX(a1x, a1y), RY(a1x, a1y), RX(a2x, a2y), RY(a2x, a2y),
+			/* rounded forewing + hindwing outlines, an inner vein contour and an eyespot */
+			float am = 0.5f * (a1x + a2x), amy = 0.5f * (a1y + a2y);
+			float p1[] = {RX(0, -sz * 0.2f), RY(0, -sz * 0.2f), RX(a1x * 0.55f, a1y * 1.02f), RY(a1x * 0.55f, a1y * 1.02f),
+				      RX(a1x, a1y), RY(a1x, a1y), RX(am * 1.1f, amy), RY(am * 1.1f, amy), RX(a2x, a2y), RY(a2x, a2y),
 				      RX(0, sz * 0.05f), RY(0, sz * 0.05f)};
-			wpoly(c, p1, 4, 0.0011f, v, m);
-			float p2[] = {RX(0, sz * 0.05f), RY(0, sz * 0.05f), RX(b1x, b1y), RY(b1x, b1y), RX(b2x, b2y), RY(b2x, b2y),
-				      RX(0, sz * 0.3f), RY(0, sz * 0.3f)};
-			wpoly(c, p2, 4, 0.0011f, v * 0.8f, m);
+			wpoly(c, p1, 6, 0.0013f, v, m);
+			float bm = 0.5f * (b1x + b2x) * 1.15f, bmy = 0.5f * (b1y + b2y) * 1.1f;
+			float p2[] = {RX(0, sz * 0.05f), RY(0, sz * 0.05f), RX(b1x, b1y), RY(b1x, b1y), RX(bm, bmy), RY(bm, bmy),
+				      RX(b2x, b2y), RY(b2x, b2y), RX(0, sz * 0.3f), RY(0, sz * 0.3f)};
+			wpoly(c, p2, 5, 0.0013f, v * 0.85f, m);
+			float i1[] = {RX(0, -sz * 0.05f), RY(0, -sz * 0.05f), RX(a1x * 0.6f, a1y * 0.62f), RY(a1x * 0.6f, a1y * 0.62f),
+				      RX(am * 0.62f, amy * 0.5f), RY(am * 0.62f, amy * 0.5f)};
+			wpoly(c, i1, 3, 0.001f, v * 0.5f, m);
+			us_point(c, RX(a1x * 0.62f, a1y * 0.45f), RY(a1x * 0.62f, a1y * 0.45f), sz * 0.09f * (0.4f + 0.6f * fx), v, US_MAT_LIGHT);
+			us_point(c, RX(b1x * 0.6f, b1y * 1.3f), RY(b1x * 0.6f, b1y * 1.3f), sz * 0.06f * (0.4f + 0.6f * fx), v * 0.8f, US_MAT_LIGHT);
 		}
 	}
-	wline(c, RX(0, -sz * 0.35f), RY(0, -sz * 0.35f), RX(0, sz * 0.45f), RY(0, sz * 0.45f), crisp ? 0.003f : 0.0014f, v,
+	wline(c, RX(0, -sz * 0.35f), RY(0, -sz * 0.35f), RX(0, sz * 0.45f), RY(0, sz * 0.45f), crisp ? 0.003f : 0.0016f, v,
 		US_MAT_STEM);
+	if (!crisp) { /* antennae */
+		wline(c, RX(0, -sz * 0.35f), RY(0, -sz * 0.35f), RX(-sz * 0.22f, -sz * 0.75f), RY(-sz * 0.22f, -sz * 0.75f), 0.001f, v * 0.7f, US_MAT_STEM);
+		wline(c, RX(0, -sz * 0.35f), RY(0, -sz * 0.35f), RX(sz * 0.22f, -sz * 0.75f), RY(sz * 0.22f, -sz * 0.75f), 0.001f, v * 0.7f, US_MAT_STEM);
+	}
 #undef RX
 #undef RY
 }
@@ -1026,7 +1138,7 @@ static void insects(dc_t *d, us_world *w, float dens)
 				f->alive = 0;
 		}
 		float tilt = f->mode ? 0.0f : us_clampf(f->vx * 2.0f, -0.5f, 0.5f);
-		draw_butterfly(c, d->crisp, f->x, f->y, f->size, f->ph, 0.9f, f->mat, tilt);
+		draw_butterfly(c, d->crisp, f->x, f->y, f->size * (d->crisp ? 1.0f : 1.55f), f->ph, 0.95f, f->mat, tilt);
 	}
 
 	for (int i = 0; i < MAX_BEE; i++) {
@@ -1093,6 +1205,557 @@ static void insects(dc_t *d, us_world *w, float dens)
 		else {
 			us_arc(c, b->x - 0.002f, b->y - 0.004f, 0.0035f, US_PI, US_TAU, 0.0009f, 0.35f + 0.25f * wf, US_MAT_WATER);
 			us_arc(c, b->x + 0.002f, b->y - 0.004f, 0.0035f, US_PI, US_TAU, 0.0009f, 0.35f + 0.25f * wf, US_MAT_WATER);
+		}
+	}
+}
+
+/* ---- sky: far mountains, a wooded ridge, clouds, sun / moon, birds ---------- */
+
+static float far_y(float u, int k)
+{
+	if (k == 0) { /* blue mountains: ridged noise, sharp crests */
+		float r = 1.0f - fabsf(us_noise2(u * 3.1f + 11.0f, 3.7f));
+		float r2 = 1.0f - fabsf(us_noise2(u * 7.3f + 2.0f, 9.1f));
+		return 0.54f - 0.09f * r * r - 0.03f * r2 * r2 * r - 0.025f * us_noise2(u * 1.3f, 8.1f) - 0.005f * us_noise2(u * 23.0f, 1.3f);
+	}
+	return 0.56f + 0.03f * us_noise2(u * 2.2f + 5.0f, 2.9f) + 0.006f * us_noise2(u * 9.0f, 6.6f); /* wooded ridge */
+}
+
+static void new_cloud(st_t *st, cloud_t *k, float x)
+{
+	us_rng *r = &st->rng;
+	k->x = x;
+	k->depth = us_rand(r);
+	/* far clouds sit low and small near the mountains, near clouds high and big */
+	k->y = us_lerp(0.385f, 0.235f, k->depth) + us_randr(r, -0.02f, 0.02f);
+	k->s = us_lerp(0.026f, 0.066f, k->depth) * us_randr(r, 0.85f, 1.15f);
+	k->spd = us_lerp(0.35f, 1.0f, k->depth);
+	/* a wide row of small billows along the flat base, a taller tier of big ones heaped over the middle */
+	int low = 5 + (int)(us_rand(r) * 3), top = 2 + (int)(us_rand(r) * 2.0f);
+	float wide = us_randr(r, 1.7f, 2.3f), lean = us_randr(r, -0.35f, 0.35f);
+	k->nb = 0;
+	for (int i = 0; i < low; i++) {
+		float t = (i + 0.5f) / low * 2.0f - 1.0f;
+		k->bx[k->nb] = t * wide + us_randr(r, -0.1f, 0.1f);
+		k->br[k->nb] = (0.3f + 0.32f * (1.0f - t * t)) * us_randr(r, 0.8f, 1.25f);
+		k->by[k->nb] = -k->br[k->nb] * us_randr(r, 0.45f, 0.75f);
+		k->nb++;
+	}
+	for (int i = 0; i < top; i++) {
+		float t = top > 1 ? (float)i / (top - 1) * 2.0f - 1.0f : 0.0f;
+		k->bx[k->nb] = t * 0.75f + lean + us_randr(r, -0.12f, 0.12f);
+		k->br[k->nb] = us_randr(r, 0.5f, 0.78f) * (1.0f - 0.2f * fabsf(t));
+		k->by[k->nb] = -us_randr(r, 0.5f, 0.85f);
+		k->nb++;
+	}
+}
+
+typedef struct {
+	float cx[MAX_BUMP], cy[MAX_BUMP], r[MAX_BUMP];
+	float base, x0, x1;
+	int nb;
+} cshape_t;
+
+static void cloud_shape(const cloud_t *k, int idx, float A, float t, float breath, cshape_t *o)
+{
+	float X0 = k->x * (A + 0.6f) - 0.3f;
+	o->nb = k->nb;
+	o->base = k->y;
+	o->x0 = 1e9f;
+	o->x1 = -1e9f;
+	for (int i = 0; i < k->nb; i++) {
+		float b = breath * (1.0f + 0.07f * us_noise2(t * 0.09f + i * 1.7f, idx * 3.1f));
+		o->r[i] = k->br[i] * k->s * b;
+		o->cx[i] = X0 + k->bx[i] * k->s;
+		o->cy[i] = k->y + k->by[i] * k->s * b;
+		if (o->cx[i] - o->r[i] < o->x0)
+			o->x0 = o->cx[i] - o->r[i];
+		if (o->cx[i] + o->r[i] > o->x1)
+			o->x1 = o->cx[i] + o->r[i];
+	}
+}
+
+static int in_cloud(const cshape_t *o, float x, float y, int skip, float shrink)
+{
+	if (y > o->base + 1e-4f)
+		return 0;
+	for (int j = 0; j < o->nb; j++) {
+		if (j == skip)
+			continue;
+		float dx = x - o->cx[j], dy = y - o->cy[j], rr = o->r[j] * shrink;
+		if (dx * dx + dy * dy < rr * rr)
+			return 1;
+	}
+	return 0;
+}
+
+/* overwrite the cloud body (hides stars / moon behind it), then draw a light-facing outline */
+static void draw_cloud(dc_t *d, const cshape_t *o, float depth, float lx, float ly, float lv, float skyv)
+{
+	us_canvas *c = d->c;
+	float fillv = d->crisp ? 0.3f : 0.012f;
+	int iv = (int)(fillv * 255.0f);
+	int px0 = (int)floorf(o->x0 * c->s), px1 = (int)ceilf(o->x1 * c->s);
+	float top = 1e9f;
+	for (int j = 0; j < o->nb; j++)
+		if (o->cy[j] - o->r[j] < top)
+			top = o->cy[j] - o->r[j];
+	int py0 = (int)floorf(top * c->s), py1 = (int)ceilf(o->base * c->s);
+	if (px0 < 0) px0 = 0;
+	if (py0 < 0) py0 = 0;
+	if (px1 > c->w - 1) px1 = c->w - 1;
+	if (py1 > c->h - 1) py1 = c->h - 1;
+	for (int py = py0; py <= py1; py++) { /* per row: fill the chord of every bump (no per-pixel tests) */
+		float y = (py + 0.5f) / c->s;
+		if (y > o->base)
+			break;
+		for (int j = 0; j < o->nb; j++) {
+			float dy = y - o->cy[j], h2 = o->r[j] * o->r[j] - dy * dy;
+			if (h2 <= 0)
+				continue;
+			float hw = sqrtf(h2);
+			int a = (int)ceilf((o->cx[j] - hw) * c->s - 0.5f), b = (int)floorf((o->cx[j] + hw) * c->s - 0.5f);
+			if (a < px0) a = px0;
+			if (b > px1) b = px1;
+			uint8_t *ip = c->ink + (size_t)py * c->w, *mp = c->mat + (size_t)py * c->w;
+			for (int px = a; px <= b; px++) {
+				ip[px] = (uint8_t)iv;
+				mp[px] = US_MAT_BG;
+			}
+		}
+	}
+	float base_v = (0.3f + 0.34f * depth) * skyv;
+	float wdt = d->crisp ? 0.0045f : 0.0011f + 0.0004f * depth;
+	/* light direction (towards sun / moon) for the rim */
+	float cxm = 0.5f * (o->x0 + o->x1), cym = o->base - 0.02f;
+	float ldx = lx - cxm, ldy = ly - cym, ll = sqrtf(ldx * ldx + ldy * ldy) + 1e-4f;
+	ldx /= ll;
+	ldy /= ll;
+	for (int j = 0; j < o->nb; j++) {
+		enum { NS = 22 };
+		float px = 0, py = 0;
+		int prev = 0;
+		for (int q = 0; q <= NS; q++) {
+			float a = US_PI * 0.92f + US_PI * 1.16f * q / NS;
+			float nx = cosf(a), ny = sinf(a);
+			float x = o->cx[j] + nx * o->r[j], y = o->cy[j] + ny * o->r[j];
+			int vis = y <= o->base + 1e-4f && !in_cloud(o, x, y, j, 0.985f);
+			if (vis && prev) {
+				float lit = us_sat(nx * ldx + ny * ldy);
+				float v = base_v * (0.55f - 0.22f * ny + 0.9f * lit * lv);
+				wline(c, px, py, x, y, wdt, v, US_MAT_WATER);
+			}
+			px = x;
+			py = y;
+			prev = vis;
+		}
+		/* inner billow: a partial inner contour gives the cauliflower its volume */
+		if (!d->crisp && depth > 0.3f && o->r[j] > 0.022f) {
+			float ir = o->r[j] * 0.68f, icy = o->cy[j] + o->r[j] * 0.22f;
+			float a0 = ldx < 0 ? US_PI * 1.08f : US_PI * 1.45f;
+			float pxx = 0, pyy = 0;
+			for (int q = 0; q <= 10; q++) {
+				float a = a0 + 0.5f * q / 10.0f * US_PI;
+				float x = o->cx[j] + cosf(a) * ir, y = icy + sinf(a) * ir;
+				int ok = y < o->base - 0.002f;
+				if (q > 0 && ok)
+					wline(c, pxx, pyy, x, y, 0.001f, base_v * 0.42f * sinf(US_PI * q / 10.0f), US_MAT_WATER);
+				pxx = x;
+				pyy = y;
+			}
+		}
+	}
+	/* flat, faintly ragged base */
+	{
+		float xa = o->x0 + 0.15f * (o->x1 - o->x0), xb = o->x1 - 0.15f * (o->x1 - o->x0);
+		float prx = xa, pry = o->base;
+		for (int q = 1; q <= 8; q++) {
+			float x = us_lerp(xa, xb, q / 8.0f);
+			float y = o->base + 0.0015f * us_noise2(x * 40.0f, o->base * 10.0f);
+			float v = base_v * 0.4f * sinf(US_PI * (q - 0.5f) / 8.0f);
+			wline(c, prx, pry, x, y, wdt * 0.9f, v, US_MAT_WATER);
+			prx = x;
+			pry = y;
+		}
+	}
+}
+
+static void draw_bird(us_canvas *c, int crisp, float x, float y, float s, float f, float dir, float v, uint8_t m, int bat)
+{
+	float w = crisp ? 0.0042f : 0.0012f;
+	for (int sd = -1; sd <= 1; sd += 2) {
+		float ex = x + sd * s * 0.48f, ey = y - s * 0.34f * f - s * 0.04f;
+		float tx = x + sd * s, ty = y + s * (0.10f - 0.26f * f);
+		wline(c, x + sd * s * 0.08f, y, ex, ey, w, v, m);
+		if (bat) { /* scalloped trailing edge */
+			float hx = x + sd * s * 0.74f, hy = ty + s * 0.22f;
+			wline(c, ex, ey, tx, ty, w, v, m);
+			wline(c, tx, ty, hx, hy, w, v * 0.8f, m);
+			wline(c, hx, hy, x + sd * s * 0.38f, ey + s * 0.3f, w, v * 0.8f, m);
+		} else
+			wline(c, ex, ey, tx, ty, w, v, m);
+	}
+	if (s > 0.007f || crisp)
+		wline(c, x - dir * s * 0.16f, y + s * 0.02f, x + dir * s * 0.22f, y - s * 0.02f, w * 1.3f, v, m);
+}
+
+static void sky(dc_t *d, const us_ctx *ctx, float dens)
+{
+	st_t *st = d->st;
+	us_canvas *c = d->c;
+	us_world *w = ctx->w;
+	us_rng *r = &st->rng;
+	float A = d->A, t = d->t, dt = d->dt;
+	int crisp = d->crisp;
+	if (!st->sky_inited) {
+		for (int i = 0; i < MAX_CLOUD; i++)
+			new_cloud(st, &st->cloud[i], (i + us_rand(r) * 0.7f) / MAX_CLOUD);
+		st->skein_wait = us_randr(r, 2.0f, 8.0f);
+		st->sky_inited = 1;
+	}
+	st->swell_env = us_approach(st->swell_env, d->a->swell, 2.0f, ctx->real_dt);
+	float day = w->daylight;
+	float night = us_sat(1.0f - day * 2.2f);
+
+	/* celestial bodies: sun by day, moon opposite it; elevation from the day phase */
+	float sph = w->day_phase, mph = fmodf(w->day_phase + 0.5f, 1.0f);
+	float sx = A * (0.08f + 0.84f * sph), sy = 0.62f + 0.54f * cosf(sph * US_TAU);
+	float mx = A * (0.08f + 0.84f * mph), my = 0.62f + 0.54f * cosf(mph * US_TAU);
+	float lx = sy < my ? sx : mx, ly = sy < my ? sy : my; /* the higher one lights the clouds */
+	float lv = sy < my ? 0.9f : 0.75f * night;
+
+	/* stars */
+	if (night > 0.01f) {
+		int ns = crisp ? 60 : 130;
+		for (int i = 0; i < ns; i++) {
+			uint32_t h = (uint32_t)i * 2654435761u;
+			float x = hashf(h) * A, y = hashf(h + 1) * 0.6f;
+			if (y > far_y(x / A, 0) - 0.004f)
+				continue;
+			float mag = hashf(h + 2);
+			float tw = 0.65f + 0.35f * us_noise2(i * 1.37f, t * (0.6f + mag));
+			float v = (0.12f + 0.5f * mag * mag) * night * tw;
+			us_point(c, x, y, crisp ? 0.003f : 0.0009f + 0.0006f * mag, v, US_MAT_LIGHT);
+			if (!crisp && mag > 0.93f) { /* the few bright ones get a faint glint */
+				wline(c, x - 0.006f, y, x + 0.006f, y, 0.001f, v * 0.35f, US_MAT_LIGHT);
+				wline(c, x, y - 0.006f, x, y + 0.006f, 0.001f, v * 0.35f, US_MAT_LIGHT);
+			}
+		}
+	}
+
+	/* sun: disc, breathing halo, slow crepuscular shafts fanning down through the air */
+	if (sy < 0.6f && day > 0.05f) {
+		float R = 0.034f, vk = us_smooth(0.05f, 0.4f, day);
+		float halo = 1.0f + 0.12f * st->bass_env;
+		if (crisp) {
+			us_disc(c, sx, sy, R * 2.0f * halo, 0.12f * vk, US_MAT_LIGHT);
+			us_disc(c, sx, sy, R * 1.35f, 0.25f * vk, US_MAT_LIGHT);
+			us_disc(c, sx, sy, R, 0.85f * vk, US_MAT_LIGHT);
+		} else {
+			int nshaft = 9;
+			for (int k = 0; k < nshaft; k++) {
+				float a = US_PI * 0.5f + (k - (nshaft - 1) * 0.5f) * 0.21f + 0.08f * us_noise2(t * 0.05f, k * 2.3f);
+				float len = 0.32f + 0.25f * (0.5f + 0.5f * us_noise2(t * 0.07f, k * 5.1f)) + 0.12f * st->swell_env;
+				float sv = (0.05f + 0.07f * (0.5f + 0.5f * us_noise2(t * 0.11f, k * 1.9f))) * vk * (0.7f + 0.5f * st->swell_env);
+				float x0 = sx + cosf(a) * R * 1.8f, y0 = sy + sinf(a) * R * 1.8f;
+				enum { SEG = 6 };
+				for (int q = 0; q < SEG; q++) { /* taper out along the shaft */
+					float t0 = (float)q / SEG, t1 = (float)(q + 1) / SEG;
+					wline(c, x0 + cosf(a) * len * t0, y0 + sinf(a) * len * t0, x0 + cosf(a) * len * t1,
+					      y0 + sinf(a) * len * t1, 0.001f, sv * (1.0f - t0), US_MAT_LIGHT);
+				}
+			}
+			us_disc(c, sx, sy, R, 0.22f * vk, US_MAT_LIGHT);
+			wring(c, sx, sy, R, 0.0018f, 0.9f * vk, US_MAT_LIGHT);
+			wring(c, sx, sy, R * 1.45f * halo, 0.0012f, 0.22f * vk, US_MAT_LIGHT);
+			wring(c, sx, sy, R * 2.2f * halo, 0.0012f, 0.11f * vk, US_MAT_LIGHT);
+		}
+	}
+	/* twilight: when the sun sits just below / on the mountains, wide faint arcs of afterglow rise over them */
+	{
+		float tw = us_smooth(0.42f, 0.55f, sy) * (1.0f - us_smooth(0.72f, 0.85f, sy));
+		if (tw > 0.01f) {
+			int nr = crisp ? 3 : 5;
+			for (int k = 0; k < nr; k++) {
+				float R = 0.09f + 0.075f * k + 0.01f * st->swell_env;
+				float v = tw * (0.16f - 0.025f * k) * (0.8f + 0.2f * st->bass_env);
+				enum { NA = 48 };
+				float px = 0, py = 0;
+				for (int q = 0; q <= NA; q++) {
+					float a = US_PI * (1.08f + 0.84f * q / NA);
+					float x = sx + cosf(a) * R * 1.6f, y = sy + sinf(a) * R;
+					if (q > 0)
+						wline(c, px, py, x, y, crisp ? 0.004f : 0.0012f, v * sinf(US_PI * q / NA), crisp ? US_MAT_LIGHT : US_MAT_BLOOM);
+					px = x;
+					py = y;
+				}
+			}
+		}
+	}
+	/* moon: lit disc with faint maria and a breathing triple halo */
+	if (my < 0.6f && night > 0.02f) {
+		float R = 0.03f, vk = us_smooth(0.0f, 0.5f, night);
+		float halo = 1.0f + 0.1f * st->bass_env + 0.05f * st->swell_env;
+		if (crisp) {
+			us_disc(c, mx, my, R * 2.1f * halo, 0.1f * vk, US_MAT_LIGHT);
+			us_disc(c, mx, my, R * 1.4f * halo, 0.2f * vk, US_MAT_LIGHT);
+			us_disc(c, mx, my, R, 0.8f * vk, US_MAT_LIGHT);
+			us_disc(c, mx - R * 0.3f, my - R * 0.15f, R * 0.3f, 0.6f * vk, US_MAT_LIGHT);
+		} else {
+			us_disc(c, mx, my, R, 0.07f * vk, US_MAT_LIGHT);
+			wring(c, mx, my, R, 0.0018f, 0.85f * vk, US_MAT_LIGHT);
+			static const float mar[4][3] = {{-0.3f, -0.2f, 0.26f}, {0.25f, 0.1f, 0.2f}, {-0.05f, 0.4f, 0.16f}, {0.35f, -0.35f, 0.1f}};
+			for (int k = 0; k < 4; k++)
+				wring(c, mx + mar[k][0] * R, my + mar[k][1] * R, mar[k][2] * R, 0.001f, 0.32f * vk, US_MAT_LIGHT);
+			wring(c, mx, my, R * 1.55f * halo, 0.0012f, 0.2f * vk, US_MAT_LIGHT);
+			wring(c, mx, my, R * 2.5f * halo, 0.0011f, 0.1f * vk, US_MAT_LIGHT);
+			wring(c, mx, my, R * 3.8f * halo, 0.001f, 0.05f * vk, US_MAT_LIGHT);
+		}
+	}
+
+	/* far mountains + wooded ridge: overwrite fill so they hide the low sun / moon */
+	{
+		float mv = crisp ? 0.36f : 0.0f, rv = crisp ? 0.32f : 0.0f;
+		int imv = (int)(mv * 255.0f), irv = (int)(rv * 255.0f);
+		enum { MAXW = 4096 };
+		static short cym[MAXW], cyr[MAXW], cyg[MAXW]; /* per-column profile rows (scratch, rebuilt each frame) */
+		int W = c->w < MAXW ? c->w : MAXW, ytop = c->h, ybot = 0;
+		float fm0 = 0, fm1 = 0, fr0 = 0, fr1 = 0, fg0 = 0, fg1 = 0;
+		for (int px = 0; px < W; px++) {
+			if ((px & 7) == 0) { /* the profiles are smooth: sample every 8th column, lerp between */
+				float u0 = (px + 0.5f) / c->s / A, u1 = (px + 8.5f) / c->s / A;
+				fm0 = far_y(u0, 0); fm1 = far_y(u1, 0);
+				fr0 = far_y(u0, 1); fr1 = far_y(u1, 1);
+				fg0 = ground_y(u0, 0); fg1 = ground_y(u1, 0);
+			}
+			float f = (px & 7) * 0.125f;
+			int ym = (int)ceilf(us_lerp(fm0, fm1, f) * c->s), yr = (int)ceilf(us_lerp(fr0, fr1, f) * c->s);
+			int yg = (int)ceilf(us_lerp(fg0, fg1, f) * c->s) + 2;
+			if (ym < 0) ym = 0;
+			if (yg > c->h) yg = c->h;
+			cym[px] = (short)ym;
+			cyr[px] = (short)yr;
+			cyg[px] = (short)yg;
+			if (ym < ytop) ytop = ym;
+			if (yg > ybot) ybot = yg;
+		}
+		for (int py = ytop; py < ybot; py++) { /* row-major: cache friendly */
+			uint8_t *ip = c->ink + (size_t)py * c->w, *mp = c->mat + (size_t)py * c->w;
+			for (int px = 0; px < W; px++) {
+				if (py < cym[px] || py >= cyg[px])
+					continue;
+				uint8_t v = (uint8_t)(py < cyr[px] ? imv : irv);
+				if (ip[px] != v) { /* ink: the cleared sky is already black, only erase what lies behind */
+					ip[px] = v;
+					mp[px] = US_MAT_BG;
+				}
+			}
+		}
+		float snow = us_sat((d->winter - 0.3f) * 2.5f);
+		float pts[2 * 97];
+		for (int k = 0; k < 2; k++) {
+			for (int i = 0; i <= 96; i++) {
+				float u = i / 96.0f;
+				pts[2 * i] = u * A;
+				pts[2 * i + 1] = far_y(u, k);
+			}
+			float v = k == 0 ? 0.2f + 0.04f * day : 0.15f;
+			wpoly(c, pts, 97, crisp ? 0.004f : 0.001f, v, k == 0 ? US_MAT_WATER : US_MAT_EARTH);
+			if (k == 0) /* snow on the high crests: brighter line + a few slope streaks */
+				for (int i = 0; i < 96; i++) {
+					float y0 = pts[2 * i + 1], y1 = pts[2 * i + 3];
+					float hi = us_sat((0.47f - 0.5f * (y0 + y1)) * 25.0f) * (0.35f + 0.65f * snow);
+					if (hi > 0.05f) {
+						wline(c, pts[2 * i], y0, pts[2 * i + 2], y1, crisp ? 0.004f : 0.0012f, 0.2f + 0.3f * hi, US_MAT_WATER);
+						if (!crisp && (i % 2) == 0)
+							wline(c, pts[2 * i], y0 + 0.002f, pts[2 * i] + 0.004f * (y1 > y0 ? 1 : -1), y0 + 0.012f * hi, 0.001f,
+							      0.14f * hi, US_MAT_WATER);
+					}
+				}
+		}
+		/* trees on the ridge: a hazy tree line, conifers and round crowns */
+		int nt = (int)(70 + 90 * dens);
+		uint8_t tm = d->winter > 0.6f ? US_MAT_EARTH : US_MAT_LEAF;
+		for (int i = 0; i < nt; i++) {
+			uint32_t h = (uint32_t)i * 2246822519u + 991u;
+			float u = hashf(h);
+			float x = u * A, y = far_y(u, 1) + 0.001f;
+			float th = 0.01f + 0.022f * hashf(h + 1) * hashf(h + 4);
+			float sw = 0.0015f * us_noise2(x * 3.0f - d->wind_t * 0.5f, 4.0f) * (0.5f + d->wind);
+			float v = 0.17f + 0.1f * hashf(h + 3);
+			if (hashf(h + 2) < 0.6f) {
+				if (crisp)
+					us_tri(c, x - th * 0.25f, y, x + th * 0.25f, y, x + sw, y - th, v + 0.08f, tm);
+				else {
+					wline(c, x - th * 0.24f, y, x + sw, y - th, 0.001f, v, tm);
+					wline(c, x + sw, y - th, x + th * 0.24f, y, 0.001f, v, tm);
+					wline(c, x - th * 0.15f, y - th * 0.4f, x + th * 0.15f, y - th * 0.42f, 0.001f, v * 0.6f, tm);
+				}
+			} else {
+				float rr = th * 0.36f;
+				if (crisp)
+					us_disc(c, x + sw, y - th * 0.62f, rr, v + 0.08f, tm);
+				else {
+					wline(c, x, y, x + sw * 0.5f, y - th * 0.35f, 0.001f, v * 0.8f, US_MAT_STEM);
+					wring(c, x + sw, y - th * 0.62f, rr, 0.001f, v, tm);
+				}
+			}
+			if (snow > 0.3f && !crisp)
+				us_point(c, x + sw, y - th, 0.0014f, 0.4f * snow, US_MAT_WATER);
+		}
+		/* valley mist drifting in front of the ridge (more when the air is wet and the light is low) */
+		float mist = (0.35f + 0.65f * w->moisture) * (0.55f + 0.45f * (1.0f - day));
+		for (int k = 0; k < 3; k++) {
+			float yb = 0.585f + 0.018f * k + 0.006f * us_noise2(t * 0.03f, k * 7.0f);
+			float xs = fmodf(t * (0.006f + 0.003f * k) + k * 0.47f, 1.0f) * (A + 0.8f) - 0.8f;
+			float len = 0.3f + 0.12f * k;
+			enum { MS = 18 };
+			float prx = xs, pry = yb;
+			for (int q = 1; q <= MS; q++) {
+				float x = xs + len * q / MS;
+				float y = yb + 0.004f * us_noise2(x * 6.0f + k, t * 0.05f);
+				float v = 0.08f * mist * sinf(US_PI * (q - 0.5f) / MS);
+				for (int rep = 0; rep < 2; rep++) {
+					float ox = rep ? A + 0.8f : 0.0f; /* wrap */
+					if (x - ox > -0.05f && prx - ox < A + 0.05f)
+						wline(c, prx - ox, pry, x - ox, y, crisp ? 0.004f : 0.0012f, v, US_MAT_WATER);
+				}
+				prx = x;
+				pry = y;
+			}
+		}
+	}
+
+	/* high cirrus: a few combed streaks near the top of the sky */
+	if (!crisp || dens > 0.3f) {
+		int ncs = 2 + (int)(dens * 3.0f);
+		for (int k = 0; k < ncs; k++) {
+			uint32_t h = (uint32_t)k * 3266489917u + 17u;
+			float span = A + 1.0f;
+			float x0 = fmodf(hashf(h) * span + t * (0.004f + 0.003f * hashf(h + 1)) * (1.0f + 2.0f * d->wind), span) - 0.6f;
+			float y0 = 0.035f + 0.11f * hashf(h + 2);
+			float len = 0.22f + 0.25f * hashf(h + 3);
+			int nl = 3 + (int)(hashf(h + 4) * 3);
+			for (int l = 0; l < nl; l++) {
+				float ox = l * 0.02f * (hashf(h + 5 + l) - 0.3f), oy = l * 0.0065f;
+				float ll = len * (0.6f + 0.4f * hashf(h + 9 + l));
+				enum { CS = 12 };
+				float prx = x0 + ox, pry = y0 + oy;
+				for (int q = 1; q <= CS; q++) {
+					float x = x0 + ox + ll * q / CS;
+					float y = y0 + oy - 0.012f * (float)q / CS + 0.003f * us_noise2(x * 8.0f, k + l * 0.3f + t * 0.02f);
+					float v = (0.1f + 0.06f * hashf(h + 13 + l)) * sinf(US_PI * (q - 0.5f) / CS) * (0.7f + 0.3f * st->swell_env);
+					wline(c, prx, pry, x, y, crisp ? 0.004f : 0.001f, v, US_MAT_WATER);
+					prx = x;
+					pry = y;
+				}
+			}
+		}
+	}
+
+	/* clouds: two depths drifting downwind, swelling with the phrase */
+	{
+		float breath = 1.0f + 0.07f * st->swell_env + 0.03f * st->bass_env;
+		float skyv = 0.75f + 0.25f * us_sat(day + night * 0.6f);
+		int nc = 3 + (int)(dens * 4.0f + 0.5f);
+		if (nc > MAX_CLOUD)
+			nc = MAX_CLOUD;
+		/* far ones first so nearer clouds overwrite them */
+		int order[MAX_CLOUD];
+		for (int i = 0; i < MAX_CLOUD; i++)
+			order[i] = i;
+		for (int i = 1; i < MAX_CLOUD; i++)
+			for (int j = i; j > 0 && st->cloud[order[j]].depth < st->cloud[order[j - 1]].depth; j--) {
+				int tmp = order[j];
+				order[j] = order[j - 1];
+				order[j - 1] = tmp;
+			}
+		for (int oi = 0; oi < MAX_CLOUD; oi++) {
+			int i = order[oi];
+			cloud_t *k = &st->cloud[i];
+			k->x += dt * k->spd * (0.0035f + 0.018f * d->wind) / (A + 0.6f);
+			if (k->x > 1.0f)
+				new_cloud(st, k, 0.0f);
+			if (i >= nc)
+				continue;
+			cshape_t o;
+			cloud_shape(k, i, A, t, breath, &o);
+			draw_cloud(d, &o, k->depth, lx, ly, lv, skyv * (0.6f + 0.4f * k->depth));
+		}
+	}
+
+	/* birds: a skein of geese now and then, swallows (bats after dark) wheeling */
+	{
+		float lift = d->a->high;
+		int bat = day < 0.12f;
+		int nsw = (int)((1.0f + 2.5f * w->flock + 2.0f * dens) * (0.5f + 0.5f * us_smooth(0.0f, 0.4f, day)) + 0.5f);
+		if (d->winter > 0.6f && !bat)
+			nsw /= 2;
+		if (nsw > 6)
+			nsw = 6;
+		for (int i = 0; i < 6; i++) {
+			bird_t *b = &st->bird[i];
+			if (!b->alive) {
+				if (i >= nsw)
+					continue;
+				b->alive = 1;
+				b->kind = 1;
+				b->x = us_rand(r) < 0.5f ? -0.05f : A + 0.05f;
+				b->y = us_randr(r, 0.08f, 0.3f);
+				b->vx = b->x < 0 ? 0.1f : -0.1f;
+				b->vy = 0;
+				b->ph = us_rand(r) * 10.0f;
+				b->size = us_randr(r, 0.007f, 0.011f);
+			}
+			int leaving = i >= nsw;
+			float tx = leaving ? (b->x < A * 0.5f ? -0.3f : A + 0.3f) : A * (0.5f + 0.5f * us_noise2(t * 0.045f + i * 7.0f, 1.3f));
+			float ty = 0.2f + 0.14f * us_noise2(t * 0.06f + i * 3.0f, 5.5f);
+			float dx = tx - b->x, dy = ty - b->y, dl = sqrtf(dx * dx + dy * dy) + 1e-4f;
+			float sp = 0.13f + 0.08f * lift;
+			b->vx += ((dx / dl) * sp - b->vx) * dt * 1.2f + 0.25f * us_noise2(t * 0.7f, i * 9.0f) * dt;
+			b->vy += ((dy / dl) * sp - b->vy) * dt * 1.2f + 0.25f * us_noise2(t * 0.7f + 3.0f, i * 9.0f) * dt;
+			b->x += b->vx * dt;
+			b->y += b->vy * dt;
+			if (leaving && (b->x < -0.2f || b->x > A + 0.2f)) {
+				b->alive = 0;
+				continue;
+			}
+			/* flap in bursts, glide between */
+			float burst = us_smooth(-0.2f, 0.3f, us_noise2(t * 0.5f, i * 4.0f));
+			b->ph += dt * (bat ? 16.0f : 13.0f) * (0.25f + 0.75f * burst);
+			float f = bat ? sinf(b->ph) : sinf(b->ph) * (0.25f + 0.75f * burst) + 0.2f * (1.0f - burst);
+			draw_bird(c, crisp, b->x, b->y, b->size, f, b->vx >= 0 ? 1.0f : -1.0f, 0.62f, US_MAT_ACCENT, bat);
+		}
+		/* skein */
+		if (st->skein_n == 0) {
+			st->skein_wait -= dt * (0.5f + w->flock + 0.5f * st->swell_env);
+			if (st->skein_wait <= 0 && !bat && d->winter < 0.8f) {
+				st->skein_dir = us_rand(r) < 0.5f ? 1.0f : -1.0f;
+				st->skein_x = st->skein_dir > 0 ? -0.08f : A + 0.08f;
+				st->skein_y = us_randr(r, 0.1f, 0.26f);
+				st->skein_n = 5 + (int)(us_rand(r) * (4.0f + 6.0f * w->flock));
+				if (st->skein_n > MAX_BIRD - 6)
+					st->skein_n = MAX_BIRD - 6;
+				st->skein_t = 0;
+			}
+		} else {
+			st->skein_t += dt;
+			st->skein_x += st->skein_dir * dt * (0.045f + 0.015f * st->swell_env);
+			st->skein_y += dt * 0.004f * us_noise2(st->skein_t * 0.2f, 2.0f);
+			float s = 0.0085f;
+			for (int k = 0; k < st->skein_n; k++) {
+				int rank = (k + 1) / 2;
+				float side = (k & 1) ? 1.0f : -0.65f;
+				float x = st->skein_x - st->skein_dir * rank * 0.026f + 0.003f * us_noise2(st->skein_t * 0.4f, k * 3.3f);
+				float y = st->skein_y + side * rank * 0.011f + 0.003f * us_noise2(st->skein_t * 0.35f + 9.0f, k * 3.3f);
+				float f = sinf(st->skein_t * 5.5f - rank * 0.7f);
+				draw_bird(c, crisp, x, y, s * (1.0f - 0.03f * rank), f, st->skein_dir, 0.55f, US_MAT_ACCENT, 0);
+			}
+			float tail = st->skein_x - st->skein_dir * (st->skein_n / 2 + 1) * 0.026f;
+			if ((st->skein_dir > 0 && tail > A + 0.1f) || (st->skein_dir < 0 && tail < -0.1f)) {
+				st->skein_n = 0;
+				st->skein_wait = us_randr(r, 18.0f, 40.0f);
+			}
 		}
 	}
 }
@@ -1208,31 +1871,7 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 
 	us_world_add(w, &w->growth, 0.004f * a->bass * (1 - d.winter), dt);
 
-	/* ---- sky: stars by night, sun / moon ---- */
-	{
-		float sv = us_sat(1.0f - w->daylight * 2.2f);
-		if (sv > 0.01f && !ctx->crisp)
-			for (int i = 0; i < 70; i++) {
-				uint32_t h = (uint32_t)i * 2654435761u;
-				float sx = hashf(h) * A, sy = hashf(h + 1) * 0.55f;
-				float tw = 0.6f + 0.4f * us_noise2(i * 1.37f, d.t * 1.1f);
-				us_point(c, sx, sy, 0.001f, 0.35f * sv * tw * (0.3f + 0.7f * hashf(h + 2)), US_MAT_LIGHT);
-			}
-		float ph = w->day_phase;
-		float cx = A * (0.08f + 0.84f * ph);
-		float cy = 0.78f + cosf(ph * US_TAU) * 0.55f;
-		if (cy < 0.72f) {
-			if (w->daylight > 0.35f) {
-				if (ctx->crisp)
-					us_disc(c, cx, cy, 0.035f, 0.5f, US_MAT_LIGHT);
-				else
-					us_ring(c, cx, cy, 0.035f + 0.004f * st->bass_env, 0.0015f, 0.55f, US_MAT_LIGHT);
-			} else {
-				us_arc(c, cx, cy, 0.028f, -1.9f, 1.9f, ctx->crisp ? 0.006f : 0.0015f, 0.5f, US_MAT_LIGHT);
-				us_arc(c, cx + 0.01f, cy, 0.024f, -1.6f, 1.6f, ctx->crisp ? 0.004f : 0.0012f, 0.35f, US_MAT_LIGHT);
-			}
-		}
-	}
+	sky(&d, ctx, dens);
 
 	float grow_k = 0.06f * (0.35f + w->moisture) * (0.6f + 1.2f * w->mycelium) * (1.0f - 0.85f * d.winter);
 	float drive = 0.12f + 1.1f * a->bass + 0.6f * a->kick + 0.2f * a->level;
@@ -1248,7 +1887,7 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 			uint8_t gm;
 			if (ctx->crisp) {
 				gm = L == 0 ? US_MAT_BG : US_MAT_EARTH;
-				gv = L == 0 ? 0.0f : (L == 1 ? 0.2f : 0.13f);
+				gv = L == 0 ? 0.3f : (L == 1 ? 0.2f : 0.13f);
 				if (d.winter > 0.55f && L > 0) { /* snowfield */
 					gm = US_MAT_WATER;
 					gv = L == 1 ? 0.36f : 0.3f;

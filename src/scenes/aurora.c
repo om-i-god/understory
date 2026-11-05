@@ -10,7 +10,8 @@
  *        storm_charge (a geomagnetic storm: more curtains, taller red fringes, faster motion).
  * Silence: curtains keep folding slowly, stars twinkle, the odd meteor falls.
  * The scene is reflected (compressed, wobbling) in the lake below the treeline: curtains, their
- * rims, the far ridge and the spruce stand.
+ * rims, the far ridge and the spruce stand. The reflection carries the whole curtain (fringe colour
+ * included); the sky's glow lights the snowy crests, the foothills and a glimmer on the water.
  */
 #include "../core/us_scene.h"
 #include "../core/us_math.h"
@@ -63,7 +64,7 @@ static float ridge_y(float u)
 	/* far mountains: ridged noise */
 	float n = 1.0f - fabsf(us_noise2(u * 3.1f, 11.3f));
 	float n2 = 1.0f - fabsf(us_noise2(u * 7.7f, 2.9f));
-	return 0.70f - 0.09f * n * n - 0.025f * n2;
+	return 0.705f - 0.14f * n * n * (0.7f + 0.3f * n2) - 0.03f * n2 * n2 + 0.02f * us_noise2(u * 1.3f, 4.1f);
 }
 
 static float hash1(int k, float seed)
@@ -78,7 +79,7 @@ static float hash1(int k, float seed)
 /* One ray, rasterised row by row: smooth brightness profile from a sharp lower rim fading upward,
  * green body (LEAF) turning to a magenta fringe (BLOOM) above fringe_t. dir = -1 draws upward (sky),
  * +1 draws downward (reflection). */
-static void ray(us_canvas *c, float x, float yb, float ln, float lean, float b, float fringe_t, int dir, uint8_t body)
+static void ray(us_canvas *c, float x, float yb, float ln, float lean, float b, float fringe_t, int dir, uint8_t body, float flat)
 {
 	float S = c->s;
 	float py0 = yb * S, len = ln * S;
@@ -95,7 +96,7 @@ static void ray(us_canvas *c, float x, float yb, float ln, float lean, float b, 
 				break;
 			continue;
 		}
-		float v = b * (0.16f + 0.84f * e);
+		float v = b * (0.16f + 0.84f * (flat + (1.0f - flat) * e));
 		if (t < 0.05f)
 			v *= us_smooth(0.0f, 0.05f, t);
 		else if (t > 0.8f)
@@ -162,11 +163,19 @@ static void hpoly(us_canvas *c, const float *xy, int n, float v, uint8_t mat)
 		rim(c, xy[2 * i], xy[2 * i + 1], xy[2 * i + 2], xy[2 * i + 3], v * 0.8f, mat);
 }
 
+static void wline_(us_canvas *c, int crisp, float ax, float ay, float bx, float by, float v, uint8_t m)
+{
+	if (crisp)
+		us_line(c, ax, ay, bx, by, 0.004f, v, m);
+	else
+		rim(c, ax, ay, bx, by, v, m);
+}
+
 static void new_curtain(st_t *s, curtain_t *c)
 {
 	us_rng *r = &s->rng;
 	c->seed = us_randr(r, 0, 100);
-	c->y0 = us_randr(r, 0.30f, 0.47f);
+	c->y0 = us_randr(r, 0.36f, 0.54f);
 	c->xc = us_randr(r, 0.3f, 0.7f);
 	c->span = us_randr(r, 0.9f, 1.6f);
 	c->fold = us_randr(r, 0.16f, 0.3f);
@@ -347,19 +356,21 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 	}
 
 	/* ---- curtains ---- */
+	float glow[64];
+	memset(glow, 0, sizeof(glow));
 	c->blend = US_BLEND_ADD;
 	int nr = (int)(130 + 250 * dens);
 	if (nr > MAX_RAYS)
 		nr = MAX_RAYS;
 	float rip_speed = 0.5f + 5.0f * s->shimmer + 2.0f * storm;
 	float flick_amt = 0.12f + 0.75f * s->shimmer;
-	float L0 = 0.12f + 0.22f * s->height + 0.05f * storm;
+	float L0 = 0.17f + 0.24f * s->height + 0.06f * storm;
 	float lift = 0.07f * (s->height - 0.4f);
 	float nact = 0;
 	for (int ci = 0; ci < MAX_CURT; ci++)
 		nact += s->cu[ci].life;
 	/* more curtains share the light: brightness grows sub-linearly with their number */
-	float bright = strength * (0.32f + 1.0f * s->surge + 0.15f * a->level) * (0.95f + 0.2f * storm) / powf(nact > 1.5f ? nact / 1.5f : 1.0f, 0.7f);
+	float bright = strength * (0.44f + 0.9f * s->surge + 0.15f * a->level) * (0.95f + 0.2f * storm) / powf(nact > 1.5f ? nact / 1.5f : 1.0f, 0.7f);
 	float fringe = us_sat(0.62f - 0.25f * storm - 0.12f * s->surge);
 	for (int ci = 0; ci < MAX_CURT; ci++) {
 		curtain_t *cu = &s->cu[ci];
@@ -368,8 +379,8 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 		cu->ph += dt * rip_speed;
 		float T = s->T + cu->seed;
 		/* depth: curtains low over the horizon are farther away -> shorter, fainter */
-		float near = us_sat((0.5f - cu->y0) / 0.2f);
-		float lifev = cu->life * bright * (0.6f + 0.5f * near) * cov;
+		float near = us_sat((0.56f - cu->y0) / 0.2f);
+		float lifev = cu->life * bright * (0.6f + 0.5f * near) * cov * sqrtf(255.0f / nr);
 		float lscale = 0.6f + 0.7f * near;
 		/* the lower rim is traced as we go: a sharp bright border, the curtain's signature */
 		float rpx = 0, rpy = 0, rpb = 0, xprev = 0;
@@ -385,7 +396,8 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 			/* where the ribbon turns edge-on its rays pile up; let them glow, but not into a solid slab */
 			float slope = k > 0 ? fabsf(xf - xprev) / (du * cu->span) : 1.0f;
 			xprev = xf;
-			float pile = us_clampf(0.3f + 1.2f * slope, 0.3f, 1.0f);
+			/* rays bunch where the ribbon turns edge-on: thin them so a fold glows a little, never a slab */
+			float pile = us_clampf(0.04f + 1.0f * slope, 0.04f, 1.0f);
 			float ripple = 0.006f * sinf(u * 70.0f - cu->ph) + 0.004f * sinf(u * 23.0f - cu->ph * 0.6f + 1.0f);
 			float x = xf * A + ripple * (0.4f + s->shimmer);
 			if (x < -0.05f || x > A + 0.05f) {
@@ -398,7 +410,8 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 			float ln = L0 * lscale * (0.45f + 0.9f * us_sat(0.55f + 0.7f * us_noise2(u * 5.0f - T * 0.4f, cu->seed + 3.0f)));
 			ln *= 0.65f + 0.6f * h2;
 			float patch = us_sat(0.55f + 0.9f * us_noise2(u * 7.0f - T * 0.9f, cu->seed + 13.0f));
-			float ends = us_smooth(0.0f, 0.12f, u) * us_smooth(1.0f, 0.88f, u);
+			float ends = us_smooth(0.0f, 0.22f, u) * us_smooth(1.0f, 0.78f, u);
+			ln *= 0.35f + 0.65f * ends; /* the curtain's ends shrink away, no hard vertical edge */
 			float fl = 1.0f + flick_amt * us_noise2(k * 0.73f + cu->seed, s->flick_t);
 			float b = lifev * patch * ends * fl * (0.7f + 0.6f * h1) * pile;
 			if (b < 0.01f) {
@@ -409,7 +422,11 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 			if (yb > yr)
 				yb = yr;
 			float lean = 0.04f * ln * (0.5f + h2);
-			ray(c, x, yb, ln * (0.9f + 0.2f * fl), lean, b * 0.3f, fringe, -1, US_MAT_LEAF);
+			ray(c, x, yb, ln * (0.9f + 0.2f * fl), lean, b * 0.3f, fringe, -1, US_MAT_LEAF, 0.0f);
+			{ /* how brightly this stretch of sky glows: lights the snow on the ridge and the lake */
+				int gi = (int)(us_sat(x / A) * 63.0f);
+				glow[gi] += b * 0.02f;
+			}
 			if (rprev) {
 				float dx = x - rpx, dy = yb - rpy;
 				if (dx * dx + dy * dy < 0.0009f) {
@@ -427,12 +444,14 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 			/* reflection in the lake: compressed, wobbling */
 			if (k % 3)
 				continue;
-			float ry0 = SHORE + (SHORE - yb) * 0.3f;
+			/* reflection in the still lake: the whole curtain, squashed, its fringe colour kept at the far end */
+			float ry0 = SHORE + 0.012f + (SHORE - yb) * 0.22f;
 			if (ry0 < 1.0f) {
-				float wob = 0.008f * us_noise2(x * 7.0f, ry0 * 25.0f + (float)ctx->t * 0.7f);
-				ray(c, x + wob, ry0, ln * 0.33f, -lean * 0.33f + wob, b * (ctx->crisp ? 0.4f : 0.22f), 2.0f, 1, US_MAT_WATER);
+				float wob = 0.006f * us_noise2(x * 7.0f, ry0 * 25.0f + (float)ctx->t * 0.7f);
+				float rl = ln * 0.48f;
+				ray(c, x + wob, ry0, rl, -lean * 0.4f + wob, b * (ctx->crisp ? 0.55f : 0.32f), fringe, 1, US_MAT_WATER, 0.45f);
 				if (!ctx->crisp)
-					us_put(c, (int)((x + wob) * c->s), (int)(ry0 * c->s), b * 0.35f, US_MAT_WATER);
+					us_put(c, (int)((x + wob) * c->s), (int)(ry0 * c->s), b * 0.3f, US_MAT_WATER);
 			}
 		}
 	}
@@ -442,6 +461,7 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 	{
 		float dayk = us_smooth(0.22f, 0.7f, day); /* none at night/twilight: mats would linger under the trails */
 		uint8_t sm = ctx->crisp ? US_MAT_WATER : US_MAT_BG;
+		(void)sm;
 		float f[2 * 8];
 		for (int j = 0; j < 8; j++) {
 			float y = j / 7.0f;
@@ -467,7 +487,30 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 			pts[2 * i + 1] = ridge_y(u);
 		}
 		float mv = 0.32f + 0.15f * day;
+		if (!ctx->crisp) { /* overwrite the mountain mass so faint stars do not show through it */
+			for (int px = 0; px < c->w; px++) {
+				float uu = (px + 0.5f) / c->s / A * 96.0f;
+				int i = (int)uu;
+				if (i > 95) i = 95;
+				int y0 = (int)ceilf(us_lerp(pts[2 * i + 1], pts[2 * i + 3], uu - i) * c->s) + 1, y1 = (int)(SHORE * c->s);
+				for (int py = y0 < 0 ? 0 : y0; py < y1 && py < c->h; py++) {
+					size_t ii = (size_t)py * c->w + px;
+					if (c->ink[ii] < 3) {
+						c->ink[ii] = 3;
+						c->mat[ii] = US_MAT_EARTH;
+					}
+				}
+			}
+		}
 		us_polyline(c, pts, 97, 0.0013f, mv, US_MAT_EARTH);
+		/* aurora light on the snowy crests */
+		for (int i = 0; i < 96; i++) {
+			float g = glow[(int)(i / 96.0f * 63.0f)] * strength;
+			float gv = us_sat(g * 0.5f);
+			if (gv > 0.02f)
+				(ctx->crisp ? us_line : us_line)(c, pts[2 * i], pts[2 * i + 1] + (ctx->crisp ? 0.0f : 0.0025f), pts[2 * i + 2],
+							  pts[2 * i + 3] + (ctx->crisp ? 0.0f : 0.0025f), ctx->crisp ? 0.004f : 0.0011f, gv, US_MAT_LEAF);
+		}
 		if (ctx->crisp)
 			for (int i = 0; i < 96; i++) {
 				float x0 = pts[2 * i], y0 = pts[2 * i + 1], x1 = pts[2 * i + 2], y1 = pts[2 * i + 3];
@@ -478,10 +521,38 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 			/* snow on the highest ridges: short hatch strokes down the flanks */
 			for (int i = 0; i < 96; i += 2) {
 				float u = i / 96.0f, y = pts[2 * i + 1];
-				if (y < 0.64f)
-					us_line(c, u * A, y + 0.004f, u * A + 0.006f, y + 0.02f + (0.64f - y) * 0.4f, 0.0009f,
-						0.12f + 0.25f * winter, US_MAT_EARTH);
+				float g = us_sat(glow[(int)(u * 63.0f)] * strength * 0.35f);
+				if (y < 0.65f) {
+					float sl = pts[2 * i + 3] > y ? 1.0f : -1.0f; /* streak down the slope */
+					us_line(c, u * A, y + 0.004f, u * A + 0.006f * sl, y + 0.02f + (0.65f - y) * 0.45f, 0.0009f,
+						0.12f + 0.22f * winter + g, g > 0.08f ? US_MAT_LEAF : US_MAT_WATER);
+				}
 			}
+		}
+	}
+
+	/* ---- foothills: a nearer, darker range between the peaks and the shore ---- */
+	{
+		float fp[2 * 65];
+		for (int i = 0; i <= 64; i++) {
+			float u = i / 64.0f;
+			fp[2 * i] = u * A;
+			fp[2 * i + 1] = SHORE - 0.022f - 0.022f * (0.5f + 0.5f * us_noise2(u * 4.2f, 6.3f)) - 0.004f * us_noise2(u * 19.0f, 2.0f);
+		}
+		for (int px = 0; px < c->w; px++) {
+			float uu = (px + 0.5f) / c->s / A * 64.0f;
+			int i = (int)uu;
+			if (i > 63) i = 63;
+			int y0 = (int)ceilf(us_lerp(fp[2 * i + 1], fp[2 * i + 3], uu - i) * c->s) + 1, y1 = (int)(SHORE * c->s);
+			for (int py = y0 < 0 ? 0 : y0; py < y1 && py < c->h; py++) {
+				size_t ii = (size_t)py * c->w + px;
+				c->ink[ii] = ctx->crisp ? (uint8_t)(255 * (0.1f + 0.2f * day)) : 2;
+				c->mat[ii] = US_MAT_EARTH;
+			}
+		}
+		for (int i = 0; i < 64; i++) {
+			float g = us_sat(glow[(int)(i / 64.0f * 63.0f)] * strength * 0.2f);
+			wline_(c, ctx->crisp, fp[2 * i], fp[2 * i + 1], fp[2 * i + 2], fp[2 * i + 3], 0.24f + 0.1f * day + g, US_MAT_EARTH);
 		}
 	}
 
@@ -510,6 +581,22 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 					rim(c, px, py, x, y, 0.12f + 0.05f * day, US_MAT_WATER);
 				px = x;
 				py = y;
+			}
+		}
+		/* lake: where the sky glows, a broken glimmer lies on the water just off the shore */
+		for (int g = 0; g < 64; g++) {
+			float gv = us_sat(glow[g] * strength * 0.3f);
+			if (gv < 0.03f)
+				continue;
+			float x0 = g / 63.0f * A;
+			for (int k = 0; k < 3; k++) {
+				float y = SHORE + 0.02f + 0.022f * k + 0.003f * us_noise2(g * 0.7f, k + (float)ctx->t * 0.3f);
+				float off = 0.01f * us_noise2(g * 1.3f + k * 5.0f, (float)ctx->t * 0.4f);
+				float len = A / 63.0f * (0.5f + 0.4f * us_noise2(g * 2.1f, k * 3.0f + (float)ctx->t * 0.5f));
+				if (ctx->crisp)
+					us_line(c, x0 + off, y, x0 + off + len, y, 0.004f, gv * (1.0f - 0.25f * k), US_MAT_WATER);
+				else
+					rim(c, x0 + off, y, x0 + off + len, y, gv * (1.0f - 0.25f * k), US_MAT_WATER);
 			}
 		}
 		/* lake: a few faint still-water lines (ink only) */
