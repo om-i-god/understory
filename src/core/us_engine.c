@@ -38,10 +38,51 @@ void us_engine_free(us_engine *e)
 	free(e->rgba);
 	free(e->xf_ink);
 	free(e->xf_mat);
+	free(e->xf_thr);
 	free(e->bloom_buf);
 	e->bloom_buf = NULL;
 	e->bloom_n = 0;
 	memset(e, 0, sizeof(*e));
+}
+
+/* Organic dissolve order: low-frequency fbm on a coarse grid, bilinearly upsampled. The new scene
+ * spreads in from the low places like moss, with soft edges. */
+static void fill_dissolve_order(us_engine *e)
+{
+	if (!e->xf_thr)
+		return;
+	int w = e->canvas.w, h = e->canvas.h;
+	enum { G = 33 };
+	float grid[G][G];
+	float ox = 17.3f * (float)(e->xf_count % 97), oy = 5.1f * (float)(e->xf_count % 89);
+	e->xf_count++;
+	float lo = 1e9f, hi = -1e9f;
+	for (int j = 0; j < G; j++)
+		for (int i = 0; i < G; i++) {
+			float v = us_fbm2(ox + i * 0.16f * e->canvas.aspect, oy + j * 0.16f, 3);
+			grid[j][i] = v;
+			lo = v < lo ? v : lo;
+			hi = v > hi ? v : hi;
+		}
+	float sc = hi > lo ? 255.0f / (hi - lo) : 0;
+	for (int y = 0; y < h; y++) {
+		float gy = (float)y / (h > 1 ? h - 1 : 1) * (G - 1);
+		int j = (int)gy;
+		if (j > G - 2)
+			j = G - 2;
+		float ty = gy - j;
+		uint8_t *row = e->xf_thr + (size_t)y * w;
+		for (int x = 0; x < w; x++) {
+			float gx = (float)x / (w > 1 ? w - 1 : 1) * (G - 1);
+			int i = (int)gx;
+			if (i > G - 2)
+				i = G - 2;
+			float tx = gx - i;
+			float a = grid[j][i] + (grid[j][i + 1] - grid[j][i]) * tx;
+			float b = grid[j + 1][i] + (grid[j + 1][i + 1] - grid[j + 1][i]) * tx;
+			row[x] = (uint8_t)((a + (b - a) * ty - lo) * sc);
+		}
+	}
 }
 
 void us_engine_set_scene(us_engine *e, const char *id, uint32_t seed)
@@ -62,6 +103,7 @@ void us_engine_set_scene(us_engine *e, const char *id, uint32_t seed)
 			memcpy(e->xf_ink, e->xf_t > 0 && e->disp.ink ? e->disp.ink : e->canvas.ink, n);
 			memcpy(e->xf_mat, e->xf_t > 0 && e->disp.mat ? e->disp.mat : e->canvas.mat, n);
 			e->xf_t = 1.0f;
+			fill_dissolve_order(e);
 		}
 		us_canvas_clear(&e->canvas);
 	}
@@ -84,13 +126,15 @@ void us_engine_configure(us_engine *e, const us_look *look, int out_w, int out_h
 	free(e->rgba);
 	free(e->xf_ink);
 	free(e->xf_mat);
+	free(e->xf_thr);
 	e->rgba = NULL;
-	e->xf_ink = e->xf_mat = NULL;
+	e->xf_ink = e->xf_mat = e->xf_thr = NULL;
 	e->xf_t = 0; /* a canvas change cancels any dissolve */
 	if (us_canvas_init(&e->canvas, cw, ch, crisp) && us_canvas_init(&e->disp, cw, ch, crisp)) {
 		e->rgba = calloc((size_t)cw * ch * 4, 1);
 		e->xf_ink = calloc((size_t)cw * ch, 1);
 		e->xf_mat = calloc((size_t)cw * ch, 1);
+		e->xf_thr = calloc((size_t)cw * ch, 1);
 	}
 }
 
@@ -159,10 +203,16 @@ void us_engine_frame(us_engine *e, const us_audio *a_in, float dt, double clock_
 		e->xf_t -= dt / (e->xfade_len > 0.01f ? e->xfade_len : 0.01f);
 		if (e->xf_t < 0)
 			e->xf_t = 0;
-		float k = us_smooth(0, 1, e->xf_t);
-		unsigned ko = (unsigned)(k * 256), kn = 256 - ko;
+		/* per-pixel progress: lp = (p - 0.55*h) / 0.45, so low places turn first and every pixel is done at p=1 */
+		float prog = 1.0f - e->xf_t;
+		unsigned kos[256];
+		for (int hh = 0; hh < 256; hh++) {
+			float lp = us_sat((prog - 0.55f * hh / 255.0f) / 0.45f);
+			kos[hh] = (unsigned)((1.0f - us_smooth(0, 1, lp)) * 256);
+		}
 		size_t n = (size_t)e->canvas.w * e->canvas.h;
 		for (size_t i = 0; i < n; i++) {
+			unsigned ko = e->xf_thr ? kos[e->xf_thr[i]] : kos[128], kn = 256 - ko;
 			unsigned o = (e->xf_ink[i] * ko) >> 8, nw = (e->canvas.ink[i] * kn) >> 8;
 			if (o > nw) {
 				e->disp.ink[i] = (uint8_t)o;

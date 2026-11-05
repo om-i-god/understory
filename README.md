@@ -35,7 +35,7 @@ of your set (how loud, how bright, how percussive, relative to the set itself) a
 living world, and moves to a fitting scene at musical turning points — a drop landing might bring the
 murmuration or the storm, a breakdown opens onto the tide, coral or aurora. A long storm charge makes
 Storm Front more likely, a wet world favours the river, a summer night favours fireflies. Scenes
-dissolve into each other and always stay at least the minutes you set, so each has time to grow.
+dissolve into each other in organic patches, the new world spreading in like moss, and always stay at least the minutes you set, so each has time to grow.
 
 ### One living world
 
@@ -48,11 +48,13 @@ between OBS sessions; **Reset world** in the source settings starts fresh.
 ## Looks
 
 - **Ink** — fine single-weight lines at full resolution.
+- **Ink in colour** — the same fine lines, each part of nature in its palette hue: green stems and
+  ferns, rose blooms, blue water, amber light.
 - **Pixel** — low resolution, crisp pixels, six palettes (Moss, Dusk, Riverbed, Ember, Glacier, Lichen).
 - **Mono-pixel** — pixel resolution, one colour, sixteen brightness levels.
 
 **Bloom** adds a soft two-scale light around bright lines in Ink — fireflies get halos, aurora and
-lightning glow. **Tint** colours Ink and Mono-pixel. **Paper** inverts to dark ink on a light ground.
+lightning glow. **Tint** colours Ink and Mono-pixel; **Palette** colours Pixel and Ink in colour. **Paper** inverts to dark ink on a light ground.
 Style, tint and palette can change live without resetting the scene.
 
 ## Controls

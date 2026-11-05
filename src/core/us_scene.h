@@ -64,6 +64,8 @@ typedef struct us_engine {
 	float xfade_len; /* seconds; 0 = hard cut */
 	float xf_t;      /* 1 -> 0 while dissolving */
 	uint8_t *xf_ink, *xf_mat;
+	uint8_t *xf_thr; /* per-pixel dissolve order (organic noise), filled at each scene change */
+	uint32_t xf_count;
 	us_canvas disp;  /* composited display canvas used during a dissolve (and for bloom) */
 	float *bloom_buf;
 	size_t bloom_n;
