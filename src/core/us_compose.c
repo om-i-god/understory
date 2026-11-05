@@ -42,7 +42,7 @@ const int us_palette_count = (int)(sizeof(us_palettes) / sizeof(us_palettes[0]))
 
 void us_style_canvas_size(int style, int out_w, int out_h, int pixel_size, float ink_scale, int *cw, int *ch)
 {
-	if (style == US_STYLE_INK) {
+	if (us_style_is_ink(style)) {
 		if (ink_scale < 0.25f) ink_scale = 0.25f;
 		if (ink_scale > 1.0f) ink_scale = 1.0f;
 		*cw = (int)(out_w * ink_scale + 0.5f);
@@ -99,6 +99,43 @@ void us_compose(const us_canvas *c, const us_look *look, uint8_t *rgba)
 				o[1] = col[1];
 				o[2] = col[2];
 			}
+			o[3] = 255;
+		}
+		return;
+	}
+
+	if (look->style == US_STYLE_COLOR) {
+		/* Ink in colour: full-res AA lines, each material its palette hue. Faint values sit near the
+		 * dark end of the ramp and fade into the ground; bright values reach the light end. */
+		int pi = look->palette;
+		if (pi < 0 || pi >= us_palette_count)
+			pi = 0;
+		const us_palette_def *p = &us_palettes[pi];
+		uint8_t tab[US_MAT_COUNT][256][3]; /* 6 KB, rebuilt per frame (cheap, and thread-safe) */
+		{
+			float bg[3];
+			for (int k = 0; k < 3; k++) /* a deeper ground than Pixel, so lines carry the colour */
+				bg[k] = p->bg[k] * 0.55f;
+			for (int m = 0; m < US_MAT_COUNT; m++)
+				for (int i = 0; i < 256; i++) {
+					float v = lut[i] / 255.0f;
+					float cover = v * 2.2f > 1 ? 1 : v * 2.2f;
+					for (int k = 0; k < 3; k++) {
+						float hue = us_lerp(p->ramp[m][0][k], p->ramp[m][1][k], v);
+						float o = bg[k] + (hue - bg[k]) * cover;
+						if (look->invert) /* paper: light ground, coloured ink */
+							o = 244 - (244 - hue * 0.7f) * cover;
+						tab[m][i][k] = (uint8_t)(o < 0 ? 0 : o > 255 ? 255 : o);
+					}
+				}
+		}
+		for (size_t i = 0; i < n; i++) {
+			int m = mat[i] < US_MAT_COUNT ? mat[i] : 0;
+			const uint8_t *col = tab[m][ink[i]];
+			uint8_t *o = rgba + i * 4;
+			o[0] = col[0];
+			o[1] = col[1];
+			o[2] = col[2];
 			o[3] = 255;
 		}
 		return;

@@ -3,7 +3,9 @@
 #include "us_canvas.h"
 #include <stddef.h>
 
-enum us_style { US_STYLE_INK = 0, US_STYLE_PIXEL = 1, US_STYLE_MONO = 2, US_STYLE_COUNT };
+enum us_style { US_STYLE_INK = 0, US_STYLE_PIXEL = 1, US_STYLE_MONO = 2, US_STYLE_COLOR = 3, US_STYLE_COUNT };
+/* full-resolution anti-aliased line styles (Ink, and Ink in colour) */
+static inline int us_style_is_ink(int style) { return style == US_STYLE_INK || style == US_STYLE_COLOR; }
 
 typedef struct us_look {
 	int style;         /* enum us_style */

@@ -1,6 +1,6 @@
 /* us_render — headless harness. Renders a scene with real or synthetic audio to PPM frames.
  *
- *   us_render --scene meadow [--style ink|pixel|mono] [--audio file.f32 | --synth]
+ *   us_render --scene meadow [--style ink|color|pixel|mono] [--audio file.f32 | --synth]
  *             [--start S] [--seconds N] [--prewarm S] [--fps 30] [--size 1280x720] [--pixel 4]
  *             [--at 5,10,20 | --every K] [--out dir] [--tint r,g,b] [--palette i] [--invert]
  *             [--density d] [--speed s] [--react r] [--trails b] [--seed n]
@@ -136,7 +136,7 @@ int main(int argc, char **argv)
 		const char *k = argv[i], *v = i + 1 < argc ? argv[i + 1] : "";
 #define ARG(name) (strcmp(k, name) == 0 && ++i)
 		if (ARG("--scene")) scene = v;
-		else if (ARG("--style")) style = !strcmp(v, "pixel") ? US_STYLE_PIXEL : !strcmp(v, "mono") ? US_STYLE_MONO : US_STYLE_INK;
+		else if (ARG("--style")) style = !strcmp(v, "pixel") ? US_STYLE_PIXEL : !strcmp(v, "mono") ? US_STYLE_MONO : !strcmp(v, "color") ? US_STYLE_COLOR : US_STYLE_INK;
 		else if (ARG("--audio")) audio = v;
 		else if (strcmp(k, "--synth") == 0) synth = 1;
 		else if (strcmp(k, "--invert") == 0) invert = 1;

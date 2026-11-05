@@ -272,11 +272,12 @@ static bool style_changed(obs_properties_t *props, obs_property_t *p, obs_data_t
 {
 	(void)p;
 	int style = (int)obs_data_get_int(st, "style");
-	obs_property_set_visible(obs_properties_get(props, "palette"), style == US_STYLE_PIXEL);
-	obs_property_set_visible(obs_properties_get(props, "tint"), style != US_STYLE_PIXEL);
-	obs_property_set_visible(obs_properties_get(props, "pixel_size"), style != US_STYLE_INK);
-	obs_property_set_visible(obs_properties_get(props, "ink_scale"), style == US_STYLE_INK);
-	obs_property_set_visible(obs_properties_get(props, "bloom"), style == US_STYLE_INK);
+	int ink = us_style_is_ink(style);
+	obs_property_set_visible(obs_properties_get(props, "palette"), style == US_STYLE_PIXEL || style == US_STYLE_COLOR);
+	obs_property_set_visible(obs_properties_get(props, "tint"), style == US_STYLE_INK || style == US_STYLE_MONO);
+	obs_property_set_visible(obs_properties_get(props, "pixel_size"), !ink);
+	obs_property_set_visible(obs_properties_get(props, "ink_scale"), ink);
+	obs_property_set_visible(obs_properties_get(props, "bloom"), ink);
 	return true;
 }
 
@@ -305,6 +306,7 @@ static obs_properties_t *src_properties(void *data)
 	obs_properties_t *look = obs_properties_create();
 	p = obs_properties_add_list(look, "style", T_("Style"), OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
 	obs_property_list_add_int(p, T_("Style.Ink"), US_STYLE_INK);
+	obs_property_list_add_int(p, T_("Style.Color"), US_STYLE_COLOR);
 	obs_property_list_add_int(p, T_("Style.Pixel"), US_STYLE_PIXEL);
 	obs_property_list_add_int(p, T_("Style.Mono"), US_STYLE_MONO);
 	obs_property_set_modified_callback(p, style_changed);

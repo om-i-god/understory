@@ -76,7 +76,7 @@ void us_engine_configure(us_engine *e, const us_look *look, int out_w, int out_h
 	e->ink_scale = ink_scale;
 	int cw, ch;
 	us_style_canvas_size(look->style, e->out_w, e->out_h, pixel_size, ink_scale, &cw, &ch);
-	int crisp = look->style != US_STYLE_INK;
+	int crisp = !us_style_is_ink(look->style);
 	if (e->canvas.ink && e->canvas.w == cw && e->canvas.h == ch && e->canvas.crisp == crisp)
 		return;
 	us_canvas_free(&e->canvas);
@@ -172,7 +172,7 @@ void us_engine_frame(us_engine *e, const us_audio *a_in, float dt, double clock_
 				e->disp.mat[i] = e->canvas.mat[i];
 			}
 		}
-	} else if (e->look.style == US_STYLE_INK && e->look.bloom > 0.001f && e->disp.ink) {
+	} else if (us_style_is_ink(e->look.style) && e->look.bloom > 0.001f && e->disp.ink) {
 		size_t n = (size_t)e->canvas.w * e->canvas.h;
 		memcpy(e->disp.ink, e->canvas.ink, n);
 		memcpy(e->disp.mat, e->canvas.mat, n);
@@ -180,7 +180,7 @@ void us_engine_frame(us_engine *e, const us_audio *a_in, float dt, double clock_
 		us_compose(&e->canvas, &e->look, e->rgba);
 		return;
 	}
-	if (e->look.style == US_STYLE_INK && e->look.bloom > 0.001f) {
+	if (us_style_is_ink(e->look.style) && e->look.bloom > 0.001f) {
 		size_t need = us_bloom_scratch(e->disp.w, e->disp.h);
 		if (need > e->bloom_n) {
 			free(e->bloom_buf);

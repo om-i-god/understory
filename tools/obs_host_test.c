@@ -119,8 +119,8 @@ int main(int argc, char **argv)
 	}
 	printf("module loaded: %s\n", obs_get_module_name(mod) ? obs_get_module_name(mod) : "(unnamed)");
 
-	const char *styles[3] = {"ink", "pixel", "mono"};
-	for (int style = 0; style < 3; style++) {
+	const char *styles[4] = {"ink", "pixel", "mono", "color"};
+	for (int style = 0; style < 4; style++) {
 		obs_data_t *st = obs_data_create();
 		obs_data_set_string(st, "scene", scene);
 		obs_data_set_int(st, "style", style);
