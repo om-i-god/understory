@@ -177,7 +177,8 @@ void us_compose(const us_canvas *c, const us_look *look, uint8_t *rgba)
 size_t us_bloom_scratch(int w, int h)
 {
 	size_t bw = (size_t)(w + BLOOM_DS - 1) / BLOOM_DS, bh = (size_t)(h + BLOOM_DS - 1) / BLOOM_DS;
-	return bw * bh * 3 + bw * 2 + (size_t)w / 4 + 4; /* blur buffers + one row of upsample scratch */
+	/* blur buffers (3 planes) + glow-material planes (2 value + 2 byte planes) + one row of upsample scratch */
+	return bw * bh * 3 + bw * bh * 2 + (bw * bh + 1) / 2 + 2 + bw * 2 + (size_t)w / 4 + 4;
 }
 
 static void box_blur(float *a, float *tmp, int w, int h, int r)
@@ -215,23 +216,69 @@ void us_bloom(us_canvas *c, float amount, float *scratch)
 	float *a = scratch, *tmp = scratch + (size_t)bw * bh;
 	/* downsample: per block, mix of mean and max (thin 1px lines in a 4x4 block still bloom) — row-linear */
 	int *bsum = (int *)tmp, *bmax = bsum + bw; /* tmp holds bw*bh floats >= 2*bw ints */
+	size_t nb = (size_t)bw * bh;
+	float *gv = scratch + nb * 3, *gv2 = gv + nb;  /* brightest source value near each block   */
+	uint8_t *gm = (uint8_t *)(gv2 + nb), *gm2 = gm + nb; /* ...and its material (the glow's colour) */
 	for (int by = 0; by < bh; by++) {
 		memset(bsum, 0, sizeof(int) * 2 * bw);
 		int y1 = by * BLOOM_DS + BLOOM_DS < h ? by * BLOOM_DS + BLOOM_DS : h, rows = y1 - by * BLOOM_DS;
 		for (int y = by * BLOOM_DS; y < y1; y++) {
 			const uint8_t *row = c->ink + (size_t)y * w;
+			const uint8_t *mrow = c->mat + (size_t)y * w;
 			for (int x = 0; x < w; x++) {
 				int v = row[x], b = x / BLOOM_DS;
 				bsum[b] += v;
-				if (v > bmax[b])
+				if (v > bmax[b]) {
 					bmax[b] = v;
+					gm[(size_t)by * bw + b] = mrow[x];
+				}
 			}
 		}
 		for (int bx = 0; bx < bw; bx++) {
+			gv[(size_t)by * bw + bx] = (float)bmax[bx];
+			if (!bmax[bx])
+				gm[(size_t)by * bw + bx] = 0;
 			int cols = (bx + 1) * BLOOM_DS <= w ? BLOOM_DS : w - bx * BLOOM_DS;
 			float v = (0.5f * bsum[bx] / (float)(cols * rows) + 0.5f * bmax[bx]) / 255.0f;
 			a[(size_t)by * bw + bx] = v * v;
 		}
+	}
+	/* spread each bright source's material over the area its glow will cover (separable argmax, r=4) */
+	{
+		const int R = 4;
+		for (int y = 0; y < bh; y++)
+			for (int x = 0; x < bw; x++) {
+				float best = -1;
+				uint8_t bm = 0;
+				for (int d = -R; d <= R; d++) {
+					int xx = x + d;
+					if (xx < 0 || xx >= bw)
+						continue;
+					float v = gv[(size_t)y * bw + xx] * (1.0f - 0.08f * (d < 0 ? -d : d));
+					if (v > best) {
+						best = v;
+						bm = gm[(size_t)y * bw + xx];
+					}
+				}
+				gv2[(size_t)y * bw + x] = best;
+				gm2[(size_t)y * bw + x] = bm;
+			}
+		for (int y = 0; y < bh; y++)
+			for (int x = 0; x < bw; x++) {
+				float best = -1;
+				uint8_t bm = 0;
+				for (int d = -R; d <= R; d++) {
+					int yy = y + d;
+					if (yy < 0 || yy >= bh)
+						continue;
+					float v = gv2[(size_t)yy * bw + x] * (1.0f - 0.08f * (d < 0 ? -d : d));
+					if (v > best) {
+						best = v;
+						bm = gm2[(size_t)yy * bw + x];
+					}
+				}
+				gm[(size_t)y * bw + x] = bm;
+			}
 	}
 	/* two scales: a tight halo (point lights, lines) and a wide haze (big bright areas) */
 	float *wide = scratch + (size_t)bw * bh * 2;
@@ -271,8 +318,13 @@ void us_bloom(us_canvas *c, float amount, float *scratch)
 		}
 		if (!any)
 			continue;
-		for (int x = 0; x < w; x++) { /* saturating add, vectorises */
-			unsigned o = (unsigned)row[x] + addrow[x];
+		const uint8_t *gmrow = gm + (size_t)(y / BLOOM_DS < bh ? y / BLOOM_DS : bh - 1) * bw;
+		uint8_t *mrow = c->mat + (size_t)y * w;
+		for (int x = 0; x < w; x++) {
+			unsigned ad = addrow[x], o = (unsigned)row[x] + ad;
+			/* where the glow outshines what is drawn here, it takes the colour of the light that cast it */
+			if (ad > row[x] && gmrow[x / BLOOM_DS])
+				mrow[x] = gmrow[x / BLOOM_DS];
 			row[x] = (uint8_t)(o > 255 ? 255 : o);
 		}
 	}
