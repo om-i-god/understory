@@ -1,7 +1,10 @@
 /* Understory scene: Mycelium — the underground network.
  *
- * A soil cross-section: a thin surface line near the top with grass, a few plants whose roots reach down,
- * and mushrooms that fruit above ground. Below, white hyphae grow as wandering tips that branch, and fuse
+ * A soil cross-section, layered like a cut bank: above, a strip of the living surface (two rows of grass,
+ * flowering plants, leaf litter, the trunk of an old tree whose buttress roots plunge through the frame,
+ * and mushrooms that fruit where the network is rich); below, the soil horizons — a dark humus of leaf
+ * fragments, the topsoil where earthworms tunnel, a stonier subsoil, and fractured bedrock at the bottom.
+ * Hyphae wrap around the stones. Below, white hyphae grow as wandering tips that branch, and fuse
  * when they meet another thread (anastomosis), so the colony becomes a real network. The network is a
  * fixed-capacity graph: every node knows its parent and its path distance from its colony's spore, so a
  * nutrient pulse launched at the spore reaches node i at t0 + d_i / v — pulses race outward through every
@@ -17,6 +20,25 @@
 #include "../core/us_math.h"
 #include <stdlib.h>
 #include <string.h>
+#ifdef US_PROF /* section timing for development: build with -DUS_PROF */
+#include <stdio.h>
+#include <time.h>
+static double prof_acc[12], prof_t;
+static long prof_n;
+static double prof_now(void)
+{
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return ts.tv_sec * 1e3 + ts.tv_nsec * 1e-6;
+}
+#define PROF(k) do { double _n = prof_now(); prof_acc[k] += _n - prof_t; prof_t = _n; } while (0)
+#define PROF_START prof_t = prof_now()
+#define PROF_END do { if (++prof_n % 300 == 0) { fprintf(stderr, "myc prof:"); for (int _k = 0; _k < 12; _k++) fprintf(stderr, " %.3f", prof_acc[_k] / prof_n); fprintf(stderr, "\n"); } } while (0)
+#else
+#define PROF(k)
+#define PROF_START
+#define PROF_END
+#endif
 
 #define MAX_NODES 10000
 #define MAX_TIPS 200
@@ -29,7 +51,16 @@
 #define MAX_SPORES 220
 #define MAX_PLANTS 4
 #define ROOT_SEGS 48
-#define N_SPECK 320
+#define N_SPECK 700
+#define TREE_SEGS 220
+#define MAX_STONE 14
+#define STONE_V 10
+#define N_FRAG 110 /* humus: leaf fragments */
+#define N_LITTER 46 /* fallen leaves on the surface */
+#define N_STRATA 40 /* bedrock bedding lines */
+#define N_STAR 50
+#define MAX_WORM 2
+#define WORM_N 18
 #define GX 96
 #define GY 64
 
@@ -73,6 +104,8 @@ typedef struct {
 	int alive, kind; /* kind 0 parasol, 1 inkcap bell, 2 spotted dome */
 	int feed;        /* the thread that feeds it (pulses arriving here make it glow + puff) */
 	float feed_born;
+	int emit;        /* spores still to release from this puff (they leave one by one, not as a line) */
+	float emit_t;
 } mush_t;
 
 typedef struct {
@@ -80,7 +113,7 @@ typedef struct {
 } germ_t;
 
 typedef struct {
-	float x, y, vx, vy, life;
+	float x, y, vx, vy, life, ph;
 } spore_t;
 
 typedef struct {
@@ -94,6 +127,19 @@ typedef struct {
 	rseg_t root[ROOT_SEGS];
 	float leaf_ph;
 } plant_t;
+
+typedef struct {
+	float x, y, rx, ry; /* x fraction of width; radii in units */
+	float rv[STONE_V];  /* outline radius jitter */
+} stone_t;
+
+typedef struct {
+	float x[WORM_N], y[WORM_N]; /* units (x fraction of width * aspect at time of drawing is not needed: worms live in xf) */
+	float ang, ph, speed;
+	float tr[40][2]; /* the burrow it leaves behind (ring buffer) */
+	int ntr, tr_w;
+	float tr_acc;
+} worm_t;
 
 typedef struct {
 	us_rng rng;
@@ -127,7 +173,17 @@ typedef struct {
 	plant_t plant[MAX_PLANTS];
 	int nplants;
 	float speck_x[N_SPECK], speck_y[N_SPECK], speck_v[N_SPECK];
-	float pebble[8][3];
+	float blade_x[260], blade_v[260];
+	float frag[N_FRAG][4];    /* xf, y, angle, size */
+	float litter[N_LITTER][4]; /* xf, angle, size, hue (0..1: >0.5 turns red in autumn) */
+	float strata[N_STRATA][3]; /* xf, y, length */
+	float star[N_STAR][3];
+	stone_t stone[MAX_STONE];
+	int nstones;
+	float tree_x; /* fraction of width (0 = no tree) */
+	int ntree;
+	rseg_t tree[TREE_SEGS];
+	worm_t worm[MAX_WORM];
 
 	float bass_env, sway_t, glow_env, prev_kick, frame_dt;
 	float empty_t[RX * RY]; /* how long each soil region has been (nearly) empty */
@@ -135,6 +191,7 @@ typedef struct {
 	germ_t germ[MAX_GERM];
 	int ngerm;
 	float dmin[256], dmin_next[256]; /* per colony: path distance of its oldest living thread (pulse source) */
+	unsigned fcount_m;
 } st_t;
 
 static void *create(uint32_t seed)
@@ -146,9 +203,26 @@ static void *create(uint32_t seed)
 
 static void destroy(void *p) { free(p); }
 
+#define SOIL0 0.30f /* the surface sits here: a strip of the world above, the cut bank below */
 static float soil_y(float xf)
 {
-	return 0.165f + 0.012f * us_noise2(xf * 3.1f, 2.7f) + 0.004f * us_noise2(xf * 13.0f, 0.4f);
+	return SOIL0 + 0.012f * us_noise2(xf * 3.1f, 2.7f) + 0.004f * us_noise2(xf * 13.0f, 0.4f);
+}
+/* soil horizons: humus -> topsoil -> subsoil -> bedrock */
+static float hz_humus(float xf) { return soil_y(xf) + 0.05f + 0.008f * us_noise2(xf * 6.0f, 9.1f); }
+static float hz_sub(float xf) { return 0.6f + 0.035f * us_noise2(xf * 2.3f, 7.1f) + 0.008f * us_noise2(xf * 11.0f, 1.3f); }
+static float hz_rock(float xf) { return 0.87f + 0.03f * us_noise2(xf * 1.7f, 3.3f) + 0.007f * us_noise2(xf * 9.0f, 5.5f); }
+
+/* stones: is (x units, y) inside one? (A = aspect) */
+static int in_stone(const st_t *st, float x, float y, float A, float pad)
+{
+	for (int k = 0; k < st->nstones; k++) {
+		const stone_t *s = &st->stone[k];
+		float dx = (x - s->x * A) / (s->rx + pad), dy = (y - s->y) / (s->ry + pad);
+		if (dx * dx + dy * dy < 1.0f)
+			return 1;
+	}
+	return 0;
 }
 
 /* ---- graph ------------------------------------------------------------ */
@@ -239,10 +313,14 @@ static void new_colony_at(st_t *st, float xf, float y)
 static void new_colony(st_t *st, float A)
 {
 	us_rng *r = &st->rng;
-	float xf = us_randr(r, 0.08f, 0.92f);
-	float y = us_randr(r, soil_y(xf) + 0.12f, 0.9f);
+	float xf = 0.5f, y = 0.6f;
+	for (int k = 0; k < 8; k++) {
+		xf = us_randr(r, 0.08f, 0.92f);
+		y = us_randr(r, soil_y(xf) + 0.07f, hz_rock(xf) - 0.04f);
+		if (!in_stone(st, xf * A, y, A, 0.01f))
+			break;
+	}
 	new_colony_at(st, xf, y);
-	(void)A;
 }
 
 /* look for a foreign thread near (xf,y) to fuse with; returns node or -1 */
@@ -312,7 +390,23 @@ static void grow(st_t *st, float A, float sp, float branch_p, float dt)
 				t->ang += us_clampf(0.05f * (float)(cr - cl), -0.25f, 0.25f);
 			}
 			float nx = x + cosf(t->ang) * STEP, ny = y + sinf(t->ang) * STEP;
-			if (nx < 0.006f || nx > A - 0.006f || ny > 0.99f || ny < sy + 0.008f ||
+			if (in_stone(st, nx, ny, A, 0.003f)) {
+				/* a stone: the tip slides along it (turns toward whichever side is free) */
+				float side = us_rand(r) < 0.5f ? -1.0f : 1.0f;
+				int ok = 0;
+				for (int k2 = 0; k2 < 4 && !ok; k2++) {
+					float a2 = t->ang + side * (k2 < 2 ? 0.7f : -0.7f) * (1 + (k2 & 1));
+					float tx = x + cosf(a2) * STEP, ty = y + sinf(a2) * STEP;
+					if (!in_stone(st, tx, ty, A, 0.003f)) {
+						t->ang = a2, nx = tx, ny = ty, ok = 1;
+					}
+				}
+				if (!ok) {
+					dead = 1;
+					break;
+				}
+			}
+			if (nx < 0.006f || nx > A - 0.006f || ny > hz_rock(nx / A) - 0.006f || ny < sy + 0.008f ||
 			    st->cell_cnt[cell_of(nx / A, ny)] > CROWD) { /* edges + crowding: tips stop */
 				dead = 1;
 				break;
@@ -405,7 +499,7 @@ static void make_plant(st_t *st, plant_t *p, float xf)
 {
 	us_rng *r = &st->rng;
 	p->x = xf;
-	p->h = us_randr(r, 0.05f, 0.11f);
+	p->h = us_randr(r, 0.08f, 0.15f);
 	p->leaf_ph = us_rand(r) * 10;
 	p->nroot = 0;
 	/* recursive-ish root: a stack of (x, y, ang, len, depth) */
@@ -447,19 +541,143 @@ static void init_scene(st_t *st, const us_ctx *ctx)
 		st->freelist[st->nfree++] = i;
 	for (int i = 0; i < GX * GY; i++)
 		st->cell_head[i] = -1;
+	/* soil grain: dense in the humus, thinning with depth (rejection sampling on a density profile) */
 	for (int i = 0; i < N_SPECK; i++) {
-		st->speck_x[i] = us_rand(r);
-		st->speck_y[i] = us_rand(r);
+		float xf, y;
+		for (;;) {
+			xf = us_rand(r);
+			y = us_randr(r, soil_y(xf) + 0.004f, 0.995f);
+			float d = y < hz_humus(xf) ? 1.0f : y < hz_sub(xf) ? 0.55f : y < hz_rock(xf) ? 0.3f : 0.18f;
+			if (us_rand(r) < d)
+				break;
+		}
+		st->speck_x[i] = xf;
+		st->speck_y[i] = y;
 		st->speck_v[i] = us_rand(r);
 	}
-	for (int i = 0; i < 8; i++) {
-		st->pebble[i][0] = us_rand(r);
-		st->pebble[i][1] = us_randr(r, 0.25f, 0.97f);
-		st->pebble[i][2] = us_randr(r, 0.004f, 0.012f);
+	for (int i = 0; i < 260; i++) {
+		st->blade_x[i] = us_rand(r);
+		st->blade_v[i] = us_rand(r);
 	}
+	for (int i = 0; i < N_FRAG; i++) {
+		float xf = us_rand(r);
+		st->frag[i][0] = xf;
+		st->frag[i][1] = us_randr(r, soil_y(xf) + 0.006f, hz_humus(xf) - 0.004f);
+		st->frag[i][2] = us_randn(r) * 0.35f;
+		st->frag[i][3] = us_randr(r, 0.004f, 0.011f);
+	}
+	for (int i = 0; i < N_LITTER; i++) {
+		st->litter[i][0] = us_rand(r);
+		st->litter[i][1] = us_randn(r) * 0.3f;
+		st->litter[i][2] = us_randr(r, 0.006f, 0.013f);
+		st->litter[i][3] = us_rand(r);
+	}
+	for (int i = 0; i < N_STRATA; i++) {
+		float xf = us_rand(r);
+		st->strata[i][0] = xf;
+		st->strata[i][1] = us_randr(r, hz_rock(xf) + 0.01f, 0.995f);
+		st->strata[i][2] = us_randr(r, 0.02f, 0.09f);
+	}
+	for (int i = 0; i < N_STAR; i++) {
+		st->star[i][0] = us_rand(r);
+		st->star[i][1] = us_randr(r, 0.01f, SOIL0 - 0.1f);
+		st->star[i][2] = us_rand(r);
+	}
+	/* stones: pebbles in the topsoil, cobbles in the subsoil, boulders sunk in the bedrock */
+	st->nstones = 0;
+	for (int i = 0; i < MAX_STONE; i++) {
+		stone_t *sn = &st->stone[st->nstones];
+		float xf = us_randr(r, 0.03f, 0.97f), rr, y;
+		if (i < 4) {
+			rr = us_randr(r, 0.008f, 0.016f);
+			y = us_randr(r, hz_humus(xf) + 0.02f, hz_sub(xf));
+		} else if (i < 10) {
+			rr = us_randr(r, 0.014f, 0.03f);
+			y = us_randr(r, hz_sub(xf), hz_rock(xf));
+		} else {
+			rr = us_randr(r, 0.04f, 0.075f);
+			y = hz_rock(xf) + us_randr(r, -0.005f, 0.03f);
+		}
+		int clash = 0;
+		for (int k = 0; k < st->nstones; k++) {
+			float dx = (st->stone[k].x - xf) * A, dy = st->stone[k].y - y;
+			if (dx * dx + dy * dy < (st->stone[k].rx + rr + 0.02f) * (st->stone[k].rx + rr + 0.02f))
+				clash = 1;
+		}
+		if (clash)
+			continue;
+		sn->x = xf;
+		sn->y = y;
+		sn->rx = rr;
+		sn->ry = rr * us_randr(r, 0.55f, 0.8f);
+		for (int k = 0; k < STONE_V; k++)
+			sn->rv[k] = us_randr(r, 0.82f, 1.08f);
+		st->nstones++;
+	}
+	/* an old tree at one side: its trunk leaves the top of the frame, buttress roots plunge into the soil */
+	{
+		float side = us_rand(r) < 0.5f ? 0.0f : 1.0f;
+		st->tree_x = side ? us_randr(r, 0.84f, 0.92f) : us_randr(r, 0.08f, 0.16f);
+		st->ntree = 0;
+		float sx[TREE_SEGS], sy[TREE_SEGS], sa[TREE_SEGS], sl[TREE_SEGS], sw[TREE_SEGS];
+		int sd[TREE_SEGS], top = 0;
+		int nmain = 5;
+		for (int k = 0; k < nmain; k++) {
+			float f = (k + 0.5f) / nmain;
+			sx[top] = (f - 0.5f) * 0.05f;
+			sy[top] = 0.004f;
+			sa[top] = US_PI * (0.5f + 0.85f * (f - 0.5f)) + us_randn(r) * 0.08f;
+			sl[top] = us_randr(r, 0.34f, 0.56f) * (0.6f + 0.8f * (1.0f - fabsf(f - 0.5f) * 2.0f) * 0.5f);
+			sw[top] = us_randr(r, 0.013f, 0.019f);
+			sd[top] = 0;
+			top++;
+		}
+		while (top > 0 && st->ntree < TREE_SEGS) {
+			top--;
+			float x = sx[top], y = sy[top], a = sa[top], L = sl[top], w0 = sw[top];
+			int dpt = sd[top];
+			int n = 8 + (int)(us_rand(r) * 4);
+			for (int k = 0; k < n && st->ntree < TREE_SEGS; k++) {
+				a += us_randn(r) * 0.3f;
+				a = us_lerp(a, US_PI * 0.5f, 0.06f); /* gravitropism */
+				if (y < 0.03f && sinf(a) < 0.2f)
+					a = us_lerp(a, US_PI * 0.5f, 0.4f); /* never out of the ground */
+				float l = L / n;
+				rseg_t *sg = &st->tree[st->ntree++];
+				sg->x0 = x, sg->y0 = y;
+				x += cosf(a) * l, y += sinf(a) * l;
+				sg->x1 = x, sg->y1 = y;
+				sg->w = w0 * (1.0f - 0.75f * (float)k / n);
+				if (dpt < 3 && top < TREE_SEGS - 1 && us_rand(r) < 0.42f / (1.0f + dpt)) {
+					sx[top] = x, sy[top] = y;
+					sa[top] = a + (us_rand(r) < 0.5f ? -1 : 1) * us_randr(r, 0.45f, 1.0f);
+					sl[top] = L * us_randr(r, 0.35f, 0.55f);
+					sw[top] = sg->w * 0.6f;
+					sd[top] = dpt + 1;
+					top++;
+				}
+			}
+		}
+	}
+	/* plants, kept clear of the tree */
 	st->nplants = 3;
-	for (int i = 0; i < st->nplants; i++)
-		make_plant(st, &st->plant[i], (i + 0.5f) / st->nplants + us_randr(r, -0.12f, 0.12f));
+	for (int i = 0; i < st->nplants; i++) {
+		float xf = (i + 0.5f) / st->nplants + us_randr(r, -0.12f, 0.12f);
+		if (fabsf(xf - st->tree_x) < 0.1f)
+			xf += xf < st->tree_x ? -0.1f : 0.1f;
+		make_plant(st, &st->plant[i], us_clampf(xf, 0.04f, 0.96f));
+	}
+	for (int k = 0; k < MAX_WORM; k++) {
+		worm_t *wm = &st->worm[k];
+		float xf = us_randr(r, 0.15f, 0.85f), y = us_randr(r, hz_humus(xf) + 0.03f, hz_sub(xf) - 0.03f);
+		wm->ang = us_rand(r) < 0.5f ? 0.0f : US_PI;
+		wm->ph = us_rand(r) * 10.0f;
+		wm->speed = us_randr(r, 0.005f, 0.008f);
+		for (int i = 0; i < WORM_N; i++) {
+			wm->x[i] = xf * A - cosf(wm->ang) * i * 0.0046f;
+			wm->y[i] = y;
+		}
+	}
 
 	/* memory: a network that grew elsewhere (world mycelium) is already here when the scene opens */
 	float m = ctx->w->mycelium;
@@ -476,6 +694,19 @@ static void init_scene(st_t *st, const us_ctx *ctx)
 			lateral(st, 4, A);
 	}
 	st->inited = 1;
+}
+
+/* inlined max-blend pixel write (same as us_put in MAX mode, minus the call per pixel) */
+static inline void put_max(us_canvas *c, int px, int py, float v, uint8_t mat)
+{
+	if ((unsigned)px >= (unsigned)c->w || (unsigned)py >= (unsigned)c->h)
+		return;
+	int iv = (int)(v * 255.0f + 0.5f);
+	size_t i = (size_t)py * c->w + px;
+	if (iv > c->ink[i]) {
+		c->ink[i] = (uint8_t)(iv > 255 ? 255 : iv);
+		c->mat[i] = mat;
+	}
 }
 
 /* fast thin AA line (Wu): two pixels per step, no sqrt — for thousands of hyphal hairlines in Ink */
@@ -502,11 +733,11 @@ static void wu_line(us_canvas *c, float ax, float ay, float bx, float by, float 
 		int iy = (int)floorf(y);
 		float f = y - iy;
 		if (steep) {
-			us_put(c, iy, i, v * cov * (1 - f), mat);
-			us_put(c, iy + 1, i, v * cov * f, mat);
+			put_max(c, iy, i, v * cov * (1 - f), mat);
+			put_max(c, iy + 1, i, v * cov * f, mat);
 		} else {
-			us_put(c, i, iy, v * cov * (1 - f), mat);
-			us_put(c, i, iy + 1, v * cov * f, mat);
+			put_max(c, i, iy, v * cov * (1 - f), mat);
+			put_max(c, i, iy + 1, v * cov * f, mat);
 		}
 	}
 }
@@ -530,6 +761,371 @@ static void px_line(us_canvas *c, float ax, float ay, float bx, float by, float 
 		if (iv > c->ink[i])
 			c->ink[i] = (uint8_t)iv;
 		c->mat[i] = mat;
+	}
+}
+
+/* faded-out pixels keep their old material, which the Ink bloom would light up in stale colours: hand the
+ * dark ones the ambient material. An eighth of the rows per frame (the lag is invisible, the cost an eighth). */
+static void settle_mats(us_canvas *c, uint8_t ambient, unsigned frame)
+{
+	for (int y = (int)(frame & 7); y < c->h; y += 8) {
+		const uint8_t *restrict ink = c->ink + (size_t)y * c->w;
+		uint8_t *restrict mat = c->mat + (size_t)y * c->w;
+		for (int i = 0; i < c->w; i++)
+			mat[i] = ink[i] < 20 ? ambient : mat[i];
+	}
+}
+
+/* a hairline in Ink, a 1-px max-blended line in the pixel styles (doesn't steal brighter pixels) */
+static void hline(us_canvas *c, float ax, float ay, float bx, float by, float v, uint8_t mat)
+{
+	if (!c->crisp) {
+		wu_line(c, ax, ay, bx, by, v, mat);
+		return;
+	}
+	float x0 = ax * c->s, y0 = ay * c->s, x1 = bx * c->s, y1 = by * c->s;
+	float dx = x1 - x0, dy = y1 - y0;
+	int n = (int)ceilf(fmaxf(fabsf(dx), fabsf(dy)));
+	if (n < 1)
+		n = 1;
+	for (int k = 0; k <= n; k++)
+		put_max(c, (int)(x0 + dx * k / n), (int)(y0 + dy * k / n), v, mat);
+}
+
+/* the world around the network: sky, surface life, the tree, soil horizons, stones, roots, worms */
+static void draw_ground(st_t *st, const us_ctx *ctx, us_canvas *c, float wind)
+{
+	us_world *w = ctx->w;
+	float A = ctx->aspect, dens = ctx->p->density, dt = ctx->dt;
+	int crisp = c->crisp;
+	float spring = us_world_season_w(w, 0), summer = us_world_season_w(w, 1);
+	float autumn = us_world_season_w(w, 2), winter = us_world_winter(w);
+	float grow_k = (0.55f + 0.5f * w->growth) * (0.75f + 0.35f * summer + 0.15f * spring) * (1.0f - 0.55f * winter);
+
+	/* night: a few stars over the surface strip */
+	float night = us_sat(1.0f - w->daylight * 1.8f);
+	if (night > 0.02f)
+		for (int i = 0; i < N_STAR; i++) {
+			float tw = 0.6f + 0.4f * sinf(st->t * (0.7f + st->star[i][2]) + i * 2.3f);
+			float v = night * (0.12f + 0.3f * st->star[i][2] * st->star[i][2]) * tw;
+			put_max(c, (int)(st->star[i][0] * A * c->s), (int)(st->star[i][1] * c->s), v, US_MAT_LIGHT);
+		}
+
+	/* back row of grass: shorter, dimmer, a touch higher — the surface has depth */
+	int nback = 60 + (int)(dens * 90);
+	for (int b = 0; b < nback; b++) {
+		float xf = st->blade_x[b], v0 = st->blade_v[b];
+		float x = xf * A, gy = soil_y(xf) - 0.006f;
+		float h = (0.01f + 0.022f * v0) * grow_k;
+		float sw = us_noise2(x * 1.6f - st->sway_t * 0.8f, v0 * 7.0f) * (0.15f + 0.35f * wind);
+		hline(c, x, gy, x + sw * h, gy - h, 0.14f + 0.1f * v0, US_MAT_LEAF);
+	}
+
+	PROF(1);
+	/* the tree: trunk (leaves the top of the frame) with a buttress flare */
+	if (st->tree_x > 0) {
+		float tx = st->tree_x * A, gy = soil_y(st->tree_x);
+		enum { NS = 24 };
+		float lx[(NS + 1) * 2], rx[(NS + 1) * 2];
+		for (int k = 0; k <= NS; k++) {
+			float y = -0.01f + (gy + 0.004f + 0.01f) * k / NS;
+			float hw = 0.024f + 0.026f * expf(-(gy - y) / 0.035f);
+			float bend = 0.006f * us_noise2(y * 4.0f, 1.7f);
+			lx[2 * k] = tx - hw + bend, lx[2 * k + 1] = y;
+			rx[2 * k] = tx + hw + bend * 0.7f, rx[2 * k + 1] = y;
+		}
+		if (crisp) {
+			/* filled bark */
+			for (int k = 0; k < NS; k++) {
+				int y0 = (int)(lx[2 * k + 1] * c->s), y1 = (int)(lx[2 * k + 3] * c->s);
+				for (int py = y0; py <= y1; py++) {
+					int xa = (int)(lx[2 * k] * c->s), xb = (int)(rx[2 * k] * c->s);
+					for (int px = xa; px <= xb; px++)
+						put_max(c, px, py, ((px + py * 3) % 7 == 0) ? 0.26f : 0.15f, US_MAT_EARTH);
+				}
+			}
+		}
+		for (int k = 0; k < NS; k++) {
+			hline(c, lx[2 * k], lx[2 * k + 1], lx[2 * k + 2], lx[2 * k + 3], 0.68f, US_MAT_EARTH);
+			hline(c, rx[2 * k], rx[2 * k + 1], rx[2 * k + 2], rx[2 * k + 3], 0.55f, US_MAT_EARTH);
+		}
+		if (!crisp) {
+			/* bark: broken vertical furrows */
+			for (int j = 1; j < 7; j++) {
+				float f = j / 7.0f;
+				for (int k = (j & 1); k < NS; k += 2) {
+					float xa = us_lerp(lx[2 * k], rx[2 * k], f), xb = us_lerp(lx[2 * k + 2], rx[2 * k + 2], f);
+					float wig = 0.002f * us_noise2(j * 3.0f, k * 0.7f);
+					wu_line(c, xa + wig, lx[2 * k + 1], xb - wig, lx[2 * k + 3], 0.15f + 0.05f * (j & 2), US_MAT_EARTH);
+				}
+			}
+		}
+		/* roots: thick ones drawn as two edges (engraved), fine ones as single hairlines */
+		for (int k = 0; k < st->ntree; k++) {
+			const rseg_t *sg = &st->tree[k];
+			float x0 = tx + sg->x0, y0 = gy + sg->y0, x1 = tx + sg->x1, y1 = gy + sg->y1;
+			if (crisp) {
+				if (sg->w > 0.004f)
+					us_line(c, x0, y0, x1, y1, sg->w, 0.5f, US_MAT_EARTH);
+				else
+					hline(c, x0, y0, x1, y1, 0.4f, US_MAT_EARTH);
+				continue;
+			}
+			if (sg->w > 0.0028f) {
+				float dx = x1 - x0, dy = y1 - y0, l = sqrtf(dx * dx + dy * dy) + 1e-6f;
+				float ox = -dy / l * sg->w * 0.5f, oy = dx / l * sg->w * 0.5f;
+				if (sg->w > 0.006f) /* the big roots: a dim core line between the engraved edges */
+					wu_line(c, x0, y0, x1, y1, 0.2f, US_MAT_EARTH);
+				wu_line(c, x0 + ox, y0 + oy, x1 + ox, y1 + oy, 0.85f, US_MAT_EARTH);
+				wu_line(c, x0 - ox, y0 - oy, x1 - ox, y1 - oy, 0.65f, US_MAT_EARTH);
+				/* engraved cross-hatching along the root body */
+				for (int j = 1; j < 3; j++) {
+					float u = j / 3.0f, mx = us_lerp(x0, x1, u), my = us_lerp(y0, y1, u);
+					wu_line(c, mx + ox * 0.8f + dx * 0.08f, my + oy * 0.8f + dy * 0.08f, mx - ox * 0.8f - dx * 0.08f,
+						my - oy * 0.8f - dy * 0.08f, 0.26f, US_MAT_EARTH);
+				}
+			} else {
+				wu_line(c, x0, y0, x1, y1, 0.22f + 60.0f * sg->w, US_MAT_EARTH);
+			}
+		}
+	}
+
+	PROF(2);
+	/* soil horizons: dotted boundaries between humus / topsoil / subsoil / bedrock */
+	{
+		float step = 0.009f;
+		int n = (int)(A / step) + 1;
+		for (int k = 0; k < n; k += 2) {
+			float xa = k * step, xb = xa + step * 0.8f;
+			float fa = xa / A, fb = xb / A;
+			hline(c, xa, hz_humus(fa), xb, hz_humus(fb), 0.15f, US_MAT_EARTH);
+			if (k % 4 == 0)
+				hline(c, xa, hz_sub(fa), xb, hz_sub(fb), 0.13f, US_MAT_EARTH);
+			hline(c, xa, hz_rock(fa), xb, hz_rock(fb), 0.2f, US_MAT_EARTH);
+		}
+	}
+	/* humus: matted leaf fragments */
+	for (int i = 0; i < N_FRAG; i++) {
+		float x = st->frag[i][0] * A, y = st->frag[i][1], an = st->frag[i][2], sz = st->frag[i][3];
+		float dx = cosf(an) * sz, dy = sinf(an) * sz;
+		float bx = -dy * 0.25f, by = dx * 0.25f;
+		float v = 0.17f + 0.08f * (i % 3);
+		hline(c, x - dx, y - dy, x + bx, y + by, v, US_MAT_EARTH);
+		hline(c, x + bx, y + by, x + dx, y + dy, v, US_MAT_EARTH);
+	}
+	/* grain */
+	for (int i = 0; i < N_SPECK; i++) {
+		float v = 0.07f + 0.15f * st->speck_v[i];
+		int px = (int)(st->speck_x[i] * A * c->s), py = (int)(st->speck_y[i] * c->s);
+		put_max(c, px, py, v * (crisp ? 1.3f : 1.4f), US_MAT_EARTH);
+		if (!crisp && st->speck_v[i] > 0.6f) /* the coarser grains are two pixels */
+			put_max(c, px + 1, py, v, US_MAT_EARTH);
+	}
+	/* bedrock: bedding planes */
+	for (int i = 0; i < N_STRATA; i++) {
+		float x = st->strata[i][0] * A, y = st->strata[i][1], L = st->strata[i][2];
+		if (in_stone(st, x, y, A, 0.004f))
+			continue;
+		float yb = y + 0.004f * us_noise2(x * 3.0f, y * 5.0f);
+		hline(c, x - L * 0.5f, y, x, yb, 0.2f, US_MAT_EARTH);
+		hline(c, x, yb, x + L * 0.5f, y + 0.002f, 0.16f, US_MAT_EARTH);
+	}
+	/* stones: outlined, with engraved shading on the lower side */
+	for (int k = 0; k < st->nstones; k++) {
+		const stone_t *sn = &st->stone[k];
+		float cx = sn->x * A, cy = sn->y;
+		float px[STONE_V + 1], py[STONE_V + 1];
+		for (int j = 0; j <= STONE_V; j++) {
+			float an = US_TAU * (j % STONE_V) / STONE_V;
+			px[j] = cx + cosf(an) * sn->rx * sn->rv[j % STONE_V];
+			py[j] = cy + sinf(an) * sn->ry * sn->rv[j % STONE_V];
+		}
+		if (crisp)
+			for (int j = 0; j < STONE_V; j++)
+				us_tri(c, cx, cy, px[j], py[j], px[j + 1], py[j + 1], 0.17f, US_MAT_EARTH);
+		for (int j = 0; j < STONE_V; j++)
+			hline(c, px[j], py[j], px[j + 1], py[j + 1], j < STONE_V / 2 ? 0.44f : 0.32f, US_MAT_EARTH);
+		if (!crisp) {
+			for (int j = 0; j < 4; j++) { /* hatching, lower-right */
+				float o = 0.15f + 0.17f * j;
+				float hl = sqrtf(fmaxf(0.0f, 1.0f - o * o)) * 0.7f;
+				float ax = cx + (0.7071f * o + 0.7071f * hl) * sn->rx, ay = cy + (0.7071f * o - 0.7071f * hl) * sn->ry;
+				float bx = cx + (0.7071f * o - 0.7071f * hl) * sn->rx, by = cy + (0.7071f * o + 0.7071f * hl) * sn->ry;
+				wu_line(c, ax, ay, bx, by, 0.2f, US_MAT_EARTH);
+			}
+		}
+	}
+	/* plant roots */
+	for (int i = 0; i < st->nplants; i++) {
+		plant_t *p = &st->plant[i];
+		float bx = p->x * A, by = soil_y(p->x);
+		for (int k = 0; k < p->nroot; k++) {
+			rseg_t *sg = &p->root[k];
+			hline(c, bx + sg->x0, by + sg->y0, bx + sg->x1, by + sg->y1, 0.3f + 40.0f * sg->w, US_MAT_EARTH);
+		}
+	}
+
+	PROF(3);
+	/* earthworms: follow-the-leader bodies tunnelling slowly through the topsoil, leaving burrows */
+	for (int k = 0; k < MAX_WORM; k++) {
+		worm_t *wm = &st->worm[k];
+		float hx = wm->x[0], hy = wm->y[0], hf = hx / A;
+		wm->ph += dt * (2.0f + 3.0f * st->bass_env);
+		float sp = wm->speed * (0.5f + 0.4f * sinf(wm->ph) * sinf(wm->ph) + 0.5f * st->bass_env);
+		wm->ang += us_noise2(k * 7.3f, st->t * 0.15f) * 0.8f * dt;
+		float top = hz_humus(hf) + 0.025f, bot = hz_sub(hf) + 0.04f;
+		float ca = cosf(wm->ang);
+		if (hy < top) /* turn downward */
+			wm->ang += (ca >= 0 ? 1.0f : -1.0f) * 0.9f * dt;
+		else if (hy > bot)
+			wm->ang -= (ca >= 0 ? 1.0f : -1.0f) * 0.9f * dt;
+		if ((hx < 0.05f && ca < 0) || (hx > A - 0.05f && ca > 0))
+			wm->ang = US_PI - wm->ang;
+		float nx = hx + cosf(wm->ang) * sp * dt, ny = hy + sinf(wm->ang) * sp * dt;
+		if (in_stone(st, nx, ny, A, 0.004f)) {
+			wm->ang += 1.2f * dt * 8.0f;
+		} else {
+			wm->x[0] = nx, wm->y[0] = ny;
+			wm->tr_acc += sp * dt;
+		}
+		for (int i = 1; i < WORM_N; i++) { /* each segment keeps its distance to the one ahead */
+			float dx = wm->x[i] - wm->x[i - 1], dy = wm->y[i] - wm->y[i - 1];
+			float l = sqrtf(dx * dx + dy * dy) + 1e-6f, seg = 0.0046f * (1.0f + 0.12f * sinf(wm->ph - i * 0.7f));
+			wm->x[i] = wm->x[i - 1] + dx / l * seg;
+			wm->y[i] = wm->y[i - 1] + dy / l * seg;
+		}
+		if (wm->tr_acc > 0.008f) {
+			wm->tr_acc = 0;
+			wm->tr[wm->tr_w][0] = wm->x[WORM_N - 1];
+			wm->tr[wm->tr_w][1] = wm->y[WORM_N - 1];
+			wm->tr_w = (wm->tr_w + 1) % 40;
+			if (wm->ntr < 40)
+				wm->ntr++;
+		}
+		for (int i = 0; i < wm->ntr; i++) { /* burrow: dotted, fading */
+			int j = (wm->tr_w - 1 - i + 40) % 40;
+			float v = 0.2f * (1.0f - (float)i / 40.0f);
+			if (crisp)
+				put_max(c, (int)(wm->tr[j][0] * c->s), (int)(wm->tr[j][1] * c->s), v, US_MAT_EARTH);
+			else
+				us_ring(c, wm->tr[j][0], wm->tr[j][1], 0.0028f, 0.0008f, v, US_MAT_EARTH);
+		}
+		for (int i = 0; i + 1 < WORM_N; i++) {
+			float x0 = wm->x[i], y0 = wm->y[i], x1 = wm->x[i + 1], y1 = wm->y[i + 1];
+			float girth = (i < 2 ? 0.003f : i > WORM_N - 4 ? 0.0024f : 0.0038f) *
+				      (1.0f + 0.15f * sinf(wm->ph - i * 0.7f));
+			float v = i == 4 || i == 5 ? 0.62f : 0.48f; /* the clitellum band */
+			if (crisp) {
+				us_line(c, x0, y0, x1, y1, 0.009f, v, US_MAT_BLOOM);
+				continue;
+			}
+			float dx = x1 - x0, dy = y1 - y0, l = sqrtf(dx * dx + dy * dy) + 1e-6f;
+			float ox = -dy / l * girth, oy = dx / l * girth;
+			wu_line(c, x0 + ox, y0 + oy, x1 + ox, y1 + oy, v, US_MAT_BLOOM);
+			wu_line(c, x0 - ox, y0 - oy, x1 - ox, y1 - oy, v * 0.8f, US_MAT_BLOOM);
+			wu_line(c, x1 + ox, y1 + oy, x1 - ox, y1 - oy, v * 0.5f, US_MAT_BLOOM); /* segment ring */
+		}
+	}
+
+	PROF(4);
+	/* the surface: soil line, fallen leaves, the front row of grass, plants, snow */
+	{
+		float pts[2 * 97];
+		for (int i = 0; i <= 96; i++) {
+			float xf = i / 96.0f;
+			pts[2 * i] = xf * A;
+			pts[2 * i + 1] = soil_y(xf);
+		}
+		us_polyline(c, pts, 97, crisp ? 0.004f : 0.0016f, 0.55f, US_MAT_EARTH);
+		if (winter > 0.2f) {
+			for (int i = 0; i <= 96; i++)
+				pts[2 * i + 1] -= 0.003f * winter;
+			us_polyline(c, pts, 97, crisp ? 0.007f : 0.0016f + 0.004f * winter, 0.8f * us_smooth(0.2f, 0.6f, winter),
+				    US_MAT_ACCENT);
+		}
+	}
+	int nlit = 16 + (int)(30.0f * autumn) + (int)(dens * 6);
+	if (nlit > N_LITTER)
+		nlit = N_LITTER;
+	for (int i = 0; i < nlit; i++) {
+		float xf = st->litter[i][0], an = st->litter[i][1], sz = st->litter[i][2];
+		float x = xf * A, y = soil_y(xf) - 0.003f;
+		float dx = cosf(an) * sz, dy = sinf(an) * sz * 0.5f;
+		float wx = -sinf(an) * sz * 0.35f, wy = -cosf(an) * sz * 0.2f;
+		uint8_t m = autumn > 0.3f && st->litter[i][3] > 0.45f ? US_MAT_BLOOM : US_MAT_EARTH;
+		float v = 0.45f;
+		if (crisp) {
+			us_line(c, x - dx, y - dy, x + dx, y + dy, 0.006f, v, m);
+		} else {
+			wu_line(c, x - dx, y - dy, x + wx, y + wy, v, m);
+			wu_line(c, x + wx, y + wy, x + dx, y + dy, v, m);
+			wu_line(c, x - dx, y - dy, x - wx * 0.6f, y - wy * 0.6f + 0.001f, v * 0.8f, m);
+			wu_line(c, x - wx * 0.6f, y - wy * 0.6f + 0.001f, x + dx, y + dy, v * 0.8f, m);
+		}
+	}
+	int nb = 80 + (int)(dens * 110);
+	for (int b = 0; b < nb; b++) {
+		float xf = st->blade_x[259 - b], v0 = st->blade_v[259 - b];
+		float x = xf * A, gy = soil_y(xf);
+		float h = (0.012f + 0.03f * v0) * grow_k;
+		float sw = us_noise2(x * 2.0f - st->sway_t, v0 * 9.0f) * (0.12f + 0.3f * wind);
+		float mx = x + sw * h * 0.35f, my = gy - h * 0.55f;
+		float tx = x + sw * h + 0.1f * h * (v0 - 0.5f), ty = gy - h;
+		float v = 0.3f + 0.25f * v0;
+		hline(c, x, gy, mx, my, v, US_MAT_LEAF);
+		hline(c, mx, my, tx, ty, v, US_MAT_LEAF);
+	}
+	for (int i = 0; i < st->nplants; i++) {
+		plant_t *p = &st->plant[i];
+		float bx = p->x * A, by = soil_y(p->x);
+		float h = p->h * (0.6f + 0.5f * grow_k);
+		float sw = us_noise2(bx * 1.3f - st->sway_t * 0.5f, i * 3.3f) * (0.04f + 0.12f * wind);
+		float mx = bx + sw * h * 0.3f, my = by - h * 0.5f;
+		float tx = bx + sw * h, ty = by - h;
+		if (crisp) {
+			us_line(c, bx, by, mx, my, 0.006f, 0.55f, US_MAT_STEM);
+			us_line(c, mx, my, tx, ty, 0.006f, 0.55f, US_MAT_STEM);
+		} else {
+			us_line(c, bx, by, mx, my, 0.002f, 0.6f, US_MAT_STEM);
+			us_line(c, mx, my, tx, ty, 0.0018f, 0.6f, US_MAT_STEM);
+		}
+		for (int k = 1; k <= 4; k++) { /* leaves: pointed blades from the stem */
+			float f = k / 5.5f;
+			float lx = us_lerp(bx, tx, f), ly = us_lerp(by, ty, f);
+			float side = (k & 1) ? 1.0f : -1.0f;
+			float la = -US_PI * 0.5f + side * (1.0f + 0.15f * sinf(st->sway_t + p->leaf_ph + k));
+			float ll = h * (0.36f - 0.05f * k);
+			float ex = lx + cosf(la) * ll, ey = ly + sinf(la) * ll + ll * 0.25f;
+			float nx = -sinf(la) * ll * 0.18f, ny = cosf(la) * ll * 0.18f;
+			float qx = (lx + ex) * 0.5f, qy = (ly + ey) * 0.5f;
+			if (crisp) {
+				us_tri(c, lx, ly, qx + nx, qy + ny, ex, ey, 0.5f, US_MAT_LEAF);
+				us_tri(c, lx, ly, qx - nx, qy - ny, ex, ey, 0.42f, US_MAT_LEAF);
+			} else {
+				wu_line(c, lx, ly, qx + nx, qy + ny, 0.5f, US_MAT_LEAF);
+				wu_line(c, qx + nx, qy + ny, ex, ey, 0.5f, US_MAT_LEAF);
+				wu_line(c, lx, ly, qx - nx, qy - ny, 0.42f, US_MAT_LEAF);
+				wu_line(c, qx - nx, qy - ny, ex, ey, 0.42f, US_MAT_LEAF);
+				wu_line(c, lx, ly, ex, ey, 0.25f, US_MAT_LEAF);
+			}
+		}
+		/* flower: open in spring/summer, pale seed head in autumn, bare in winter */
+		float fl = us_sat(1.0f - winter * 1.4f);
+		if (fl > 0.05f) {
+			float pr = (crisp ? 0.009f : 0.0075f) * fl;
+			uint8_t fm = autumn > 0.55f ? US_MAT_ACCENT : US_MAT_BLOOM;
+			for (int k = 0; k < 5; k++) {
+				float an = k * (US_TAU / 5) + p->leaf_ph + 0.2f * sinf(st->sway_t * 0.7f + i);
+				float ex = tx + cosf(an) * pr, ey = ty + sinf(an) * pr * 0.8f;
+				if (crisp) {
+					us_line(c, tx, ty, ex, ey, 0.006f, 0.75f, fm);
+				} else {
+					wu_line(c, tx, ty, ex, ey, 0.75f, fm);
+					us_ring(c, (tx + ex) * 0.5f, (ty + ey) * 0.5f, pr * 0.32f, 0.0009f, 0.6f, fm);
+				}
+			}
+			us_disc(c, tx, ty, crisp ? 0.004f : 0.0022f, 0.85f, US_MAT_LIGHT);
+		}
 	}
 }
 
@@ -576,6 +1172,7 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 	float dt = ctx->dt, A = ctx->aspect, dens = ctx->p->density;
 	if (!st->inited)
 		init_scene(st, ctx);
+	PROF_START;
 	st->t += dt;
 	st->frame_dt = dt;
 
@@ -605,9 +1202,10 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 	/* coverage guarantee: soil regions that stay (nearly) empty get a spore germinating in them */
 	{
 		int cnt[RX * RY] = {0};
-		int y0 = (int)(0.2f * GY);
-		for (int cy = y0; cy < GY; cy++) {
-			int ry = (cy - y0) * RY / (GY - y0);
+		const float Y0 = SOIL0 + 0.03f, Y1 = 0.86f;
+		int y0 = (int)(Y0 * GY), y1 = (int)(Y1 * GY);
+		for (int cy = y0; cy < y1; cy++) {
+			int ry = (cy - y0) * RY / (y1 - y0);
 			for (int cx = 0; cx < GX; cx++)
 				cnt[ry * RX + cx * RX / GX] += st->cell_cnt[cy * GX + cx];
 		}
@@ -628,9 +1226,10 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 		if (best >= 0 && bt > 1.5f && st->germ_cool <= 0) {
 			int rx = best % RX, ry = best / RX;
 			float xf = (rx + us_randr(r, 0.2f, 0.8f)) / RX;
-			float yy = 0.2f + (ry + us_randr(r, 0.2f, 0.8f)) * (0.8f / RY);
-			yy = fmaxf(yy, soil_y(xf) + 0.04f);
-			new_colony_at(st, xf, fminf(yy, 0.95f));
+			float yy = Y0 + (ry + us_randr(r, 0.2f, 0.8f)) * ((Y1 - Y0) / RY);
+			yy = fminf(fmaxf(yy, soil_y(xf) + 0.04f), hz_rock(xf) - 0.03f);
+			if (!in_stone(st, xf * A, yy, A, 0.008f))
+				new_colony_at(st, xf, yy);
 			st->empty_t[best] = 0;
 			st->germ_cool = us_randr(r, 1.5f, 4.0f);
 		}
@@ -667,61 +1266,13 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 		k++;
 	}
 
-	/* ---- above ground: soil line, grass, plants ---- */
-	{
-		float pts[2 * 97];
-		for (int i = 0; i <= 96; i++) {
-			float xf = i / 96.0f;
-			pts[2 * i] = xf * A;
-			pts[2 * i + 1] = soil_y(xf);
-		}
-		us_polyline(c, pts, 97, 0.0016f, 0.6f, US_MAT_EARTH);
-		int nb = 90 + (int)(dens * 120);
-		for (int b = 0; b < nb; b++) {
-			float xf = st->speck_x[b];
-			float x = xf * A, gy = soil_y(xf);
-			float h = 0.008f + 0.016f * st->speck_v[b] * (0.6f + 0.6f * w->growth);
-			float sw = us_noise2(x * 2.0f - st->sway_t, st->speck_y[b] * 9) * (0.1f + 0.25f * wind);
-			us_line(c, x, gy, x + sw * h * 0.8f, gy - h, 0.001f, 0.3f + 0.2f * st->speck_v[b], US_MAT_LEAF);
-		}
-	}
-	for (int i = 0; i < st->nplants; i++) {
-		plant_t *p = &st->plant[i];
-		float bx = p->x * A, by = soil_y(p->x);
-		/* stem + a few leaves */
-		float sw = us_noise2(bx * 1.3f - st->sway_t * 0.5f, i * 3.3f) * (0.02f + 0.08f * wind);
-		float tx = bx + sw * p->h, ty = by - p->h;
-		us_line(c, bx, by, tx, ty, 0.002f, 0.6f, US_MAT_STEM);
-		for (int k = 1; k <= 3; k++) {
-			float f = k / 4.0f;
-			float lx = bx + (tx - bx) * f, ly = by + (ty - by) * f;
-			float side = (k & 1) ? 1.0f : -1.0f;
-			float la = -US_PI * 0.5f + side * (0.9f + 0.15f * sinf(st->sway_t + p->leaf_ph + k));
-			float ll = p->h * 0.32f;
-			us_line(c, lx, ly, lx + cosf(la) * ll, ly + sinf(la) * ll, 0.0015f, 0.5f, US_MAT_LEAF);
-		}
-		us_disc(c, tx, ty, ctx->crisp ? 0.004f : 0.0032f, 0.7f, US_MAT_BLOOM);
-		/* roots */
-		for (int k = 0; k < p->nroot; k++) {
-			rseg_t *s = &p->root[k];
-			us_line(c, bx + s->x0, by + s->y0, bx + s->x1, by + s->y1, s->w, 0.42f, US_MAT_EARTH);
-		}
-	}
+	PROF(0);
+	/* ---- the world around the network ---- */
+	if (!ctx->crisp)
+		settle_mats(c, US_MAT_ACCENT, st->fcount_m++);
+	draw_ground(st, ctx, c, wind);
 
-	/* ---- soil texture: specks + pebbles ---- */
-	for (int i = 0; i < N_SPECK; i++) {
-		float xf = st->speck_x[i], sy = soil_y(xf);
-		float y = sy + 0.02f + st->speck_y[i] * (0.99f - sy - 0.02f);
-		us_point(c, xf * A, y, ctx->crisp ? 0.0016f : 0.0012f, 0.08f + 0.14f * st->speck_v[i], US_MAT_EARTH);
-	}
-	for (int i = 0; i < 8; i++) {
-		float x = st->pebble[i][0] * A, y = st->pebble[i][1], rr = st->pebble[i][2];
-		if (ctx->crisp)
-			us_disc(c, x, y, rr, 0.16f, US_MAT_EARTH);
-		else
-			us_ring(c, x, y, rr, 0.0012f, 0.24f, US_MAT_EARTH);
-	}
-
+	PROF(7);
 	/* ---- the network ---- */
 	{
 		for (int k = 0; k < 256; k++)
@@ -748,8 +1299,11 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 			float head;
 			float g = pulse_glow(st, n, &head);
 			v += 0.45f * g;
-			/* pixel styles keep threads in the STEM ramp: a LIGHT mat would linger through the trails */
-			uint8_t m = g > 0.5f && !ctx->crisp ? US_MAT_LIGHT : US_MAT_STEM;
+			/* pale threads; pulses light them gold (pixel styles keep the thread's own ramp: a LIGHT mat
+			 * would linger through the trails) */
+			uint8_t m = g > 0.5f && !ctx->crisp ? US_MAT_LIGHT : US_MAT_ACCENT;
+			if (ctx->crisp && v < 0.45f)
+				m = US_MAT_STEM; /* pixel: older threads sink into a darker ramp, fresh ones stay pale */
 			float x0 = q->x * A, y0 = q->y, x1 = n->x * A, y1 = n->y;
 			if (head > 0.12f) {
 				/* the nutrient packet itself: a bright bead racing along the thread (trails make it a comet) */
@@ -784,9 +1338,9 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 			if (na->die > 0 || nb->die > 0)
 				v *= 0.4f;
 			if (ctx->crisp)
-				px_line(c, na->x * A, na->y, nb->x * A, nb->y, us_sat(v), US_MAT_STEM);
+				px_line(c, na->x * A, na->y, nb->x * A, nb->y, us_sat(v), US_MAT_ACCENT);
 			else
-				wu_line(c, na->x * A, na->y, nb->x * A, nb->y, us_sat(v), g > 0.5f ? US_MAT_LIGHT : US_MAT_STEM);
+				wu_line(c, na->x * A, na->y, nb->x * A, nb->y, us_sat(v), g > 0.5f ? US_MAT_LIGHT : US_MAT_ACCENT);
 		}
 		for (int k = 0; k < 256; k++)
 			st->dmin[k] = st->dmin_next[k] < 1e8f ? st->dmin_next[k] : 0.0f;
@@ -812,6 +1366,7 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 		k++;
 	}
 
+	PROF(8);
 	/* ---- fruiting bodies: pop up above the soil where the network is rich and the world is wet/green ---- */
 	{
 		float autumn = us_world_season_w(w, 2), winter = us_world_winter(w);
@@ -833,14 +1388,14 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 					continue;
 				int kind = (int)(us_rand(r) * 3.0f);
 				int sib = us_rand(r) < 0.5f ? 1 + (int)(us_rand(r) * 2.0f) : 0; /* clusters */
-				float h0 = kind == 0 ? us_randr(r, 0.06f, 0.1f) : kind == 1 ? us_randr(r, 0.045f, 0.075f)
-							       : us_randr(r, 0.04f, 0.065f);
+				float h0 = kind == 0 ? us_randr(r, 0.1f, 0.16f) : kind == 1 ? us_randr(r, 0.075f, 0.12f)
+							       : us_randr(r, 0.065f, 0.1f);
 				for (int sbi = 0; sbi <= sib && mi >= 0; sbi++) {
 					mush_t *mu = &st->mush[mi];
 					memset(mu, 0, sizeof(*mu));
 					mu->alive = 1;
 					mu->kind = kind;
-					mu->x = us_clampf(n->x + (sbi ? us_randr(r, -0.025f, 0.025f) : 0.0f), 0.01f, 0.99f);
+					mu->x = us_clampf(n->x + (sbi ? us_randr(r, -0.03f, 0.03f) : 0.0f), 0.01f, 0.99f);
 					mu->g = sbi ? -us_randr(r, 0.1f, 0.6f) : 0.0f; /* siblings come up a little later */
 					mu->life = us_randr(r, 30.0f, 60.0f);
 					mu->h = h0 * (sbi ? us_randr(r, 0.45f, 0.75f) : 1.0f);
@@ -887,14 +1442,31 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 			float tx = bx + sinf(lean) * h, ty = by - cosf(lean) * h;
 			float vv = us_sat((0.72f + 0.28f * mu->glow) * (1.0f - 0.6f * wilt));
 			/* rhizomorph: the cord down to the feeding thread */
-			if (fed)
-				us_line(c, bx, by, fn->x * A, fn->y, ctx->crisp ? 0.003f : 0.0014f, 0.45f + 0.5f * mu->glow,
-					mu->glow > 0.4f ? US_MAT_LIGHT : US_MAT_STEM);
-			/* stipe */
-			float sw = (mu->kind == 2 ? 0.0026f : 0.0016f) * (0.6f + 0.4f * pop);
-			us_line(c, bx, by, tx, ty, ctx->crisp ? 0.0045f : sw, vv * 0.85f, US_MAT_STEM);
+			if (fed) { /* a gently sagging cord, not a ruler line */
+				float ex = fn->x * A, ey = fn->y, cv = 0.45f + 0.5f * mu->glow;
+				uint8_t cm = mu->glow > 0.4f ? US_MAT_LIGHT : US_MAT_ACCENT;
+				float qx = bx, qy = by, sag = 0.25f * (ex - bx);
+				for (int k = 1; k <= 4; k++) {
+					float u = k / 4.0f;
+					float px = us_lerp(bx, ex, u) + sag * sinf(u * US_PI), py = us_lerp(by, ey, u);
+					if (ctx->crisp)
+						hline(c, qx, qy, px, py, cv, cm);
+					else
+						wu_line(c, qx, qy, px, py, cv, cm);
+					qx = px, qy = py;
+				}
+			}
+			/* stipe: in Ink an outlined column (two edges), in pixel a solid one */
+			float sw = (mu->kind == 2 ? 0.0055f : mu->kind == 0 ? 0.0038f : 0.0045f) * (0.6f + 0.4f * pop) * (mu->h / 0.12f);
+			if (ctx->crisp) {
+				us_line(c, bx, by, tx, ty, fmaxf(sw * 1.4f, 0.006f), vv * 0.85f, US_MAT_ACCENT);
+			} else {
+				float ox = cosf(lean) * sw * 0.5f, oy = sinf(lean) * sw * 0.5f;
+				wu_line(c, bx - ox * 1.2f, by - oy, tx - ox, ty - oy, vv * 0.85f, US_MAT_ACCENT);
+				wu_line(c, bx + ox * 1.2f, by + oy, tx + ox, ty + oy, vv * 0.7f, US_MAT_ACCENT);
+			}
 			if (mu->kind == 2)
-				us_disc(c, bx, by - 0.003f, ctx->crisp ? 0.0045f : 0.0032f, vv * 0.8f, US_MAT_STEM); /* volva */
+				us_disc(c, bx, by - 0.004f, ctx->crisp ? 0.0065f : 0.005f * (mu->h / 0.08f), vv * 0.8f, US_MAT_ACCENT); /* volva */
 			float cr = mu->r * us_sat(pop * 1.3f - 0.15f);
 			if (cr < 0.001f)
 				continue;
@@ -914,7 +1486,10 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 				ch = cr * (0.95f - 0.3f * open);
 				flat = 0.2f * open;
 			}
-			uint8_t capm = mu->kind == 1 ? US_MAT_ACCENT : US_MAT_BLOOM;
+			/* parasol: brown (EARTH); inkcap: white (ACCENT); fly agaric: red (BLOOM) with pale spots */
+			uint8_t capm = mu->kind == 0 ? US_MAT_EARTH : mu->kind == 1 ? US_MAT_ACCENT : US_MAT_BLOOM;
+			if (mu->kind == 0)
+				vv = us_sat(vv * 1.25f);
 			float pts[2 * 15];
 			int np = 15;
 			float ca = cosf(lean), sa = sinf(lean);
@@ -931,10 +1506,18 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 			}
 			if (ctx->crisp) {
 				for (int k = 0; k + 1 < np; k++)
-					us_tri(c, tx, ty, pts[2 * k], pts[2 * k + 1], pts[2 * k + 2], pts[2 * k + 3], vv, capm);
+					us_tri(c, tx, ty, pts[2 * k], pts[2 * k + 1], pts[2 * k + 2], pts[2 * k + 3],
+					       mu->kind == 0 ? us_sat(vv * 1.3f) : vv, capm);
 			} else {
-				us_polyline(c, pts, np, 0.0015f, vv, capm);
-				us_line(c, pts[0], pts[1], pts[2 * np - 2], pts[2 * np - 1], 0.001f, vv * 0.7f, capm);
+				for (int k = 0; k + 1 < np; k++)
+					wu_line(c, pts[2 * k], pts[2 * k + 1], pts[2 * k + 2], pts[2 * k + 3], vv, capm);
+				wu_line(c, pts[0], pts[1], pts[2 * np - 2], pts[2 * np - 1], vv * 0.7f, capm);
+				/* a second, inner shell line gives the cap body */
+				for (int k = 2; k + 3 < np; k++) {
+					float ax = us_lerp(tx, pts[2 * k], 0.8f), ay = us_lerp(ty, pts[2 * k + 1], 0.8f);
+					float bx2 = us_lerp(tx, pts[2 * k + 2], 0.8f), by2 = us_lerp(ty, pts[2 * k + 3], 0.8f);
+					wu_line(c, ax, ay, bx2, by2, vv * 0.4f, capm);
+				}
 				/* gills: fine radiating lines under the cap, lit by arriving pulses */
 				float gv = vv * (0.35f + 0.6f * mu->glow);
 				for (int k = -4; k <= 4; k++) {
@@ -951,13 +1534,13 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 					float lx = u * cw, ly = -ch * dome * SP[k][1] - ch * 0.12f;
 					float sx = tx + lx * ca - ly * sa, sy = ty + lx * sa + ly * ca;
 					if (ctx->crisp)
-						us_put(c, (int)(sx * c->s), (int)(sy * c->s), vv, US_MAT_LIGHT);
+						us_put(c, (int)(sx * c->s), (int)(sy * c->s), vv, US_MAT_ACCENT);
 					else
-						us_disc(c, sx, sy, 0.0011f + 0.0006f * open, vv, US_MAT_LIGHT);
+						us_ring(c, sx, sy, (0.0012f + 0.0008f * open) * (mu->h / 0.08f), 0.0009f, vv, US_MAT_ACCENT);
 				}
 			} else if (mu->kind == 0 && !ctx->crisp && open > 0.3f) { /* ring on the stipe */
 				float rx = bx + (tx - bx) * 0.72f, ry = by + (ty - by) * 0.72f;
-				us_line(c, rx - 0.004f, ry + 0.002f, rx + 0.004f, ry + 0.002f, 0.0009f, vv * 0.7f, US_MAT_STEM);
+				us_line(c, rx - 0.007f, ry + 0.003f, rx + 0.007f, ry + 0.003f, 0.0009f, vv * 0.7f, US_MAT_ACCENT);
 			}
 			/* spore puffs: when a pulse arrives through the cord, or on hits from mature caps */
 			mu->puff -= dt;
@@ -965,33 +1548,52 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 			if ((arrive || a->beat) && open > 0.7f && wilt <= 0 && mu->puff <= 0 &&
 			    (arrive || us_rand(r) < 0.3f + 0.5f * a->onset)) {
 				mu->puff = us_randr(r, 0.8f, 2.0f);
-				int ns = 2 + (int)(4.0f * mu->glow);
-				for (int k = 0; k < ns && st->nspores < MAX_SPORES; k++) {
-					spore_t *sp2 = &st->spore[st->nspores++];
-					sp2->x = tx + us_randr(r, -cw, cw);
-					sp2->y = ty + 0.002f;
-					sp2->vx = us_randr(r, -0.008f, 0.008f) + 0.003f * wind;
-					sp2->vy = us_randr(r, -0.012f, -0.002f);
-					sp2->life = 1.0f;
-				}
+				mu->emit += 2 + (int)(4.0f * mu->glow);
+			}
+			/* spores drop out of the gills one at a time, then the air takes them */
+			mu->emit_t -= dt;
+			if (mu->emit > 0 && mu->emit_t <= 0 && st->nspores < MAX_SPORES) {
+				spore_t *sp2 = &st->spore[st->nspores++];
+				float u = us_randr(r, -0.85f, 0.85f);
+				sp2->x = tx + u * cw * cosf(lean);
+				sp2->y = ty + u * cw * sinf(lean) + us_randr(r, 0.0f, 0.004f);
+				sp2->vx = us_randn(r) * 0.008f + 0.004f * wind;
+				sp2->vy = us_randr(r, -0.004f, 0.01f);
+				sp2->life = 1.0f;
+				sp2->ph = us_rand(r) * US_TAU;
+				mu->emit--;
+				mu->emit_t = us_randr(r, 0.04f, 0.16f);
 			}
 		}
 		for (int k = 0; k < st->nspores;) {
 			spore_t *s = &st->spore[k];
-			s->vx += us_noise2(s->x * 9.0f, s->y * 9.0f + st->sway_t) * 0.006f * dt + 0.002f * wind * dt;
-			s->vy -= 0.001f * dt;
-			s->vx *= expf(-dt * 0.5f);
+			/* warm air lifts them; a slow curl field makes each wander its own way */
+			float n1 = us_noise3(s->x * 7.0f, s->y * 7.0f, st->t * 0.2f), n2 = us_noise3(s->x * 7.0f + 9.1f, s->y * 7.0f, st->t * 0.2f);
+			/* plus a private random walk: spores leaving the same gill one after another would otherwise
+			 * ride the same streamline and read as a dotted streak */
+			float jit = 0.0025f * sqrtf(dt * 30.0f);
+			s->vx += (n1 * 0.006f + 0.003f * wind) * dt + us_randn(r) * jit;
+			s->vy += (n2 * 0.006f - 0.004f) * dt + us_randn(r) * jit * 0.8f;
+			s->vx *= expf(-dt * 0.6f);
+			s->vy *= expf(-dt * 0.6f);
 			s->x += s->vx * dt;
 			s->y += s->vy * dt;
-			s->life -= dt * 0.22f;
+			s->life -= dt * 0.16f;
 			if (s->life <= 0 || s->y < -0.02f || s->x < -0.02f || s->x > A + 0.02f) {
 				*s = st->spore[--st->nspores];
 				continue;
 			}
-			us_point(c, s->x, s->y, ctx->crisp ? 0.0016f : 0.0011f, 0.45f * s->life, US_MAT_ACCENT);
+			float tw = 0.65f + 0.35f * sinf(st->t * 2.3f + s->ph);
+			float v = 0.55f * us_smooth(0.0f, 0.25f, s->life) * tw;
+			if (ctx->crisp)
+				put_max(c, (int)(s->x * c->s), (int)(s->y * c->s), v, US_MAT_ACCENT);
+			else
+				us_point(c, s->x, s->y, 0.0012f, v, US_MAT_ACCENT);
 			k++;
 		}
 	}
+	PROF(9);
+	PROF_END;
 }
 
-const us_scene_vt us_scene_mycelium = {"mycelium", "Mycelium", 0.75f, create, destroy, frame};
+const us_scene_vt us_scene_mycelium = {"mycelium", "Mycelium", 0.3f, create, destroy, frame};
