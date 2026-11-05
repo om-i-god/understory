@@ -94,12 +94,15 @@ static void spawn(st_t *st, part_t *q, float winter, int anywhere, float A)
 	else if (q->kind == K_SNOW)
 		q->y = -0.02f; /* snow sifts down from above */
 	else {
-		/* enter from an edge the wind is blowing from, or from below (thermals) */
+		/* most drift into view anywhere (fading in, as if catching the light); the rest enter from the windward
+		 * edge or rise from below, so the air fills evenly instead of piling up on one side */
 		float e = us_rand(r);
-		if (e < 0.6f) {
+		if (e < 0.5f) {
+			q->y = us_randr(r, 0.04f, 0.86f);
+		} else if (e < 0.72f) {
 			q->x = -0.02f;
 			q->y = us_randr(r, 0.05f, 0.88f);
-		} else if (e < 0.8f) {
+		} else if (e < 0.88f) {
 			q->y = 0.95f;
 		} else {
 			q->y = -0.02f;
@@ -110,6 +113,20 @@ static void spawn(st_t *st, part_t *q, float winter, int anywhere, float A)
 	q->life = 0.0f;
 	q->seedv = us_rand(r);
 	q->ttl = us_randr(r, 25.0f, 60.0f);
+}
+
+/* Ink bloom keeps each pixel's material, so a seed's glow spreading over stale wind-line pixels came out in
+ * patches. Pollen's air is full of seeds, so every faint background / wind pixel simply takes the seeds' hue:
+ * one branchless pass, cheaper than working out where the halos are. */
+static void tint_air(us_canvas *c, uint8_t to, int ink_max, unsigned from_mask)
+{
+	size_t n = (size_t)c->w * c->h;
+	const uint8_t *ink = c->ink;
+	uint8_t *m = c->mat;
+	for (size_t i = 0; i < n; i++) {
+		unsigned mm = m[i], ok = (unsigned)(ink[i] <= ink_max) & (from_mask >> (mm & 31u));
+		m[i] = (uint8_t)(ok & 1u ? to : mm);
+	}
 }
 
 /* cheap anti-aliased hairline (Wu-style: two pixels per step along the major axis), brightness v0 -> v1 */
@@ -199,7 +216,7 @@ static void pappus(us_canvas *c, int crisp, float x, float y, float sz, float ti
 	wline(c, bx, by, x, y, v * 0.9f, mat);
 	us_disc(c, x - axx * sz * 0.15f, y - axy * sz * 0.15f, sz * 0.05f + 0.0006f, v * 0.6f, mat);
 	wline2(c, x, y, cx, cy, v * 0.55f, v * 0.35f, mat);
-	int n = sz > 0.02f ? 22 : (sz > 0.012f ? 15 : 9);
+	int n = sz > 0.02f ? 19 : (sz > 0.012f ? 14 : 9);
 	if (n > maxn)
 		n = maxn;
 	int barbs = sz > 0.024f;
@@ -322,15 +339,27 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 		for (int j = 0; j <= gy; j++)
 			for (int i = 0; i <= gx; i++) {
 				float x = (float)i / gx * A, y = (float)j / gy;
+				/* the drawn streamlines carry a softer second octave than the particle wind, so they read as
+				 * long flowing threads rather than knots */
 				float ps = us_noise3(x * eddy, y * eddy, st->swirl_t) +
-					   0.4f * us_noise3(x * eddy * 2.3f, y * eddy * 2.3f, st->swirl_t * 1.7f + 5.0f);
+					   0.22f * us_noise3(x * eddy * 2.3f, y * eddy * 2.3f, st->swirl_t * 1.7f + 5.0f);
 				float P = ps * k_sw + breeze0 * y * 0.6f + lift0 * x * 0.5f;
 				st->psi_t[j * (gx + 1) + i] = P;
 				lo = P < lo ? P : lo;
 				hi = P > hi ? P : hi;
 			}
-		int nlev = ctx->crisp ? 7 : 13;
+		int nlev = ctx->crisp ? 7 : 12;
 		float step = (hi - lo) / (nlev + 1);
+		/* mean slope of the field: contours where the slope dies away are the small closed loops around an
+		 * eddy's eye; they fade out so only the long sweeping lines remain */
+		float gmean = 1e-6f;
+		for (int j = 0; j < gy; j++)
+			for (int i = 0; i < gx; i++) {
+				float p00 = st->psi_t[j * (gx + 1) + i], p11 = st->psi_t[(j + 1) * (gx + 1) + i + 1];
+				float p10 = st->psi_t[j * (gx + 1) + i + 1], p01 = st->psi_t[(j + 1) * (gx + 1) + i];
+				gmean += fabsf(p10 + p11 - p00 - p01) + fabsf(p01 + p11 - p00 - p10);
+			}
+		gmean /= (float)(gx * gy);
 		float sv = (ctx->crisp ? 0.2f : 0.22f) * (0.55f + 0.6f * st->bass_s) * (1.0f - 0.5f * winter);
 		float hx = A / gx, hy = 1.0f / gy;
 		for (int j = 0; j < gy; j++)
@@ -344,6 +373,10 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 				float p00 = st->psi_t[j * (gx + 1) + i], p10 = st->psi_t[j * (gx + 1) + i + 1];
 				float p01 = st->psi_t[(j + 1) * (gx + 1) + i], p11 = st->psi_t[(j + 1) * (gx + 1) + i + 1];
 				float cmin = fminf(fminf(p00, p10), fminf(p01, p11)), cmax = fmaxf(fmaxf(p00, p10), fmaxf(p01, p11));
+				float slope = (fabsf(p10 + p11 - p00 - p01) + fabsf(p01 + p11 - p00 - p10)) / gmean;
+				float pv = sv * patch * us_smooth(0.55f, 1.2f, slope);
+				if (pv < 0.008f)
+					continue;
 				int l0 = (int)ceilf((cmin - lo) / step), l1 = (int)floorf((cmax - lo) / step);
 				for (int l = l0 < 1 ? 1 : l0; l <= l1 && l <= nlev; l++) {
 					float L = lo + l * step;
@@ -359,7 +392,7 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 					if ((p00 < L) != (p01 < L))
 						ex[ne] = x0, ey[ne++] = y0 + hy * (L - p00) / (p01 - p00);
 					for (int e = 0; e + 1 < ne; e += 2)
-						wline(c, ex[e], ey[e], ex[e + 1], ey[e + 1], sv * patch, ctx->crisp ? US_MAT_WATER : US_MAT_BG);
+						wline(c, ex[e], ey[e], ex[e + 1], ey[e + 1], pv, US_MAT_WATER);
 				}
 			}
 	}
@@ -376,19 +409,30 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 		if (beam_v[k] < 0.02f)
 			continue;
 		float x0 = st->beam_x[k] * A, wdt = st->beam_w[k];
-		int nl = ctx->crisp ? 4 : 12;
+		int nl = ctx->crisp ? 4 : 14;
 		for (int l = 0; l < nl; l++) {
-			float off = (l / (float)(nl - 1) - 0.5f) * wdt;
+			/* uneven strand spacing, and dust drifting through each strand, so the shaft reads as light in air */
+			float jit = 0.35f * sinf(l * 12.9f + k * 3.1f) / nl;
+			float off = ((l + 0.5f) / nl - 0.5f + jit) * wdt;
 			float e = fabsf(off) / (wdt * 0.5f + 1e-4f);
-			float edge = 1.0f - e * e * 0.85f;
+			float edge = us_sat(1.0f - e * e * 0.85f);
+			float dust = 0.5f + 0.5f * us_noise2(t * 0.15f + l * 1.7f, k * 5.3f + 2.0f);
 			float yb = 0.88f - 0.12f * us_noise2(l * 0.7f, st->beam_ph[k]); /* strands fade out at uneven depths */
-			if (ctx->crisp)
-				/* pixel palettes: the BG ramp gives a soft slate shaft instead of a hard gold wire */
-				us_line(c, x0 + off, -0.02f, x0 + off + bdx * (yb + 0.02f), yb, 0.004f, us_sat(1.3f * beam_v[k] * edge),
-					US_MAT_BG);
-			else
-				wline2(c, x0 + off, -0.02f, x0 + off + bdx * (yb + 0.02f), yb, 0.42f * beam_v[k] * edge,
-				       0.03f * beam_v[k], US_MAT_LIGHT);
+			if (ctx->crisp) {
+				/* pixel looks: a dithered strand that fades as it falls, never a hard wire */
+				float top = us_sat(1.15f * beam_v[k] * edge * (0.6f + 0.4f * dust));
+				int py0 = (int)(-0.02f * c->s), py1 = (int)(yb * c->s);
+				for (int py = py0 < 0 ? 0 : py0; py < py1; py++) {
+					float yy = (py + 0.5f) / c->s, u = (yy + 0.02f) / (yb + 0.02f);
+					float vv = top * (1.0f - u) * (1.0f - u);
+					int px = (int)((x0 + off + bdx * (yy + 0.02f)) * c->s);
+					if (vv < 0.1f || (vv < 0.45f && ((px + py) & 1)))
+						continue;
+					us_put(c, px, py, vv, US_MAT_BG);
+				}
+			} else
+				wline2(c, x0 + off, -0.02f, x0 + off + bdx * (yb + 0.02f), yb,
+				       0.36f * beam_v[k] * edge * (0.35f + 0.65f * dust), 0.02f * beam_v[k], US_MAT_LIGHT);
 		}
 	}
 
@@ -657,6 +701,10 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 		}
 	}
 	c->blend = US_BLEND_MAX;
+
+	if (!ctx->crisp) {
+		tint_air(c, US_MAT_ACCENT, 12, (1u << US_MAT_BG) | (1u << US_MAT_WATER));
+	}
 }
 
 const us_scene_vt us_scene_pollen = {"pollen", "Pollen & Seeds", 0.12f, create, destroy, frame};

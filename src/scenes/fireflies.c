@@ -30,6 +30,9 @@
 #define FH 64
 #define NHIST 18 /* flight-path history samples (long-exposure trails) */
 #define NGB 48    /* ground-light bins across the width */
+#define NMW 460   /* milky-way stars */
+#define LGX 64    /* coarse flash-light grid (halo tinting) */
+#define LGY 36
 
 #define POOL_Y 0.885f
 #define FLY_TOP 0.36f
@@ -76,6 +79,9 @@ typedef struct {
 	float sync;       /* global order parameter (smoothed), for diagnostics + glow */
 	float hist_acc;
 	float gbin[NGB], gbin_s[NGB]; /* flash light falling on the bank, per x bin */
+	float mw_x[NMW], mw_y[NMW], mw_b[NMW];
+	float lg[LGX * LGY], lg_s[LGX * LGY], lcov[LGX * LGY];
+	float lwt[LGX * LGY];
 } st_t;
 
 static void *create(uint32_t seed)
@@ -110,7 +116,37 @@ static void hring(us_canvas *c, float x, float y, float r, float v)
 	}
 }
 
-/* a fine horizontal hairline (cheap: two rows of coverage, soft ends) */
+/* a fine horizontal hairline (cheap: two rows of coverage, soft ends); with `cov` (a coarse LGX x LGY light
+ * grid) the line thins away where fireflies are flashing, so their glare washes the engraving out softly */
+static void hline_cov(us_canvas *c, float x0, float x1, float y, float v, uint8_t m, const float *cov)
+{
+	float fy = y * c->s - 0.5f;
+	int iy = (int)floorf(fy);
+	float ay = fy - iy;
+	int p0 = (int)(x0 * c->s), p1 = (int)(x1 * c->s);
+	if (p0 < 0)
+		p0 = 0;
+	if (p1 > c->w)
+		p1 = c->w;
+	float gyf = us_clampf(y * LGY - 0.5f, 0, LGY - 1.001f);
+	int gj = (int)gyf;
+	float ty = gyf - gj;
+	const float *r0 = cov + gj * LGX, *r1 = cov + (gj + 1) * LGX;
+	float gsc = (float)LGX / c->w;
+	for (int px = p0; px < p1; px++) {
+		float e = us_sat((px - p0) * 0.1f) * us_sat((p1 - px) * 0.1f);
+		float gxf = us_clampf((px + 0.5f) * gsc - 0.5f, 0, LGX - 1.001f);
+		int gi = (int)gxf;
+		float tx = gxf - gi;
+		float k = us_lerp(us_lerp(r0[gi], r0[gi + 1], tx), us_lerp(r1[gi], r1[gi + 1], tx), ty);
+		float vv = v * e * (1.0f - us_sat(k * 3.0f));
+		if (vv <= 0.002f)
+			continue;
+		us_put(c, px, iy, vv * (1 - ay), m);
+		us_put(c, px, iy + 1, vv * ay, m);
+	}
+}
+
 static void hline(us_canvas *c, float x0, float x1, float y, float v, uint8_t m)
 {
 	float fy = y * c->s - 0.5f;
@@ -159,6 +195,85 @@ static void wline(us_canvas *c, float ax, float ay, float bx, float by, float v,
 			us_put(c, ix, iy + 1, v * f, m);
 		}
 	}
+}
+
+/* Ink bloom keeps each pixel's material, so a glow spreading over faint pixels of other materials comes out
+ * patchy or striped. Recolour faint pixels toward `to` with a coarse weight field (bilinear between cell
+ * centres, ordered dither at partial weight), so a halo is one even hue with no visible cell edges.
+ * Works quad by quad between cell centres: empty quads are skipped, saturated quads take a fast path. */
+static void tint_soft(us_canvas *c, const float *wgt, int gw, int gh, uint8_t to, int ink_max, unsigned from_mask)
+{
+	static const uint8_t bayer[16] = {0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5};
+	float cw = (float)c->w / gw, ch = (float)c->h / gh;
+	for (int j = -1; j < gh; j++) {
+		int ja = j < 0 ? 0 : j, jb = j + 1 >= gh ? gh - 1 : j + 1;
+		int y0 = j < 0 ? 0 : (int)((j + 0.5f) * ch), y1 = j + 1 >= gh ? c->h : (int)((j + 1.5f) * ch);
+		if (y1 > c->h)
+			y1 = c->h;
+		for (int i = -1; i < gw; i++) {
+			int ia = i < 0 ? 0 : i, ib = i + 1 >= gw ? gw - 1 : i + 1;
+			float w00 = wgt[ja * gw + ia], w10 = wgt[ja * gw + ib], w01 = wgt[jb * gw + ia], w11 = wgt[jb * gw + ib];
+			float mx = fmaxf(fmaxf(w00, w10), fmaxf(w01, w11));
+			if (mx < 0.03f)
+				continue;
+			int x0 = i < 0 ? 0 : (int)((i + 0.5f) * cw), x1 = i + 1 >= gw ? c->w : (int)((i + 1.5f) * cw);
+			if (x1 > c->w)
+				x1 = c->w;
+			float mn = fminf(fminf(w00, w10), fminf(w01, w11));
+			float iy = 1.0f / (y1 - y0 > 0 ? y1 - y0 : 1), ix = 1.0f / (x1 - x0 > 0 ? x1 - x0 : 1);
+			for (int y = y0; y < y1; y++) {
+				const uint8_t *ink = c->ink + (size_t)y * c->w;
+				uint8_t *m = c->mat + (size_t)y * c->w;
+				if (mn >= 1.0f) { /* branchless: this runs over large areas */
+					for (int x = x0; x < x1; x++) {
+						unsigned mm = m[x], ok = (unsigned)(ink[x] <= ink_max) & (from_mask >> (mm & 31u));
+						m[x] = (uint8_t)(ok & 1u ? to : mm);
+					}
+					continue;
+				}
+				float ty = (y - y0 + 0.5f) * iy;
+				float wl = (w00 + (w01 - w00) * ty) * 16.0f, wr = (w10 + (w11 - w10) * ty) * 16.0f;
+				float k = wl + (wr - wl) * 0.5f * ix, dk = (wr - wl) * ix;
+				const uint8_t *bz = bayer + (y & 3) * 4;
+				for (int x = x0; x < x1; x++, k += dk) {
+					unsigned mm = m[x];
+					unsigned ok = (unsigned)(k > bz[x & 3] + 0.5f) & (unsigned)(ink[x] <= ink_max) & (from_mask >> (mm & 31u));
+					m[x] = (uint8_t)(ok & 1u ? to : mm);
+				}
+			}
+		}
+	}
+}
+
+/* spread a coarse accumulation grid into a 0..1 tint weight (cone kernel of radius `rad` cells, rad <= 3) */
+static void tint_weight(const float *acc, float *wgt, int gw, int gh, int rad, float gain)
+{
+	float kern[7][7];
+	for (int dy = -rad; dy <= rad; dy++)
+		for (int dx = -rad; dx <= rad; dx++) {
+			float d = sqrtf((float)(dx * dx + dy * dy)) / (rad + 0.5f);
+			kern[dy + 3][dx + 3] = d < 1.0f ? (1.0f - d) * gain : 0.0f;
+		}
+	memset(wgt, 0, sizeof(float) * (size_t)gw * gh);
+	/* scatter: only occupied cells cost anything */
+	for (int gy = 0; gy < gh; gy++)
+		for (int gx = 0; gx < gw; gx++) {
+			float a = acc[gy * gw + gx];
+			if (a <= 0)
+				continue;
+			for (int dy = -rad; dy <= rad; dy++) {
+				int yy = gy + dy;
+				if (yy < 0 || yy >= gh)
+					continue;
+				for (int dx = -rad; dx <= rad; dx++) {
+					int xx = gx + dx;
+					if (xx >= 0 && xx < gw)
+						wgt[yy * gw + xx] += a * kern[dy + 3][dx + 3];
+				}
+			}
+		}
+	for (int i = 0; i < gw * gh; i++)
+		wgt[i] = us_sat(wgt[i]);
 }
 
 static float tree_at(const st_t *st, float xf)
@@ -279,6 +394,16 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 			st->star_b[k] = 0.25f + 0.6f * us_rand(r) * us_rand(r);
 			st->star_ph[k] = us_rand(r) * US_TAU;
 		}
+		/* the milky way: a soft clumpy band arcing across the upper sky */
+		for (int k = 0; k < NMW; k++) {
+			float u = us_rand(r);
+			float off = us_randn(r) * (0.035f + 0.03f * us_rand(r));
+			st->mw_x[k] = u;
+			st->mw_y[k] = 0.06f + 0.30f * u - 0.16f * u * u + off; /* tilted, gently bowed */
+			float clump = us_sat(0.5f + 0.9f * us_fbm2(u * 7.0f, off * 30.0f, 3));
+			st->mw_b[k] = (0.12f + 0.5f * us_rand(r) * us_rand(r)) * (0.3f + 0.7f * clump) *
+				      (1.0f - us_sat(fabsf(off) / 0.09f) * 0.6f);
+		}
 		for (int k = 0; k < NRIP; k++) {
 			st->rip_x[k] = us_rand(r);
 			st->rip_y[k] = us_randr(r, POOL_Y + 0.012f, 0.995f);
@@ -286,7 +411,7 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 			st->rip_sp[k] = us_randr(r, 0.004f, 0.012f) * (us_rand(r) < 0.5f ? -1 : 1);
 		}
 		/* population at open remembers the world's insects */
-		float frac = (0.10f + 0.6f * w->insects) * dayf * (1.0f - 0.8f * winter);
+		float frac = (0.22f + 0.6f * w->insects) * dayf * (1.0f - 0.8f * winter);
 		int n0 = (int)(nmax * frac);
 		for (int i = 0; i < n0 && i < MAXF; i++)
 			spawn_fly(st, &st->f[i], A, 1.0f);
@@ -320,10 +445,10 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 	for (int i = 0; i < MAXF; i++)
 		if (st->f[i].state == 1)
 			alive++;
-	float frac = (0.12f + 0.35f * w->insects + 0.9f * E * E) * dayf * (1.0f - 0.85f * winter);
+	float frac = (0.2f + 0.35f * w->insects + 0.9f * E * E) * dayf * (1.0f - 0.85f * winter);
 	int target = (int)(nmax * us_sat(frac));
 	if (alive < target) {
-		st->spawn_acc += dt * (3.0f + 40.0f * E);
+		st->spawn_acc += dt * (6.0f + 40.0f * E);
 		while (st->spawn_acc >= 1.0f) {
 			st->spawn_acc -= 1.0f;
 			for (int i = 0; i < MAXF; i++)
@@ -444,9 +569,13 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 			for (int k = 0; k < NH; k++) {
 				float u = (k + 0.5f) / NH;
 				float y = 0.64f - 0.56f * powf(u, 1.7f);
-				float v = 2.3f * dusk * (0.07f + 0.93f * expf(-(0.64f - y) / 0.17f));
+				float v = 2.3f * dusk * (0.07f + 0.93f * expf(-(0.64f - y) / 0.15f)) * (u < 0.28f ? 1.35f : 1.0f);
 				if (v < 0.02f)
 					continue;
+				/* a rose afterglow low behind the trees, cool night blue overhead */
+				uint8_t hm = u < 0.42f ? US_MAT_BLOOM : US_MAT_WATER;
+				if (u >= 0.28f)
+					v *= 0.8f;
 				int run0 = -1;
 				float cl = 0;
 				for (int i = 0; i <= TREE_N; i++) {
@@ -462,7 +591,7 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 					else if (!open && run0 >= 0) {
 						float xa = (float)run0 / (TREE_N - 1) * A, xb = (float)(i - 1) / (TREE_N - 1) * A;
 						if (xb > xa)
-							hline(c, xa, xb, y, v * 0.75f, US_MAT_BG);
+							hline_cov(c, xa, xb, y, v * 0.75f, hm, st->lcov);
 						run0 = -1;
 					}
 				}
@@ -478,7 +607,8 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 					float xf = (float)i / (MS - 1);
 					float n = us_fbm2(xf * 5.0f - t * 0.012f * (1.0f + 0.2f * u), y * 14.0f + t * 0.004f, 2);
 					float open = y > tree_at(st, xf) + 0.01f;
-					prof[i] = open * band * us_smooth(0.05f, 0.6f, 0.5f + n) * (0.08f + 0.1f * w->calm + 0.25f * st->glow);
+					/* the field's air, faintly lit by the swarm */
+					prof[i] = open * band * us_smooth(0.25f, 0.75f, 0.5f + n) * (0.04f + 0.05f * w->calm + 0.14f * st->glow);
 				}
 				float fy = y * c->s - 0.5f;
 				int iy = (int)floorf(fy);
@@ -490,8 +620,8 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 						qi = MS - 2;
 					float v = us_lerp(prof[qi], prof[qi + 1], q - qi);
 					if (v > 0.006f) {
-						us_put(c, px, iy, v * (1 - ay), US_MAT_BG);
-						us_put(c, px, iy + 1, v * ay, US_MAT_BG);
+						us_put(c, px, iy, v * (1 - ay), US_MAT_LIGHT);
+						us_put(c, px, iy + 1, v * ay, US_MAT_LIGHT);
 					}
 				}
 			}
@@ -513,6 +643,35 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 				us_point(c, xf * A, st->star_y[k], ctx->crisp ? 0.0025f : 0.0011f, sb,
 					 US_MAT_ACCENT);
 			}
+	}
+
+	/* the milky way: fills the high sky with a slow, clumpy river of faint stars */
+	{
+		float sv = 1.0f - us_smooth(0.12f, 0.5f, w->daylight);
+		if (sv > 0.01f) {
+			float rot = t * 0.0008f; /* the sky turns, imperceptibly */
+			for (int k = 0; k < NMW; k++) {
+				float xf = st->mw_x[k] + rot;
+				xf -= floorf(xf);
+				float y = st->mw_y[k] + 0.03f * sinf(xf * 3.0f);
+				if (y > tree_at(st, xf) - 0.015f || y < 0.005f)
+					continue;
+				float b = 2.4f * st->mw_b[k] * sv * (0.85f + 0.15f * sinf(t * (0.5f + (k % 7) * 0.2f) + k));
+				if (ctx->crisp) {
+					if (st->mw_b[k] < 0.2f)
+						continue;
+					us_put(c, (int)(xf * A * c->s), (int)(y * c->s), b * 1.2f, US_MAT_ACCENT);
+				} else {
+					float fx = xf * A * c->s - 0.5f, fy = y * c->s - 0.5f;
+					int ix = (int)floorf(fx), iy = (int)floorf(fy);
+					float ax = fx - ix, ay = fy - iy;
+					us_put(c, ix, iy, b * (1 - ax) * (1 - ay), US_MAT_ACCENT);
+					us_put(c, ix + 1, iy, b * ax * (1 - ay), US_MAT_ACCENT);
+					us_put(c, ix, iy + 1, b * (1 - ax) * ay, US_MAT_ACCENT);
+					us_put(c, ix + 1, iy + 1, b * ax * ay, US_MAT_ACCENT);
+				}
+			}
+		}
 	}
 
 	/* moon on a night arc */
@@ -556,6 +715,16 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 		push_hist = 1;
 	}
 	memset(st->gbin, 0, sizeof(st->gbin));
+	memset(st->lg, 0, sizeof(st->lg));
+	/* at high density the long-exposure trails thin out so the swarm stays legible */
+	float trail_k = 1.0f;
+	{
+		float pop = 0;
+		for (int i = 0; i < MAXF; i++)
+			pop += st->f[i].state != 0;
+		if (pop > 120.0f)
+			trail_k = sqrtf(120.0f / pop);
+	}
 	c->blend = US_BLEND_ADD;
 	for (int i = 0; i < MAXF; i++) {
 		fly_t *f = &st->f[i];
@@ -633,7 +802,7 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 			int idx = f->hh;
 			for (int k = 0; k < NHIST - 1; k++) {
 				float hb = f->hb[idx];
-				float tv = 0.36f * (pb < hb ? pb : hb) * (1.0f - (float)k / NHIST);
+				float tv = 0.36f * trail_k * (pb < hb ? pb : hb) * (1.0f - (float)k / NHIST);
 				if (tv > 0.015f) {
 					if (ctx->crisp)
 						us_line(c, px, py, f->hx[idx], f->hy[idx], 0.002f, tv * 0.7f, US_MAT_LIGHT);
@@ -647,6 +816,11 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 
 		if (b > 0.01f) {
 			gl_sum += v;
+			{
+				int gx = (int)(f->x * LGX), gy = (int)(y * LGY);
+				if (gx >= 0 && gy >= 0 && gx < LGX && gy < LGY)
+					st->lg[gy * LGX + gx] += v;
+			}
 			{
 				int gb = (int)(f->x * NGB);
 				if (gb >= 0 && gb < NGB)
@@ -667,16 +841,15 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 						us_put(c, (int)(x * c->s), (int)(y * c->s) + k, 0.45f * v, US_MAT_LIGHT);
 					}
 			} else {
-				if (v > 0.2f)
-					us_disc(c, x, y, 0.012f * size, 0.05f * v, US_MAT_LIGHT);
-				us_disc(c, x, y, 0.006f * size, 0.13f * v, US_MAT_LIGHT);
-				us_disc(c, x, y, 0.0032f * size, 0.45f * v, US_MAT_LIGHT);
-				us_disc(c, x, y, 0.0016f * size, 1.1f * v, US_MAT_LIGHT);
+				/* a tight core and a small inner glow: the Ink bloom supplies the wide halo */
+				us_disc(c, x, y, 0.0055f * size, 0.07f * v, US_MAT_LIGHT);
+				us_disc(c, x, y, 0.003f * size, 0.38f * v, US_MAT_LIGHT);
+				us_disc(c, x, y, 0.0015f * size, 1.1f * v, US_MAT_LIGHT);
 				if (pw > 0 && b > 0.05f) {
 					float rr = (0.008f + 0.026f * fade) * size;
-					hring(c, x, y, rr, 0.3f * vis * (1.0f - fade) * (1.0f - fade));
+					hring(c, x, y, rr, 0.22f * vis * (1.0f - fade) * (1.0f - fade));
 					if (f->z > 0.5f)
-						hring(c, x, y, rr * 1.7f, 0.13f * vis * (1.0f - fade) * (1.0f - fade));
+						hring(c, x, y, rr * 1.7f, 0.09f * vis * (1.0f - fade) * (1.0f - fade));
 				}
 			}
 			/* reflection in the pool: mirrored, compressed, broken into a shimmering streak */
@@ -791,6 +964,27 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 		}
 	}
 
+	/* flash light colours the faint mist, sky hatching and halo around it (smoothed so it never pops) */
+	if (!ctx->crisp) {
+		for (int i = 0; i < LGX * LGY; i++) {
+			float tgt = st->lg[i];
+			st->lg_s[i] = tgt > st->lg_s[i] ? us_approach(st->lg_s[i], tgt, 0.05f, rdt) : us_approach(st->lg_s[i], tgt, 0.4f, rdt);
+		}
+		for (int gy = 0; gy < LGY; gy++)
+			for (int gx = 0; gx < LGX; gx++) {
+				float sum = 0;
+				for (int dy = -1; dy <= 1; dy++)
+					for (int dx = -1; dx <= 1; dx++) {
+						int xx = gx + dx, yy = gy + dy;
+						if (xx >= 0 && yy >= 0 && xx < LGX && yy < LGY)
+							sum += st->lg_s[yy * LGX + xx] * (dx || dy ? 0.5f : 1.0f);
+					}
+				st->lcov[gy * LGX + gx] = sum;
+			}
+		tint_weight(st->lg_s, st->lwt, LGX, LGY, 1, 3.0f);
+		tint_soft(c, st->lwt, LGX, LGY, US_MAT_LIGHT, 20,
+			   (1u << US_MAT_BG) | (1u << US_MAT_BLOOM) | (1u << US_MAT_WATER));
+	}
 }
 
 const us_scene_vt us_scene_fireflies = {"fireflies", "Fireflies", 0.3f, create, destroy, frame};
