@@ -1,8 +1,10 @@
 /* Understory scene: Rain — rain over a wet meadow at eye level; snow in winter.
  *
  * Back to front: drifting rain clouds (soft in Ink, ordered-dither in Pixel), a far ridge, a treeline of
- * conifers and round-headed trees along the horizon, then the meadow running toward us in perspective,
- * dotted with puddles. Every drop has a depth: far drops are short faint hairlines that vanish just under
+ * conifers and round-headed trees along the horizon with a farmhouse whose lit windows glow (and shine
+ * back from the puddles) and whose smoke leans with the wind, a hedgerow across the middle distance, then
+ * the meadow running toward us in perspective: a farm track whose wheel ruts hold rainwater, a fence whose
+ * wires bead with drops that drip off, wildflowers that nod when drops strike them, and puddles. Every drop has a depth: far drops are short faint hairlines that vanish just under
  * the horizon, near drops are long bright streaks that fall the whole height of the frame. Where a drop
  * lands in a puddle it opens a ripple ring (two crests, flattened by perspective, clipped by the puddle);
  * on open ground it throws up a little crown of droplets. Sheets of heavier rain sweep across with the
@@ -25,7 +27,11 @@
 #define MAX_RINGS 240
 #define MAX_PUD 10
 #define MAX_TREES 46
-#define MAX_TUFT 220
+#define MAX_TUFT 640
+#define MAX_FLW 110   /* meadow flowers */
+#define NPOST 14      /* fence posts along the track */
+#define MAX_BEAD 48   /* raindrops beading on the fence wire */
+#define NSMOKE 26
 #define MAX_BLADES 110
 #define NDRIFT 160
 #define CFW 96
@@ -60,8 +66,23 @@ typedef struct {
 } tree_t;
 
 typedef struct {
+	float u, z, h, ph, nod, nodv;
+	uint8_t kind; /* 0 buttercup, 1 campion, 2 ox-eye daisy */
+} flw_t;
+
+typedef struct {
+	int span;     /* fence span (post k .. k+1) */
+	float f, size, wire;
+} bead_t;
+
+typedef struct {
 	us_rng rng;
 	int inited;
+	flw_t fw[MAX_FLW];
+	bead_t bd[MAX_BEAD];
+	int nbd;
+	float bead_acc, track_u0, track_u1, track_bend, house_u, smoke_t, fence_side;
+	float sx[NSMOKE], sy[NSMOKE], sa[NSMOKE];
 	float so; /* seed offset for terrain noise */
 	drop_t d[MAX_DROPS];
 	int nd;
@@ -230,6 +251,13 @@ static float drift_at(const st_t *st, float u)
 	return us_lerp(st->drift[i], st->drift[i + 1], f - i);
 }
 
+/* the farm track: a pair of wheel ruts running from our feet to the horizon (x in normalized units) */
+static float track_x(const st_t *st, float A, float z)
+{
+	return A * (us_lerp(st->track_u1, st->track_u0, z) + st->track_bend * sinf(US_PI * z) * (1.0f - 0.5f * z));
+}
+static float track_w(float z) { return 0.46f * z; }
+
 /* 4x4 Bayer matrix for dithered pixel clouds */
 static const uint8_t bayer4[16] = {0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5};
 
@@ -283,6 +311,26 @@ static void init_scene(st_t *st, const us_ctx *ctx)
 	for (int i = 0; i < MAX_TUFT; i++) {
 		st->tu[i] = us_rand(r);
 		st->tz[i] = us_rand(r);
+	}
+	st->track_u0 = us_randr(r, 0.28f, 0.72f);
+	st->track_u1 = us_randr(r, 0.4f, 0.6f);
+	st->track_bend = us_randr(r, -0.12f, 0.12f);
+	st->fence_side = us_rand(r) < 0.5f ? -1.0f : 1.0f;
+	/* the farmhouse stands away from the track's vanishing point */
+	st->house_u = st->track_u1 + (us_rand(r) < 0.5f ? -1.0f : 1.0f) * us_randr(r, 0.12f, 0.3f);
+	for (int i = 0; i < MAX_FLW; i++) {
+		flw_t *f = &st->fw[i];
+		f->u = us_rand(r);
+		f->z = 0.12f + 0.86f * sqrtf(us_rand(r));
+		f->h = us_randr(r, 0.55f, 1.0f);
+		f->ph = us_rand(r) * US_TAU;
+		f->kind = (uint8_t)(us_rand(r) * 3.0f);
+		f->nod = f->nodv = 0;
+	}
+	for (int i = 0; i < NSMOKE; i++) {
+		st->sx[i] = 0;
+		st->sy[i] = -1.0f;
+		st->sa[i] = 0;
 	}
 	for (int i = 0; i < MAX_BLADES; i++) {
 		st->bx[i] = us_rand(r);
@@ -417,8 +465,10 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 		for (int py = y0 < 0 ? 0 : y0; py <= y1 && py < c->h; py++)
 			for (int px = x0 < 0 ? 0 : x0; px <= x1 && px < c->w; px++) {
 				size_t o = (size_t)py * c->w + px;
-				if (c->mat[o] == US_MAT_SNOW)
+				if (c->mat[o] == US_MAT_SNOW) {
 					c->ink[o] = 0;
+					c->mat[o] = US_MAT_BG; /* else the ink bloom relights the wiped flake */
+				}
 			}
 	}
 
@@ -435,7 +485,7 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 				st->cloud[j * CFW + i] = us_smooth(-0.2f + 0.3f * (1 - cov), 0.6f, n) * vf + mist * (0.8f + 0.2f * n);
 			}
 		}
-		float gain = 0.2f + 0.08f * w->daylight;
+		float gain = 0.24f + 0.1f * w->daylight;
 		if (ctx->crisp) {
 			/* ordered dither: soft cloud edges without blobby 4-step bands; stops at the ridge */
 			int yh = (int)(CLOUD_Y * c->s);
@@ -464,7 +514,7 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 				}
 			}
 		} else {
-			sky_blit(c, st->cloud, CFW, CFH, gain, US_MAT_LIGHT, CLOUD_Y, st->sky_x, st->sky_t);
+			sky_blit(c, st->cloud, CFW, CFH, gain, US_MAT_WATER, CLOUD_Y, st->sky_x, st->sky_t);
 		}
 	}
 
@@ -479,12 +529,11 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 			pts[2 * i] = u * A;
 			pts[2 * i + 1] = ridge_y(st, u);
 		}
-		uint8_t rm = snowy > 0.5f ? US_MAT_SNOW : US_MAT_STEM;
-		if (ctx->crisp)
+if (ctx->crisp)
 			for (int i = 0; i < NT; i++) {
 				float x0 = pts[2 * i], x1 = pts[2 * i + 2];
-				us_tri(c, x0, pts[2 * i + 1], x1, pts[2 * i + 3], x0, HZ, 0.2f, rm);
-				us_tri(c, x1, pts[2 * i + 3], x1, HZ, x0, HZ, 0.2f, rm);
+				us_tri(c, x0, pts[2 * i + 1], x1, pts[2 * i + 3], x0, HZ, snowy > 0.5f ? 0.22f : 0.13f, snowy > 0.5f ? US_MAT_WATER : US_MAT_EARTH);
+				us_tri(c, x1, pts[2 * i + 3], x1, HZ, x0, HZ, snowy > 0.5f ? 0.22f : 0.13f, snowy > 0.5f ? US_MAT_WATER : US_MAT_EARTH);
 			}
 		hpoly(c, pts, NT + 1, 0.2f + 0.25f * snowy, snowy > 0.5f ? US_MAT_SNOW : US_MAT_EARTH);
 	}
@@ -502,7 +551,19 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 				pts[2 * i] = u * A;
 				pts[2 * i + 1] = ground_y(z) + 0.012f * z * us_noise2(u * (3.0f + 4.0f * (1.0f - z)) + k * 3.1f, st->so);
 			}
-			hpoly(c, pts, 49, (0.06f + 0.2f * snowy) * (0.45f + 0.55f * z), US_MAT_SNOW);
+			/* drifts, not ruled lines: each ridge comes and goes along its length; blue-shadowed lee,
+			 * a brighter wind-polished crest where it rises */
+			float base_v = (0.08f + 0.22f * snowy) * (0.45f + 0.55f * z);
+			for (int i = 0; i < 48; i++) {
+				float u = (i + 0.5f) / 48.0f;
+				float n = us_noise2(u * (4.0f + 6.0f * (1.0f - z)) + k * 7.3f, st->so + 11.0f);
+				float m = us_smooth(-0.15f, 0.35f, n);
+				if (m < 0.05f)
+					continue;
+				int crest = n > 0.45f;
+				hl(c, pts[2 * i], pts[2 * i + 1], pts[2 * i + 2], pts[2 * i + 3], base_v * m * (crest ? 1.6f : 1.0f),
+				   crest ? US_MAT_SNOW : US_MAT_WATER);
+			}
 		}
 	}
 	if (ctx->crisp) {
@@ -514,8 +575,11 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 					/* snowfield: dithered from a bright distance down to a shaded foreground,
 					 * dark enough that the falling flakes still read against it */
 					float th = (bayer4[(py & 3) * 4 + (px & 3)] + 0.5f) / 16.0f;
-					float g = us_sat(1.0f - z * 1.6f) * (0.6f + 0.4f * snowy);
-					us_put(c, px, py, g > th ? 0.36f : 0.2f, US_MAT_SNOW);
+						float g = us_sat(1.25f - z * 1.1f) * (0.6f + 0.4f * snowy);
+						if (g > th)
+							us_put(c, px, py, 0.62f, US_MAT_SNOW);
+						else
+							us_put(c, px, py, 0.62f, US_MAT_WATER);
 				} else {
 					us_put(c, px, py, 0.12f + 0.04f * z, US_MAT_EARTH);
 				}
@@ -523,18 +587,107 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 		}
 	}
 	{
-		int nt = (int)(MAX_TUFT * (0.35f + 0.65f * dens));
+		/* a pixel canvas fills in fast: fewer, dimmer tufts there */
+		int nt = (int)(MAX_TUFT * (0.35f + 0.65f * dens) * (ctx->crisp ? 0.4f : 1.0f));
 		float green = 1.0f - 0.6f * snowy;
 		for (int i = 0; i < nt; i++) {
-			float z = 0.02f + 0.98f * st->tz[i] * st->tz[i];
+			float z = 0.02f + 0.98f * powf(st->tz[i], 1.35f);
 			float x = st->tu[i] * A, y = ground_y(z);
-			float h = 0.003f + 0.03f * z * z * green;
+			float hv = st->tu[(i * 7 + 3) % MAX_TUFT]; /* a second per-tuft random */
+			float h = (0.003f + 0.03f * z * z * green) * (0.55f + 0.7f * hv);
 			float sw = (0.2f + st->wind_s) * h * 0.7f * (0.6f + 0.4f * us_noise2(x * 3.0f - st->gust_t, i * 0.3f));
-			float v = 0.16f + 0.2f * z;
-			hl(c, x, y, x + sw, y - h, v, gm);
-			if (z > 0.3f) {
-				hl(c, x + h * 0.25f, y, x + h * 0.25f + sw * 1.2f, y - h * 0.8f, v * 0.85f, gm);
-				hl(c, x - h * 0.25f, y, x - h * 0.25f + sw * 0.8f, y - h * 0.7f, v * 0.85f, gm);
+			float v = (0.14f + 0.2f * z) * (ctx->crisp ? 0.8f : 1.0f);
+			float bend = (hv - 0.5f) * h * 0.5f;
+			hl(c, x, y, x + sw + bend, y - h, v, gm);
+			if (z > 0.3f && hv > 0.25f)
+				hl(c, x + h * 0.25f, y, x + h * 0.25f + sw * 1.2f + h * 0.3f, y - h * 0.8f, v * 0.85f, gm);
+			if (z > 0.3f && hv < 0.75f)
+				hl(c, x - h * 0.25f, y, x - h * 0.25f + sw * 0.8f - h * 0.3f, y - h * 0.65f, v * 0.85f, gm);
+		}
+	}
+
+	/* ---- a hedgerow across the meadow in the middle distance, gapped where the track goes through ---- */
+	{
+		const float zh = 0.14f;
+		float gx = track_x(st, A, zh), gw = track_w(zh) * 0.75f;
+		float r0 = 0.0045f + 0.03f * zh;
+		uint8_t hm = snowy > 0.5f ? US_MAT_STEM : US_MAT_LEAF;
+		for (float x = -0.01f; x < A + 0.01f; x += r0 * 1.15f) {
+			if (fabsf(x - gx) < gw)
+				continue;
+			float n = us_noise2(x * 9.0f, st->so + 5.0f), n2 = us_noise2(x * 23.0f, st->so);
+			if (n < -0.45f) /* field gateways and gaps */
+				continue;
+			float rr = r0 * (0.8f + 0.35f * n2 + 0.3f * n);
+			float y = ground_y(zh) - rr * 0.6f;
+			if (ctx->crisp) {
+				us_disc(c, x, y, rr, 0.3f, hm);
+				us_disc(c, x - rr * 0.3f, y - rr * 0.35f, rr * 0.55f, 0.45f, hm);
+			} else {
+				ellipse(c, x, y, rr, rr * 0.8f, US_PI * 0.95f, US_TAU + 0.15f, 0.3f, hm);
+				ellipse(c, x - rr * 0.2f, y - rr * 0.25f, rr * 0.5f, rr * 0.4f, US_PI, US_TAU, 0.2f, hm);
+				if (snowy > 0.2f)
+					ellipse(c, x, y - rr * 0.1f, rr * 0.85f, rr * 0.6f, US_PI * 1.15f, US_PI * 1.85f, 0.6f * snowy, US_MAT_SNOW);
+			}
+			/* now and then a hedgerow tree stands up out of it */
+			if (n2 > 0.42f && !ctx->crisp) {
+				float th = rr * 5.0f;
+				hl(c, x, y, x, y - th * 0.6f, 0.3f, US_MAT_STEM);
+				float pts[2 * 17];
+				for (int k = 0; k <= 16; k++) {
+					float aa = US_TAU * k / 16;
+					float q = th * 0.42f * (1.0f + 0.1f * sinf(aa * 5.0f + x * 50.0f));
+					pts[2 * k] = x + cosf(aa) * q;
+					pts[2 * k + 1] = y - th * 0.75f + sinf(aa) * q * 0.85f;
+				}
+				hpoly(c, pts, 17, 0.28f, hm);
+			}
+		}
+	}
+
+	/* ---- the farm track: two wheel ruts holding rainwater, grass down the middle ---- */
+	{
+		const int NZ = 48;
+		float wet_r = us_sat(st->wet * 1.3f - 0.2f) * (1.0f - snowy);
+		for (int sd = -1; sd <= 1; sd += 2) {
+			float pts[2 * 49];
+			for (int i = 0; i <= NZ; i++) {
+				float z = 1.03f * i / NZ;
+				pts[2 * i] = track_x(st, A, z) + sd * 0.32f * track_w(z);
+				pts[2 * i + 1] = ground_y(z);
+			}
+			if (ctx->crisp) {
+				for (int i = 0; i < NZ; i++) {
+					float z = 1.03f * (i + 0.5f) / NZ;
+					int wv = wet_r > 0.3f && z > 0.12f;
+					us_line(c, pts[2 * i], pts[2 * i + 1], pts[2 * i + 2], pts[2 * i + 3], 0.0011f + 0.004f * z,
+						wv ? 0.36f : (snowy > 0.5f ? 0.4f : 0.3f), wv ? US_MAT_WATER : (snowy > 0.5f ? US_MAT_STEM : US_MAT_EARTH));
+				}
+			} else {
+				/* the rut's two lips, then the sky caught in its water */
+				for (int e = -1; e <= 1; e += 2) {
+					float q[2 * 49];
+					for (int i = 0; i <= NZ; i++) {
+						float z = 1.03f * i / NZ;
+						q[2 * i] = pts[2 * i] + e * 0.035f * track_w(z);
+						q[2 * i + 1] = pts[2 * i + 1];
+					}
+					hpoly(c, q, NZ + 1, 0.2f + 0.08f * snowy, snowy > 0.5f ? US_MAT_WATER : US_MAT_EARTH);
+				}
+				for (int i = 0; i < NZ; i++) {
+					float z = 1.03f * (i + 0.5f) / NZ;
+					if (z < 0.08f)
+						continue;
+					float h1 = sinf(i * 12.9898f + sd * 31.7f) * 43758.5f;
+					h1 -= floorf(h1);
+					if (h1 > wet_r * 1.2f)
+						continue;
+					float trem = 0.6f + 0.4f * sinf(t * (2.0f + 3.0f * st->rain_amt) + h1 * 20.0f);
+					float v = (0.22f + 0.4f * z) * trem * wet_r * (1.0f - 0.5f * st->freeze);
+					float f0 = 0.15f + 0.3f * h1, f1 = f0 + 0.35f + 0.2f * h1;
+					hl(c, us_lerp(pts[2 * i], pts[2 * i + 2], f0), us_lerp(pts[2 * i + 1], pts[2 * i + 3], f0),
+					   us_lerp(pts[2 * i], pts[2 * i + 2], f1), us_lerp(pts[2 * i + 1], pts[2 * i + 3], f1), v, US_MAT_WATER);
+				}
 			}
 		}
 	}
@@ -556,7 +709,7 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 					float bw = tr->h * 0.34f * f;
 					float droop = tr->h * 0.16f * (1.0f + 0.5f * snowy);
 					if (ctx->crisp)
-						us_tri(c, px, py - droop * 0.5f, px - bw, py + droop * 0.5f, px + bw, py + droop * 0.5f, 0.32f, US_MAT_LEAF);
+						us_tri(c, px, py - droop * 0.5f, px - bw, py + droop * 0.5f,px + bw, py + droop * 0.5f, k & 1 ? 0.45f : 0.62f, US_MAT_LEAF);
 					else {
 						hl(c, px, py - droop * 0.3f, px - bw, py + droop * 0.5f, 0.36f, US_MAT_LEAF);
 						hl(c, px, py - droop * 0.3f, px + bw, py + droop * 0.5f, 0.36f, US_MAT_LEAF);
@@ -570,8 +723,8 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 				float cx = tx, cy = ty + cr;
 				hl(c, x, base, cx, cy, 0.4f, US_MAT_STEM);
 				if (ctx->crisp) {
-					us_disc(c, cx, cy, cr, 0.3f, US_MAT_LEAF);
-					us_disc(c, cx - cr * 0.3f, cy - cr * 0.3f, cr * 0.5f, 0.42f, US_MAT_LEAF);
+us_disc(c, cx, cy, cr, 0.45f, US_MAT_LEAF);
+						us_disc(c, cx - cr * 0.3f, cy - cr * 0.3f, cr * 0.5f, 0.66f, US_MAT_LEAF);
 				} else {
 					float pts[2 * 17];
 					for (int k = 0; k <= 16; k++) {
@@ -585,6 +738,68 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 				if (snowy > 0.1f)
 					ellipse(c, cx, cy, cr * 0.9f, cr * 0.75f, US_PI * 1.15f, US_PI * 1.85f, 0.65f * snowy, US_MAT_SNOW);
 			}
+		}
+	}
+
+	/* ---- the farmhouse on the horizon: a lit window, smoke leaning with the wind ---- */
+	{
+		float hx = st->house_u * A, base = HZ + 0.003f;
+		float hw = 0.034f, wh = 0.02f, rh = 0.019f;
+		float lit = us_sat(1.05f - 0.75f * w->daylight) * (0.85f + 0.15f * us_noise2(t * 1.3f, 7.7f));
+		if (ctx->crisp) {
+			us_tri(c, hx - hw, base, hx + hw, base, hx + hw, base - wh, 0.16f, US_MAT_EARTH);
+			us_tri(c, hx - hw, base, hx + hw, base - wh, hx - hw, base - wh, 0.16f, US_MAT_EARTH);
+			us_tri(c, hx - hw * 1.15f, base - wh, hx + hw * 1.15f, base - wh, hx, base - wh - rh, 0.26f,
+			       snowy > 0.5f ? US_MAT_SNOW : US_MAT_EARTH);
+			us_disc(c, hx - hw * 0.45f, base - wh * 0.5f, 0.0035f, 0.6f + 0.4f * lit, US_MAT_LIGHT);
+			us_disc(c, hx + hw * 0.4f, base - wh * 0.5f, 0.0035f, 0.45f + 0.4f * lit, US_MAT_LIGHT);
+		} else {
+			float pts[] = {hx - hw, base, hx - hw, base - wh, hx - hw * 1.18f, base - wh + 0.002f, hx, base - wh - rh,
+				       hx + hw * 1.18f, base - wh + 0.002f, hx + hw, base - wh, hx + hw, base};
+			hpoly(c, pts, 7, 0.36f, US_MAT_EARTH);
+			hl(c, hx - hw, base - wh, hx + hw, base - wh, 0.2f, US_MAT_EARTH);
+			hl(c, hx - 0.004f, base, hx - 0.004f, base - wh * 0.6f, 0.3f, US_MAT_EARTH);
+			hl(c, hx + 0.004f, base, hx + 0.004f, base - wh * 0.6f, 0.3f, US_MAT_EARTH);
+			hl(c, hx - 0.004f, base - wh * 0.6f, hx + 0.004f, base - wh * 0.6f, 0.3f, US_MAT_EARTH);
+			if (snowy > 0.3f) {
+				hl(c, hx - hw * 1.1f, base - wh + 0.0012f, hx, base - wh - rh + 0.0012f, 0.7f * snowy, US_MAT_SNOW);
+				hl(c, hx, base - wh - rh + 0.0012f, hx + hw * 1.1f, base - wh + 0.0012f, 0.7f * snowy, US_MAT_SNOW);
+			}
+			/* two windows, warm; the glow is the ink bloom's */
+			for (int k = 0; k < 2; k++) {
+				float wx = hx + (k ? 0.4f : -0.45f) * hw, wy = base - wh * 0.5f;
+				float wv = (k ? 0.7f : 0.95f) * lit;
+				us_tri(c, wx - 0.004f, wy - 0.0045f, wx + 0.004f, wy - 0.0045f, wx + 0.004f, wy + 0.0045f, wv, US_MAT_LIGHT);
+				us_tri(c, wx - 0.004f, wy - 0.0045f, wx + 0.004f, wy + 0.0045f, wx - 0.004f, wy + 0.0045f, wv, US_MAT_LIGHT);
+				hl(c, wx, wy - 0.0045f, wx, wy + 0.0045f, wv * 0.4f, US_MAT_EARTH); /* glazing bar */
+			}
+		}
+		/* chimney + smoke: puffs rise, swell and lean downwind */
+		float chx = hx + hw * 0.55f, chy = base - wh - rh * 0.45f;
+		hl(c, chx, chy, chx, chy - 0.006f, 0.36f, US_MAT_EARTH);
+		hl(c, chx + 0.003f, chy - 0.002f, chx + 0.003f, chy - 0.006f, 0.36f, US_MAT_EARTH);
+		st->smoke_t += dt * (0.5f + st->wind_s);
+		/* smoke: three curling wisps from the chimney, swelling and leaning downwind as they rise */
+		float smv = 0.6f + 0.4f * (1.0f - w->daylight);
+		for (int k = 0; k < 3; k++) {
+			float pts[2 * NSMOKE];
+			for (int i = 0; i < NSMOKE; i++) {
+				float age = (float)i / (NSMOKE - 1);
+				float rise = 0.12f * age * (1.0f - 0.35f * st->wind_s);
+				float spread = 0.004f + 0.02f * age;
+				float curl = us_noise2(age * 3.0f - st->smoke_t * 0.35f, k * 4.1f + st->so);
+				pts[2 * i] = chx + 0.0015f + (0.02f + 0.22f * st->wind_s) * age * age + spread * curl;
+				pts[2 * i + 1] = chy - 0.007f - rise + 0.3f * spread * us_noise2(k * 2.3f, age * 3.0f - st->smoke_t * 0.3f);
+			}
+			if (ctx->crisp) {
+				for (int i = 2; i < NSMOKE - 6; i += 3)
+					us_put(c, (int)(pts[2 * i] * c->s), (int)(pts[2 * i + 1] * c->s), 0.3f, US_MAT_SNOW);
+			} else
+				for (int i = 0; i + 1 < NSMOKE; i++) {
+					float age = (float)i / (NSMOKE - 1);
+					float sv = 0.26f * smv * us_smooth(0.0f, 0.1f, age) * (1.0f - age) * (k == 1 ? 1.0f : 0.6f);
+					hl(c, pts[2 * i], pts[2 * i + 1], pts[2 * i + 2], pts[2 * i + 3], sv, US_MAT_SNOW);
+				}
 		}
 	}
 
@@ -614,8 +829,8 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 					for (int px = x0; px <= x1; px++)
 						if ((unsigned)px < (unsigned)c->w && (unsigned)py < (unsigned)c->h) {
 							size_t o = (size_t)py * c->w + px;
-							c->ink[o] = (uint8_t)(255.0f * (st->freeze > 0.5f ? 0.55f : 0.2f));
-							c->mat[o] = US_MAT_WATER;
+							c->ink[o] = (uint8_t)(255.0f * (st->freeze > 0.5f ? 0.8f : 0.2f));
+							c->mat[o] = st->freeze > 0.5f ? US_MAT_SNOW : US_MAT_WATER;
 						}
 				}
 			} else {
@@ -636,6 +851,23 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 				float yy = y + fy * ry;
 				float v = (0.16f + 0.2f * (1.0f - fabsf(fy))) * (1.0f + 0.8f * st->freeze);
 				hl(c, x + off - len, yy, x + off + len, yy, v, US_MAT_WATER);
+			}
+			/* the farmhouse's lit windows caught in the water: a broken warm column under the house */
+			{
+				float hx = st->house_u * A;
+				float lit = us_sat(1.05f - 0.75f * w->daylight);
+				if (fabsf(hx - x) < rx * 0.8f && lit > 0.1f) {
+					float hw = rx * sqrtf(us_sat(1.0f - ((hx - x) / rx) * ((hx - x) / rx)));
+					(void)hw;
+					int nk = 3 + (int)(p->z * 6.0f);
+					for (int k = 0; k < nk; k++) {
+						float fy = -0.8f + 1.6f * (k + 0.5f) / nk;
+						float wob = 0.003f * trem * us_noise2(t * 4.0f + k, i * 3.0f);
+						float len = (0.002f + 0.006f * p->z) * (0.6f + 0.4f * sinf(t * 3.0f + k * 1.7f));
+						float yy = y + fy * ry;
+						hl(c, hx + wob - len, yy, hx + wob + len, yy, (0.55f - 0.25f * fabsf(fy)) * lit, US_MAT_LIGHT);
+					}
+				}
 			}
 			/* ice: a couple of crack lines */
 			if (st->freeze > 0.3f && rx * c->s > 6.0f) {
@@ -683,6 +915,155 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 		i++;
 	}
 
+	/* ---- meadow flowers: stems and heads that nod when the drops strike them and lean with the wind ---- */
+	{
+		float bloomy = us_sat(1.0f - snowy * 1.5f) * (0.35f + 0.65f * us_sat(us_world_season_w(w, 0) + us_world_season_w(w, 1) + 0.6f * autumn));
+		int nf = (int)(MAX_FLW * (0.3f + 0.7f * dens) * bloomy);
+		float hit_p = (0.4f + 6.0f * st->rain_amt * liquid) * dt;
+		float seed = us_smooth(0.4f, 0.9f, autumn);
+		for (int i = 0; i < nf; i++) {
+			flw_t *f = &st->fw[i];
+			float z = f->z, x = f->u * A, by = ground_y(z);
+			/* not in a puddle, not on the track */
+			int skip = fabsf(x - track_x(st, A, z)) < track_w(z) * 0.5f;
+			for (int k = 0; k < st->npud && !skip; k++) {
+				float qx = (x - st->px[k]) / (st->prx[k] * 1.1f), qy = (by - st->py[k]) / (st->pry[k] * 1.3f);
+				skip = qx * qx + qy * qy < 1.0f;
+			}
+			if (skip)
+				continue;
+			/* a drop strikes the head: a kick, then a damped nod back */
+			if (us_rand(r) < hit_p * z)
+				f->nodv += us_randr(r, 4.0f, 9.0f) * (0.5f + 0.5f * st->heavy);
+			f->nodv += (-28.0f * f->nod - 3.5f * f->nodv) * dt;
+			f->nod += f->nodv * dt;
+			float h = (0.01f + 0.085f * z * z) * f->h;
+			float sw = (0.1f + 0.7f * st->wind_s * (0.5f + gust)) * 0.4f * (0.6f + 0.4f * us_noise2(x * 3.0f - st->gust_t, f->ph));
+			float a = sw + 0.35f * f->nod;
+			float hx = x + sinf(a) * h, hy = by - cosf(a) * h;
+			float mx = x + sinf(a * 0.4f) * h * 0.5f, my = by - cosf(a * 0.4f) * h * 0.5f;
+			float sv = 0.22f + 0.25f * z;
+			if (ctx->crisp) {
+				us_line(c, x, by, mx, my, 0.001f, sv + 0.1f, US_MAT_STEM);
+				us_line(c, mx, my, hx, hy, 0.001f, sv + 0.1f, US_MAT_STEM);
+			} else {
+				float pts[6] = {x, by, mx, my, hx, hy};
+				hpoly(c, pts, 3, sv, US_MAT_STEM);
+				if (z > 0.45f) { /* a leaf */
+					float lx = us_lerp(x, mx, 0.6f), ly = us_lerp(by, my, 0.6f);
+					float side = (i & 1) ? 1.0f : -1.0f;
+					hl(c, lx, ly, lx + side * h * 0.22f, ly - h * 0.12f, sv * 0.9f, US_MAT_LEAF);
+				}
+			}
+			float hr = 0.0016f + 0.0075f * z;
+			if (seed > 0.5f) { /* autumn: seed heads */
+				us_point(c, hx, hy, hr * 0.35f, 0.4f, US_MAT_STEM);
+				continue;
+			}
+			uint8_t pm = f->kind == 0 ? US_MAT_LIGHT : f->kind == 1 ? US_MAT_BLOOM : US_MAT_ACCENT;
+			float pv = 0.62f + 0.3f * z;
+			if (ctx->crisp || hr * c->s < 3.0f) {
+				us_point(c, hx, hy, ctx->crisp ? 0.0012f + 0.004f * z : hr * 0.5f, pv, pm);
+				if (ctx->crisp && f->kind == 2 && z > 0.5f)
+					us_put(c, (int)(hx * c->s), (int)(hy * c->s), 0.8f, US_MAT_LIGHT);
+				continue;
+			}
+			/* petals; the head tips over with the nod */
+			int np = f->kind == 2 ? 9 : 5;
+			float tilt = 0.55f + 0.25f * cosf(a * 2.0f);
+			for (int k = 0; k < np; k++) {
+				float pa = f->ph + US_TAU * k / np;
+				float pr = hr * (f->kind == 0 ? 0.6f : 1.0f);
+				hl(c, hx + cosf(pa) * pr * 0.25f, hy + sinf(pa) * pr * 0.25f * tilt, hx + cosf(pa) * pr, hy + sinf(pa) * pr * tilt,
+				   pv, pm);
+			}
+			if (f->kind == 0)
+				us_point(c, hx, hy, hr * 0.45f, pv, pm);
+			else
+				us_point(c, hx, hy, hr * 0.22f, 0.85f, f->kind == 2 ? US_MAT_LIGHT : pm);
+		}
+	}
+
+	/* ---- the fence along the track: posts receding, wires beaded with rain that drips off ---- */
+	{
+		float zp[NPOST], xp[NPOST], yp[NPOST], hp[NPOST];
+		for (int k = 0; k < NPOST; k++) {
+			float z = 1.08f / (1.0f + k * 0.5f);
+			zp[k] = z;
+			xp[k] = track_x(st, A, z) + st->fence_side * (0.62f * track_w(z) + 0.012f * z);
+			yp[k] = ground_y(z);
+			hp[k] = 0.13f * z;
+		}
+		uint8_t pm = US_MAT_EARTH;
+		for (int k = 0; k < NPOST; k++) {
+			float z = zp[k];
+			if (ctx->crisp)
+				us_line(c, xp[k], yp[k], xp[k], yp[k] - hp[k], 0.001f + 0.006f * z, 0.42f, pm);
+			else {
+				us_line(c, xp[k], yp[k], xp[k], yp[k] - hp[k], 0.0008f + 0.0045f * z, 0.3f + 0.15f * z, pm);
+				hl(c, xp[k] - 0.0025f * z, yp[k] - hp[k], xp[k] + 0.0025f * z, yp[k] - hp[k], 0.5f, pm);
+			}
+			if (snowy > 0.3f)
+				us_point(c, xp[k], yp[k] - hp[k] - 0.002f * z, 0.001f + 0.003f * z, 0.75f * snowy, US_MAT_SNOW);
+		}
+		/* two wires, sagging between the posts */
+		float wl[2] = {0.9f, 0.55f};
+		for (int wi = 0; wi < 2; wi++)
+			for (int k = 0; k + 1 < NPOST; k++) {
+				float pts[2 * 7];
+				float sag = 0.012f * zp[k + 1];
+				for (int i = 0; i <= 6; i++) {
+					float f = i / 6.0f;
+					pts[2 * i] = us_lerp(xp[k], xp[k + 1], f);
+					pts[2 * i + 1] = us_lerp(yp[k] - hp[k] * wl[wi], yp[k + 1] - hp[k + 1] * wl[wi], f) + sag * 4.0f * f * (1.0f - f);
+				}
+				if (ctx->crisp)
+					us_polyline(c, pts, 7, 0.001f, 0.3f, US_MAT_STEM);
+				else
+					hpoly(c, pts, 7, 0.22f + 0.12f * zp[k], US_MAT_STEM);
+			}
+		/* beads: gather on the wires while it rains, grow, slide to the sag and drip */
+		st->bead_acc += dt * (1.5f + 30.0f * st->rain_amt) * liquid * (1.0f - st->freeze);
+		while (st->bead_acc >= 1.0f && st->nbd < MAX_BEAD) {
+			st->bead_acc -= 1.0f;
+			bead_t *b = &st->bd[st->nbd++];
+			b->span = (int)(powf(us_rand(r), 1.8f) * (NPOST - 1));
+			b->f = us_randr(r, 0.05f, 0.95f);
+			b->size = 0.1f;
+			b->wire = us_rand(r) < 0.6f ? 0.0f : 1.0f;
+		}
+		if (st->bead_acc > 1.0f)
+			st->bead_acc = 1.0f;
+		for (int i = 0; i < st->nbd;) {
+			bead_t *b = &st->bd[i];
+			int k = b->span;
+			b->size += dt * (0.15f + 0.8f * st->rain_amt) * liquid;
+			b->f += (0.5f - b->f) * dt * 0.25f * b->size;
+			float wv = b->wire ? wl[1] : wl[0];
+			float sag = 0.012f * zp[k + 1];
+			float x = us_lerp(xp[k], xp[k + 1], b->f);
+			float y = us_lerp(yp[k] - hp[k] * wv, yp[k + 1] - hp[k + 1] * wv, b->f) + sag * 4.0f * b->f * (1.0f - b->f);
+			float z = us_lerp(zp[k], zp[k + 1], b->f);
+			if (b->size >= 1.0f || st->freeze > 0.5f) {
+				/* it lets go */
+				if (st->nsp < MAX_SPL && st->freeze < 0.5f) {
+					spl_t *s = &st->sp[st->nsp++];
+					s->u = x / A;
+					s->y = y + 0.002f;
+					s->z = z;
+					s->vx = 0;
+					s->vy = 0.05f;
+					s->life = 1.0f;
+				}
+				*b = st->bd[--st->nbd];
+				continue;
+			}
+			float br = (0.0007f + 0.0026f * z) * (0.5f + 0.5f * b->size);
+			us_point(c, x, y + br * 0.6f, ctx->crisp ? 0.001f : br, 0.55f + 0.4f * b->size, US_MAT_WATER);
+			i++;
+		}
+	}
+
 	/* ---- rain + snow ---- */
 	for (int i = 0; i < st->nd;) {
 		drop_t *d = &st->d[i];
@@ -719,7 +1100,11 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 					float room = (1.0f - sqrtf(qx * qx + qy * qy)) * st->prx[hit];
 					float rmax = fminf((0.012f + 0.055f * d->z) * us_randr(r, 0.7f, 1.2f), room + 0.004f * d->z);
 					add_ring(st, nu, d->land, d->z, rmax);
-				} else if (d->z > 0.25f && us_rand(r) < 0.5f + 0.5f * d->z) {
+					} else if (st->freeze < 0.5f && st->wet > 0.35f && d->z > 0.1f &&
+						   fabsf(fabsf(x - track_x(st, A, d->z)) - 0.32f * track_w(d->z)) < 0.03f * track_w(d->z) + 0.002f) {
+						/* into the water standing in a wheel rut */
+						add_ring(st, nu, d->land, d->z, 0.004f + 0.014f * d->z);
+					} else if (d->z > 0.25f && us_rand(r) < 0.5f + 0.5f * d->z) {
 					splash(st, nu, d->land, d->z, vx, d->z > 0.6f ? 3 : 2);
 				}
 			}
@@ -732,8 +1117,10 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 		}
 		if (d->y > -0.02f) {
 			if (d->snow) {
-				float sz = 0.001f + 0.004f * d->z * d->z;
-				float v = 0.3f + 0.65f * d->z;
+					float sz = 0.001f + 0.004f * d->z * d->z;
+					float v = 0.62f + 0.38f * d->z;
+					if (ctx->crisp && snowy > 0.5f && d->y > HZ)
+						v = 1.0f; /* the top step: still reads against the bright snowfield */
 				d->wx = x;
 				d->wy = d->y;
 				d->wr = sz * 1.8f + 1.5f / c->s;

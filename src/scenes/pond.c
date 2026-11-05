@@ -5,7 +5,9 @@
  * drops a ripple ring — a short wave packet that expands, fades, and interferes with the others both as
  * lines on the surface and as distortion in the caustics. Lily pads (notched discs with veins) drift
  * and bob as rings pass beneath them; water striders skate in bursts, leaving tiny dimple rings from their
- * legs; reed clumps fringe the bank. Deep winter puts an ice skin on the pond: muted rings, dim light,
+ * legs; reed clumps fringe the bank. Around the water: grassy banks, pebbles at the waterline, ferns and
+ * marsh flowers, a wooden jetty, and a tree leaning out over the pond whose shade dims the caustics and
+ * whose weeping twigs dimple the surface. Deep winter puts an ice skin on the pond: muted rings, dim light,
  * crack lines that creak further on heavy hits.
  *
  * Audio: onsets -> rings (kicks -> big ones); bass -> caustic swell; highs -> striders more restless.
@@ -32,6 +34,11 @@
 #define CRACK_N 36
 #define MAX_LEAVES 14
 #define BLIT_WMAX 4096
+#define MAX_STRANDS 60 /* the overhanging tree's weeping fringe */
+#define TREE_V 48
+#define MAX_FERNS 12
+#define MAX_PEBBLES 70
+#define MAX_TUFTS 260
 
 typedef struct {
 	float x, y, r, speed, amp, age, life;
@@ -70,7 +77,6 @@ typedef struct {
 	us_rng rng;
 	int inited;
 	float so;
-	float field[FWMAX * FH];
 	float land[FWMAX * FH];
 	float qmask[FWMAX * FH];
 	float dpx[FWMAX * FH], dpy[FWMAX * FH];
@@ -89,12 +95,21 @@ typedef struct {
 	crack_t ck[MAX_CRACKS];
 	leaf_t lf[MAX_LEAVES];
 	int nlf;
-	uint16_t blit_x[BLIT_WMAX], blit_t[BLIT_WMAX]; /* field_blit column cache */
 	/* vector caustics: per grid quad, circumcentres of its two triangles + which triangle owns each side */
 	float ccx[CGH][CGW - 1][2], ccy[CGH][CGW - 1][2];
 	uint8_t own[CGH][CGW - 1][4]; /* top, right, bottom, left -> triangle 0/1 */
 	float drip_t;
 	float A;
+	/* the banks */
+	float wx, wy; /* willow trunk */
+	float sa[MAX_STRANDS], sl[MAX_STRANDS], sph[MAX_STRANDS], sr0[MAX_STRANDS], wR;
+	float lob[TREE_V];
+	float jth; /* the jetty's bearing */
+	float fx[MAX_FERNS], fy[MAX_FERNS], fs[MAX_FERNS], fph[MAX_FERNS];
+	int nfern;
+	float pb_th[MAX_PEBBLES], pb_k[MAX_PEBBLES], pb_r[MAX_PEBBLES], pb_a[MAX_PEBBLES];
+	float tu_x[MAX_TUFTS], tu_y[MAX_TUFTS];
+	float wind_t;
 } st_t;
 
 static void *create(uint32_t seed)
@@ -170,68 +185,6 @@ static inline float fcos(float a)
 	x -= floorf(x + 0.5f);              /* [-0.5, 0.5] */
 	float s = x * (8.0f - 16.0f * fabsf(x));
 	return 0.225f * (s * fabsf(s) - s) + s;
-}
-
-/* Full-canvas bilinear field blit (same result as us_field over (0,0)-(aspect,1) with MAX blending),
- * but row-separable and writing the canvas directly: ~4x cheaper at 720p, which matters because the
- * caustics cover the whole pond every frame. */
-static void field_blit(us_canvas *c, const float *f, int fw, int fh, float gain, uint8_t mat, uint16_t *bx, uint16_t *bt)
-{
-	int tmp[FWMAX + 1];
-	int W = c->w < BLIT_WMAX ? c->w : BLIT_WMAX;
-	float kx = (float)fw / c->w, ky = (float)fh / c->h;
-	/* the horizontal sample positions are the same for every row */
-	for (int i = 0; i < W; i++) {
-		float fx = (i + 0.5f) * kx - 0.5f;
-		if (fx < 0)
-			fx = 0;
-		int ix = (int)fx;
-		float tx = fx - ix;
-		if (ix >= fw - 1) {
-			ix = fw - 1;
-			tx = 0;
-		}
-		bx[i] = (uint16_t)ix;
-		bt[i] = (uint16_t)(tx * 256.0f + 0.5f);
-	}
-	for (int j = 0; j < c->h; j++) {
-		float fy = (j + 0.5f) * ky - 0.5f;
-		int iy = (int)floorf(fy);
-		float ty = fy - iy;
-		int y0 = iy < 0 ? 0 : (iy >= fh ? fh - 1 : iy), y1 = iy + 1 >= fh ? fh - 1 : (iy + 1 < 0 ? 0 : iy + 1);
-		const float *r0 = f + y0 * fw, *r1 = f + y1 * fw;
-		int first = -1, last = -1;
-		for (int i = 0; i < fw; i++) {
-			int v = (int)((r0[i] + (r1[i] - r0[i]) * ty) * gain * 255.0f * 256.0f);
-			tmp[i] = v;
-			if (v > 0) {
-				if (first < 0)
-					first = i;
-				last = i;
-			}
-		}
-		if (first < 0)
-			continue; /* nothing lit on this row (outside the pond) */
-		tmp[fw] = tmp[fw - 1];
-		/* only the columns whose samples can be lit */
-		int i0 = (int)((first - 0.5f) / kx) - 1, i1 = (int)((last + 1.5f) / kx) + 1;
-		if (i0 < 0)
-			i0 = 0;
-		if (i1 > W - 1)
-			i1 = W - 1;
-		uint8_t *ink = c->ink + (size_t)j * c->w, *mt = c->mat + (size_t)j * c->w;
-		for (int i = i0; i <= i1; i++) {
-			int ix = bx[i];
-			int a0 = tmp[ix];
-			int iv = (a0 + (((tmp[ix + 1] - a0) * bt[i]) >> 8)) >> 8; /* 8.8 fixed point */
-			if (iv > 255)
-				iv = 255;
-			if (iv > ink[i]) {
-				ink[i] = (uint8_t)iv;
-				mt[i] = mat;
-			}
-		}
-	}
 }
 
 /* ---- pond geometry: a soft blob centred on the frame ---- */
@@ -398,6 +351,67 @@ static void init_scene(st_t *st, const us_ctx *ctx)
 	}
 	for (int i = 0; i < MAX_CRACKS; i++)
 		grow_crack(st, &st->ck[i]);
+	/* the willow stands in the corner with the most bank */
+	{
+		float A = st->A, best = -1, bth = 0;
+		for (int k = 0; k < 4; k++) {
+			float x = (k & 1) ? A * 0.955f : A * 0.045f, y = (k & 2) ? 0.93f : 0.07f;
+			float q = pond_q(st, x, y);
+			if (q > best) {
+				best = q;
+				bth = atan2f((y - 0.5f) / 0.5f, (x - A * 0.5f) / (A * 0.5f));
+			}
+		}
+		pond_pt(st, bth, 1.12f, &st->wx, &st->wy);
+		st->wx = us_clampf(st->wx, A * 0.07f, A * 0.93f);
+		st->wy = us_clampf(st->wy, 0.1f, 0.9f);
+		for (int v = 0; v < TREE_V; v++) {
+			float th = US_TAU * v / TREE_V;
+			st->lob[v] = 1.0f + 0.06f * cosf(2 * th + st->so) + 0.05f * cosf(3 * th + 1.3f * st->so) + 0.08f * fabsf(sinf(4.5f * th + st->so));
+		}
+		/* the jetty juts in from a side away from the tree */
+		/* on the long side opposite the tree, a little toward the far end */
+		st->jth = (sinf(bth) < 0 ? 1.0f : -1.0f) * US_PI * 0.5f + (cosf(bth) < 0 ? -1.0f : 1.0f) * (sinf(bth) < 0 ? -1.0f : 1.0f) * us_randr(r, 0.15f, 0.45f);
+		/* a dome of hanging strands seen from above: they start across the crown (most near its rim) and
+		 * cascade outward past it */
+		st->wR = us_randr(r, 0.12f, 0.15f);
+		for (int i = 0; i < MAX_STRANDS; i++) {
+			st->sa[i] = us_rand(r) * US_TAU;
+			st->sr0[i] = st->wR * us_randr(r, 0.82f, 1.0f);
+			st->sl[i] = st->wR * us_randr(r, 0.12f, 0.32f);
+			st->sph[i] = us_rand(r) * 20.0f;
+		}
+		/* ferns in the other corners, well back from the water and clear of the willow trunk */
+		st->nfern = 0;
+		for (int tries = 0; tries < 400 && st->nfern < MAX_FERNS; tries++) {
+			float x = us_rand(r) * A, y = us_rand(r);
+			float dx = x - st->wx, dy = y - st->wy;
+			if (pond_q(st, x, y) < 1.2f || dx * dx + dy * dy < (st->wR + 0.1f) * (st->wR + 0.1f))
+				continue;
+			int ok = 1;
+			for (int k = 0; k < st->nfern && ok; k++) {
+				float ex = x - st->fx[k], ey = y - st->fy[k];
+				ok = ex * ex + ey * ey > 0.012f;
+			}
+			if (!ok)
+				continue;
+			st->fx[st->nfern] = x;
+			st->fy[st->nfern] = y;
+			st->fs[st->nfern] = us_randr(r, 0.04f, 0.07f);
+			st->fph[st->nfern] = us_rand(r) * US_TAU;
+			st->nfern++;
+		}
+	}
+	for (int i = 0; i < MAX_PEBBLES; i++) {
+		st->pb_th[i] = us_rand(r) * US_TAU;
+		st->pb_k[i] = us_randr(r, 1.025f, 1.1f);
+		st->pb_r[i] = us_randr(r, 0.0025f, 0.0075f);
+		st->pb_a[i] = us_rand(r) * US_PI;
+	}
+	for (int i = 0; i < MAX_TUFTS; i++) {
+		st->tu_x[i] = us_rand(r);
+		st->tu_y[i] = us_rand(r);
+	}
 	st->inited = 1;
 }
 
@@ -769,6 +783,298 @@ static void koi_draw(us_canvas *c, int crisp, koi_t *k, int idx, float kv)
 				 0.0014f, kv * 1.3f, k->mat);
 	}
 }
+/* ---- the banks: grass, pebbles at the waterline, ferns in the corners, a weeping willow trailing its
+ *      strands over the water (the tips dimple the surface) ---- */
+static float qgrid(const st_t *st, int fw, float x, float y)
+{
+	int i = (int)(x / st->A * fw), j = (int)(y * FH);
+	if (i < 0 || j < 0 || i >= fw || j >= FH)
+		return 2.0f;
+	return st->qmask[j * fw + i];
+}
+
+static void draw_banks(us_canvas *c, st_t *st, const us_ctx *ctx, float wind, int fw, int npads)
+{
+	const us_world *w = ctx->w;
+	float A = st->A, dt = ctx->dt, dens = ctx->p->density;
+	float winter = us_world_winter(w), autumn = us_world_season_w(w, 2);
+	float spring = us_world_season_w(w, 0), summer = us_world_season_w(w, 1);
+	int crisp = ctx->crisp;
+	float green = 1.0f - 0.6f * winter;
+	uint8_t gm = winter > 0.6f ? US_MAT_STEM : US_MAT_LEAF;
+	st->wind_t += dt * (0.4f + 2.0f * wind);
+	(void)npads;
+
+	/* grass on the banks */
+	{
+		int nt = (int)(MAX_TUFTS * (0.35f + 0.65f * dens) * (crisp ? 0.5f : 1.0f));
+		for (int i = 0; i < nt; i++) {
+			float x = st->tu_x[i] * A, y = st->tu_y[i];
+			float q = qgrid(st, fw, x, y);
+			if (q < 1.1f || q > 1.9f)
+				continue;
+			float sz = (0.005f + 0.004f * st->tu_y[(i * 7 + 1) % MAX_TUFTS]) * (0.7f + 0.3f * green);
+			float sw = 0.5f * wind * us_noise2(x * 2.0f - st->wind_t * 0.4f, y * 3.0f);
+			float v = (0.2f + 0.1f * st->tu_x[(i * 3 + 2) % MAX_TUFTS]) * (0.7f + 0.3f * green);
+			for (int b = -1; b <= 1; b++) {
+				float ang = -US_PI * 0.5f + b * 0.55f + sw;
+				hl(c, x, y, x + cosf(ang) * sz, y + sinf(ang) * sz, v, gm);
+			}
+		}
+	}
+
+	/* pebbles along the waterline */
+	{
+		int np = (int)(MAX_PEBBLES * (0.4f + 0.6f * dens));
+		for (int i = 0; i < np; i++) {
+			float x, y;
+			pond_pt(st, st->pb_th[i], st->pb_k[i], &x, &y);
+			float rr = st->pb_r[i], ca = cosf(st->pb_a[i]), sa = sinf(st->pb_a[i]);
+			float v = 0.32f + 0.25f * (rr / 0.0075f) + 0.2f * winter;
+			uint8_t m = winter > 0.6f ? US_MAT_ACCENT : US_MAT_EARTH;
+			if (crisp) {
+				us_disc(c, x, y, rr * 0.9f, v * 0.8f, m);
+				continue;
+			}
+			float pts[2 * 9];
+			for (int k = 0; k <= 8; k++) {
+				float a = US_TAU * k / 8.0f;
+				float ex = cosf(a) * rr * 1.3f, ey = sinf(a) * rr * 0.85f;
+				pts[2 * k] = x + ex * ca - ey * sa;
+				pts[2 * k + 1] = y + ex * sa + ey * ca;
+			}
+			hpoly(c, pts, 9, v, m);
+			hl(c, x - rr * 0.5f * ca, y - rr * 0.5f * sa - rr * 0.25f, x + rr * 0.2f * ca, y + rr * 0.2f * sa - rr * 0.35f, v * 0.6f, m);
+		}
+	}
+
+	/* marsh marigolds (spring) and forget-me-nots along the bank */
+	{
+		float fl = us_sat(spring + summer * 0.7f) * (1.0f - winter);
+		int nf = (int)(60.0f * fl * (0.4f + 0.6f * dens));
+		for (int i = 0; i < nf; i++) {
+			float h1 = st->tu_x[(i * 11 + 5) % MAX_TUFTS], h2 = st->tu_y[(i * 13 + 7) % MAX_TUFTS];
+			float x, y;
+			pond_pt(st, h1 * US_TAU, 1.06f + 0.12f * h2, &x, &y);
+			uint8_t m = (i % 3) == 0 ? US_MAT_LIGHT : (i % 3) == 1 ? US_MAT_BLOOM : US_MAT_ACCENT;
+			float bl = 0.85f + 0.15f * sinf(ctx->t * 0.7f + i);
+			if (crisp)
+				us_put(c, (int)(x * c->s), (int)(y * c->s), 0.8f * bl, m);
+			else {
+				float rr = 0.0018f + 0.0012f * h2;
+				for (int k = 0; k < 5; k++) {
+					float a = US_TAU * k / 5.0f + h1 * 9.0f;
+					us_point(c, x + cosf(a) * rr, y + sinf(a) * rr, 0.0011f, 0.75f * bl, m);
+				}
+				us_point(c, x, y, 0.0009f, 0.9f, US_MAT_LIGHT);
+			}
+		}
+	}
+
+	/* ferns: fronds from above, pinnae shortening toward the tips, swaying with the wind */
+	{
+		uint8_t fm = winter > 0.6f ? US_MAT_STEM : (autumn > 0.6f ? US_MAT_ACCENT : US_MAT_LEAF);
+		int nfern = (int)(st->nfern * (0.5f + 0.5f * dens) + 0.5f);
+		for (int i = 0; i < nfern; i++) {
+			float cx = st->fx[i], cy = st->fy[i], S = st->fs[i] * (0.75f + 0.25f * green);
+			int nfr = 7;
+			for (int k = 0; k < nfr; k++) {
+				float a0 = st->fph[i] + US_TAU * k / nfr + 0.15f * sinf(k * 2.3f);
+				float sway = 0.18f * wind * us_noise2(st->wind_t * 0.6f + k, i * 3.1f);
+				float L = S * (0.8f + 0.2f * sinf(k * 1.7f + i));
+				float px = cx, py = cy;
+				const int NS = 8;
+				for (int s = 1; s <= NS; s++) {
+					float f = (float)s / NS;
+					float a = a0 + (0.25f + sway) * f; /* fronds curl a little */
+					float qx = cx + cosf(a0 + 0.12f * f) * L * f + cosf(a) * 0.0f, qy = cy + sinf(a0 + 0.12f * f) * L * f;
+					qx += -sinf(a0) * (0.15f + sway) * L * f * f;
+					qy += cosf(a0) * (0.15f + sway) * L * f * f;
+					float v = (0.38f - 0.12f * f) * (0.7f + 0.3f * green);
+					if (crisp) {
+						us_line(c, px, py, qx, qy, 0.001f, v + 0.1f, fm);
+					} else {
+						hl(c, px, py, qx, qy, v, fm);
+						/* pinnae */
+						float pl = L * 0.2f * (1.0f - f) + 0.002f;
+						float dx = qx - px, dy = qy - py, dl = sqrtf(dx * dx + dy * dy) + 1e-6f;
+						float nx = -dy / dl, ny = dx / dl;
+						hl(c, qx, qy, qx + (nx + dx / dl * 0.5f) * pl, qy + (ny + dy / dl * 0.5f) * pl, v * 0.85f, fm);
+						hl(c, qx, qy, qx + (-nx + dx / dl * 0.5f) * pl, qy + (-ny + dy / dl * 0.5f) * pl, v * 0.85f, fm);
+					}
+					px = qx;
+					py = qy;
+				}
+			}
+		}
+	}
+
+}
+
+/* multiply the ink inside a disc (shade / occlusion) */
+static void carve_disc(us_canvas *c, float x, float y, float R, float keep, const float *lob)
+{
+	int k8 = (int)(keep * 256.0f);
+	float Rm = R * 1.2f;
+	int y0 = (int)floorf((y - Rm) * c->s), y1 = (int)ceilf((y + Rm) * c->s);
+	int x0 = (int)floorf((x - Rm) * c->s), x1 = (int)ceilf((x + Rm) * c->s);
+	float inv = 1.0f / c->s;
+	for (int j = y0 < 0 ? 0 : y0; j <= y1 && j < c->h; j++) {
+		float dy = (j + 0.5f) * inv - y;
+		uint8_t *row = c->ink + (size_t)j * c->w;
+		for (int i = x0 < 0 ? 0 : x0; i <= x1 && i < c->w; i++) {
+			float dx = (i + 0.5f) * inv - x;
+			float r2 = dx * dx + dy * dy, rr = R;
+			if (r2 > Rm * Rm)
+				continue;
+			if (lob && r2 > R * R * 0.75f) {
+				float th = atan2f(dy, dx);
+				if (th < 0)
+					th += US_TAU;
+				float fv = th / US_TAU * TREE_V;
+				int k = (int)fv % TREE_V;
+				rr = R * us_lerp(lob[k], lob[(k + 1) % TREE_V], fv - floorf(fv));
+			}
+			if (r2 <= rr * rr)
+				row[i] = (uint8_t)((row[i] * k8) >> 8);
+		}
+	}
+}
+
+/* a wooden jetty out over the water, and a tree leaning over the pond from the bank: its shade dims the
+ * caustics, its crown hides them, a fringe of weeping twigs trails from its rim and dimples the surface */
+static void draw_overhang(us_canvas *c, st_t *st, const us_ctx *ctx, float wind)
+{
+	const us_world *w = ctx->w;
+	float dt = ctx->dt;
+	float winter = us_world_winter(w), autumn = us_world_season_w(w, 2);
+	int crisp = ctx->crisp;
+	/* ---- jetty ---- */
+	{
+		float x0, y0, x1, y1;
+		pond_pt(st, st->jth, 1.14f, &x0, &y0);
+		pond_pt(st, st->jth, 0.8f, &x1, &y1);
+		float dx = x1 - x0, dy = y1 - y0, L = sqrtf(dx * dx + dy * dy) + 1e-6f;
+		float ux = dx / L, uy = dy / L, nx = -uy, ny = ux;
+		float hw = 0.024f;
+		/* the boards hide the water beneath */
+		for (float f = 0; f <= L; f += hw * 0.8f)
+			carve_disc(c, x0 + ux * f, y0 + uy * f, hw * 1.05f, 0.12f, NULL);
+		float snow = us_smooth(0.6f, 0.9f, winter);
+		uint8_t bm = snow > 0.5f ? US_MAT_ACCENT : US_MAT_EARTH;
+		int np = (int)(L / 0.0085f);
+		for (int k = 0; k <= np; k++) {
+			float f = (k + 0.5f) / (np + 1) * L;
+			float j = 0.0015f * sinf(k * 12.9898f);
+			float ax = x0 + ux * f + nx * hw, ay = y0 + uy * f + ny * hw;
+			float bx = x0 + ux * f - nx * hw, by = y0 + uy * f - ny * hw;
+			float v = 0.55f + 0.1f * sinf(k * 7.1f) + 0.2f * snow;
+			if (crisp)
+				us_line(c, ax + ux * j, ay + uy * j, bx + ux * j, by + uy * j, 0.001f, v, bm);
+			else {
+				hl(c, ax + ux * j, ay + uy * j, bx + ux * j, by + uy * j, v, bm);
+				hl(c, ax + ux * (j + 0.0055f), ay + uy * (j + 0.0055f), bx + ux * (j + 0.0055f), by + uy * (j + 0.0055f), v * 0.45f, bm);
+			}
+		}
+		/* posts at the end, ringed by the water lapping them */
+		for (int s = -1; s <= 1; s += 2) {
+			float px = x1 + nx * hw * s * 1.1f, py = y1 + ny * hw * s * 1.1f;
+			us_disc(c, px, py, 0.004f, 0.5f, US_MAT_EARTH);
+			if (!crisp)
+				us_ring(c, px, py, 0.0075f + 0.0015f * sinf(ctx->t * 1.3f + s), 0.0009f, 0.3f * (1.0f - st->ice), US_MAT_WATER);
+		}
+	}
+	/* ---- the tree ---- */
+	float bare = us_smooth(0.5f, 0.9f, winter);
+	float gold = us_smooth(0.4f, 0.85f, autumn);
+	uint8_t lm = gold > 0.5f ? US_MAT_LIGHT : US_MAT_LEAF;
+	float crown = 1.0f - bare;
+	float R = st->wR * (0.8f + 0.2f * crown);
+	float sw = 0.004f * (0.3f + wind);
+	float ox = sw * us_noise2(st->wind_t * 0.5f, 1.7f), oy = sw * 0.6f * us_noise2(4.2f, st->wind_t * 0.5f);
+	float cx = st->wx + ox, cy = st->wy + oy;
+	if (crown > 0.05f) {
+		carve_disc(c, st->wx + R * 0.3f, st->wy + R * 0.28f, R * 0.98f, us_lerp(1.0f, 0.4f, crown), st->lob);
+		carve_disc(c, cx, cy, R, us_lerp(1.0f, 0.0f, crown), st->lob);
+	}
+	/* the weeping fringe */
+	{
+		int ns = (int)(MAX_STRANDS * (0.6f + 0.4f * ctx->p->density));
+		for (int i = 0; i < ns; i++) {
+			float a0 = st->sa[i], L = st->sl[i];
+			float swy = (0.08f + 0.35f * wind) * us_noise2(st->wind_t * 0.4f + st->sph[i], i * 0.37f);
+			float px = cx + cosf(a0) * st->sr0[i] * R / st->wR, py = cy + sinf(a0) * st->sr0[i] * R / st->wR;
+			const int NS = 5;
+			for (int s = 1; s <= NS; s++) {
+				float f = (float)s / NS;
+				float a = a0 + swy * f;
+				float qx = px + cosf(a) * L / NS, qy = py + sinf(a) * L / NS;
+				float v = (0.42f - 0.2f * f);
+				if (crisp)
+					us_line(c, px, py, qx, qy, 0.001f, v, bare > 0.5f ? US_MAT_STEM : lm);
+				else {
+					hl(c, px, py, qx, qy, v * 0.7f, bare > 0.5f ? US_MAT_STEM : lm);
+					if (bare < 0.9f && (s & 1))
+						us_point(c, qx, qy, 0.0012f, v * crown, lm);
+				}
+				px = qx;
+				py = qy;
+			}
+			if (pond_q(st, px, py) < 0.95f && st->ice < 0.5f && us_rand(&st->rng) < dt * (0.04f + 0.4f * wind))
+				add_ring(st, px, py, 0.45f, 0.03f, 0.9f, 1);
+		}
+	}
+	if (crown > 0.05f) {
+		float pts[2 * (TREE_V + 1)];
+		for (int v = 0; v <= TREE_V; v++) {
+			int k = v % TREE_V;
+			float th = US_TAU * k / TREE_V;
+			pts[2 * v] = cx + cosf(th) * R * st->lob[k];
+			pts[2 * v + 1] = cy + sinf(th) * R * st->lob[k];
+		}
+		if (crisp) {
+			for (int v = 0; v < TREE_V; v++)
+				us_tri(c, cx, cy, pts[2 * v], pts[2 * v + 1], pts[2 * v + 2], pts[2 * v + 3], 0.3f * crown, lm);
+			for (int q = 0; q < 9; q++) {
+				float h1 = st->sph[q * 5] / 20.0f, h2 = st->sph[q * 5 + 2] / 20.0f;
+				float rr = R * 0.65f * sqrtf(h1), th = US_TAU * h2;
+				us_disc(c, cx + cosf(th) * rr - R * 0.1f, cy + sinf(th) * rr - R * 0.1f, R * 0.22f, (0.42f + 0.18f * (q & 1)) * crown, lm);
+			}
+			us_polyline(c, pts, TREE_V + 1, 0.001f, 0.5f * crown, lm);
+		} else {
+			hpoly(c, pts, TREE_V + 1, 0.5f * crown, lm);
+			/* leaf clumps: crescents on their shaded side, shivering with the wind */
+			for (int q = 0; q < 46; q++) {
+				float h1 = sinf(q * 12.9898f + st->so * 3.1f) * 43758.5453f;
+				h1 -= floorf(h1);
+				float h2 = h1 * 9.17f - floorf(h1 * 9.17f);
+				float rr = R * 0.84f * sqrtf(h1), th = US_TAU * h2;
+				float qx = cx + cosf(th) * rr, qy = cy + sinf(th) * rr;
+				float qr = R * (0.11f + 0.07f * h2) * (1.0f - 0.35f * rr / R);
+				float jit = 0.25f * wind * us_noise2(st->wind_t * 1.3f, q + st->so);
+				float pp[2 * 7];
+				for (int k = 0; k <= 6; k++) {
+					float aa = -0.2f + jit + 2.2f * k / 6.0f;
+					pp[2 * k] = qx + cosf(aa) * qr;
+					pp[2 * k + 1] = qy + sinf(aa) * qr;
+				}
+				hpoly(c, pp, 7, (0.46f - 0.2f * rr / R) * crown, lm);
+			}
+		}
+	}
+	/* limbs: faint through the leaves, the whole picture in winter */
+	float lv = (crisp ? 0.0f : 0.06f) * crown + 0.5f * bare;
+	if (lv > 0.02f)
+		for (int b = 0; b < 7; b++) {
+			float th = st->so + b * US_TAU / 7.0f;
+			float L1 = R * (0.55f + 0.1f * (b % 3));
+			float ex = cx + cosf(th) * L1, ey = cy + sinf(th) * L1;
+			hl(c, st->wx, st->wy, ex, ey, lv, US_MAT_STEM);
+			for (int k = -1; k <= 1; k += 2)
+				hl(c, ex, ey, ex + cosf(th + k * 0.45f) * R * 0.38f, ey + sinf(th + k * 0.45f) * R * 0.38f, lv * 0.8f, US_MAT_STEM);
+		}
+}
+
 static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 {
 	st_t *st = sp;
@@ -895,54 +1201,45 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 			caustic_lines(st, c, gw2, gh2, cs2, lt, FW, FH, (0.2f + 2.0f * gain) * 0.42f);
 			goto caustics_done;
 		}
-		float inv_cs = 1.0f / cs;
-		float sharp = 1.0f / (0.11f + 0.08f * (1.0f - st->bass_env)) / cs; /* bass focuses the light */
-		/* domain warp bends the cell walls into soft curves */
-		float cx1[FWMAX], cx2[FWMAX];
-		for (int i = 0; i < FW; i++) {
-			float x = (i + 0.5f) * sx;
-			cx1[i] = 0.02f * fcos(x * 7.0f + lt * 0.5f) + 0.012f * fcos(x * 17.0f - lt * 0.8f);
-			cx2[i] = fcos(x * 13.0f + lt * 0.3f);
-		}
-		for (int j = 0; j < FH; j++) {
-			float y = (j + 0.5f) * sy;
-			float ry = 0.02f * fcos(y * 6.0f - lt * 0.6f) + 0.01f * fcos(y * 19.0f + lt * 0.7f);
-			float ry2 = 0.012f * fcos(y * 11.0f - lt * 0.4f);
-			for (int i = 0; i < FW; i++) {
-				int idx = j * FW + i;
-				float m = us_smooth(1.0f, 0.9f, st->qmask[idx]);
-				if (m <= 0.0f) {
-					st->field[idx] = 0;
-					continue;
-				}
-				float x = (i + 0.5f) * sx;
-				float wx = x + ry + cx2[i] * ry2 + st->dpx[idx], wy = y + cx1[i] + st->dpy[idx];
-				int ci = (int)(wx * inv_cs) + 1, cj = (int)(wy * inv_cs) + 1;
-				float f1 = 1e9f, f2 = 1e9f;
-				for (int dj = -1; dj <= 1; dj++) {
-					int jj = cj + dj;
-					if (jj < 0 || jj >= gh)
+		/* Pixel: one pass fills the pond bed and the land around it (nearest lookup in the mask grid), then
+		 * the same vector net as Ink, drawn as 1px lines: a fine web instead of an upscaled, 2px-thick field */
+		{
+			float lv = 0.13f + 0.1f * winter;
+			uint8_t lm = winter > 0.6f ? US_MAT_ACCENT : US_MAT_EARTH;
+			int bed = (int)(255.0f * (0.11f + 0.03f * open));
+			int land = (int)(255.0f * lv);
+			int ix[BLIT_WMAX];
+			int W = c->w < BLIT_WMAX ? c->w : BLIT_WMAX;
+			for (int px = 0; px < W; px++) {
+				int i = px * FW / c->w;
+				ix[px] = i < FW ? i : FW - 1;
+			}
+			for (int py = 0; py < c->h; py++) {
+				int j = py * FH / c->h;
+				if (j >= FH)
+					j = FH - 1;
+				const float *qrow = st->qmask + j * FW;
+				uint8_t *ink = c->ink + (size_t)py * c->w, *mt = c->mat + (size_t)py * c->w;
+				for (int px = 0; px < W; px++) {
+					float q = qrow[ix[px]];
+					int iv;
+					uint8_t m;
+					if (q < 0.995f) {
+						iv = bed;
+						m = ice > 0.5f ? US_MAT_ACCENT : US_MAT_WATER;
+					} else if (q > 1.012f) {
+						iv = land;
+						m = lm;
+					} else
 						continue;
-					for (int di = -1; di <= 1; di++) {
-						int ii = ci + di;
-						if (ii < 0 || ii >= gw)
-							continue;
-						float ddx = st->cpx[jj * CGW + ii] - wx, ddy = st->cpy[jj * CGW + ii] - wy;
-						float d2 = ddx * ddx + ddy * ddy;
-						if (d2 < f1) {
-							f2 = f1;
-							f1 = d2;
-						} else if (d2 < f2)
-							f2 = d2;
+					if (iv > ink[px]) {
+						ink[px] = (uint8_t)iv;
+						mt[px] = m;
 					}
 				}
-				float e = (sqrtf(f2) - sqrtf(f1)) * sharp;
-				float v = us_sat(1.0f - e);
-				v = v * v;
-				st->field[idx] = (v * 0.9f + 0.05f) * m;
 			}
 		}
-		field_blit(c, st->field, FW, FH, gain * 1.3f, US_MAT_WATER, st->blit_x, st->blit_t);
+		caustic_lines(st, c, gw, gh, cs, lt, FW, FH, 0.42f + 1.6f * gain);
 	}
 caustics_done:
 
@@ -1001,9 +1298,8 @@ caustics_done:
 			else
 				hpoly(c, pts, NB + 1, 0.3f / L, US_MAT_EARTH);
 		}
-		if (ctx->crisp) /* land beyond the bank (mask computed with the caustics) */
-			us_field(c, st->land, FW, FH, 0.13f + 0.1f * winter, winter > 0.6f ? US_MAT_ACCENT : US_MAT_EARTH, 0, 0, A, 1.0f);
 		float wind = us_sat(0.25f * w->wind + 0.8f * a->high + 0.3f * a->air);
+		draw_banks(c, st, ctx, wind, FW, npads);
 		int ncl = (int)(MAX_CLUMPS * (0.35f + 0.65f * dens));
 		uint8_t rm = winter > 0.6f ? US_MAT_STEM : US_MAT_LEAF;
 		float green = 1.0f - 0.6f * winter;
@@ -1117,12 +1413,23 @@ caustics_done:
 							float ex = (ix - A * 0.5f) / rx_, ey = (iy - 0.5f) / ry_;
 							if (ex * ex + ey * ey > st->bmin * st->bmin * 0.92f || in_pad(st, npads, ix, iy, 1.0f))
 								continue;
+							v = us_sat(v * 1.35f);
 							if (ctx->crisp) {
-								us_point(c, ix, iy, 0.001f, v, US_MAT_LIGHT);
+								us_point(c, ix, iy, 0.001f, 0.45f + 0.55f * v, US_MAT_LIGHT);
+								if (v > 0.6f) {
+									float q = 1.0f / c->s;
+									us_put(c, (int)(ix * c->s) - 1, (int)(iy * c->s), 0.5f * v, US_MAT_LIGHT);
+									us_put(c, (int)(ix * c->s) + 1, (int)(iy * c->s), 0.5f * v, US_MAT_LIGHT);
+									(void)q;
+								}
 							} else {
-								float L = 0.003f + 0.004f * v;
-								hl(c, ix - L, iy, ix + L, iy, v, US_MAT_WATER);
-								hl(c, ix, iy - L, ix, iy + L, v, US_MAT_WATER);
+								/* a four-point star of light, long arms along the crests' bisector */
+								float L = 0.004f + 0.009f * v;
+								hl(c, ix - L, iy, ix + L, iy, v, US_MAT_LIGHT);
+								hl(c, ix, iy - L, ix, iy + L, v, US_MAT_LIGHT);
+								hl(c, ix - L * 0.35f, iy - L * 0.35f, ix + L * 0.35f, iy + L * 0.35f, v * 0.6f, US_MAT_LIGHT);
+								hl(c, ix - L * 0.35f, iy + L * 0.35f, ix + L * 0.35f, iy - L * 0.35f, v * 0.6f, US_MAT_LIGHT);
+								us_point(c, ix, iy, 0.0016f, v, US_MAT_LIGHT);
 							}
 						}
 					}
@@ -1300,6 +1607,8 @@ caustics_done:
 			draw_strider(c, ctx->crisp, x, y, s->hd, 0.85f);
 		}
 	}
+
+	draw_overhang(c, st, ctx, us_sat(0.25f * w->wind + 0.8f * a->high + 0.3f * a->air));
 
 	/* ---- ice skin: frost rim, crack lines that creak further on heavy hits ---- */
 	if (ice > 0.02f) {

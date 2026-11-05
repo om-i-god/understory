@@ -6,6 +6,10 @@
  *   - point vortices (eddies) shed behind the stones — steadily in silence, in bursts on onsets,
  *   - a little curl noise so nothing is ever laminar.
  * The canvas trails turn each particle's motion into a short streak, so the picture is the flow.
+ * Beyond the banks lies a patchwork countryside: fields laid out back from the river between hedgerows
+ * (plough furrows, crop drills that ripple with gusts, wildflower meadows, pastures with grazing sheep),
+ * fences, a towpath, and slow cloud shadows drifting over it all; it turns gold and baled in autumn and
+ * white in winter.
  *
  * Audio: mids + level -> flow speed; onsets -> eddies shed behind stones; bass/kick -> the water swells
  *        wider; highs -> reeds on the banks sway.
@@ -32,6 +36,11 @@
 #define MAX_FISH 4
 #define MAX_TREES 12
 #define TREE_V 40
+#define MAX_COL 10 /* field columns per bank (between hedgerows) */
+#define NBAND 3    /* fields stacked back from the river in each column */
+#define MAX_SHEEP 14
+#define D0 0.05f   /* the riverside strip (towpath, reeds) before the fields start */
+#define DFAR 0.8f
 #define GX 48 /* coarse noise grid (curl wobble + speed texture), sampled bilinearly */
 #define GY 27
 
@@ -89,9 +98,37 @@ typedef struct {
 	float lob[TREE_V], lmin, lmax;
 } tree_t;
 
+/* a field seen from above: rows at an angle (plough furrows / crop drills), or a flowery meadow,
+ * or a pasture with sheep. Bounded by the hedgerows either side and by band edges back from the river. */
+enum { F_PLOUGH, F_CROP, F_MEADOW, F_PASTURE };
+typedef struct {
+	uint8_t kind, edge; /* edge: its far boundary is 0 open, 1 hedge, 2 fence */
+	float ang, sp, ph, ca, sa;
+} field_t;
+
+typedef struct {
+	int side, col, band;
+	float p, q, hd, ph, step;
+} sheep_t;
+
 typedef struct {
 	us_rng rng;
 	int inited;
+	/* countryside, per bank (0 = far bank / top, 1 = near bank / bottom) */
+	int ncol[2];
+	float hx[2][MAX_COL + 1], hlean[2][MAX_COL + 1], hgap[2][MAX_COL + 1];
+	float bd[2][MAX_COL][NBAND + 1][2]; /* band edges: d at the left / right hedge */
+	field_t fd[2][MAX_COL][NBAND];
+	sheep_t sh[MAX_SHEEP];
+	int nsh;
+	float shade_t, path_side;
+	/* coarse per-frame grids: cloud shadow + crop gusts over the land */
+#define LGW 40
+#define LGH 24
+	float lshade[LGW * LGH], lgust[LGW * LGH];
+	/* crisp land fill cache (fields are static; refreshed a few columns per frame) */
+	uint8_t *lc_ink, *lc_mat;
+	int lc_w, lc_h, lc_phase;
 	surge_t sg[MAX_SURGE];
 	int nsg;
 	float sgx[NX]; /* surge profile along the river, rebuilt per frame */
@@ -117,7 +154,7 @@ typedef struct {
 	float cy[NX], hw[NX], sl[NX], hb[NX]; /* hb: floodplain terraces (slow) */
 	float bank_w;
 	float A;
-	float gcx[GX * GY], gcy[GX * GY], gmod[GX * GY];
+	float gcx[GX * GY], gcy[GX * GY], gmod[GX * GY], gn[GX * GY];
 	/* smoothed drivers */
 	float width, speed, swell_env, wind_t, flow_t, ice;
 	float rock_x[MAX_ROCKS], rock_y[MAX_ROCKS];
@@ -131,12 +168,41 @@ static void *create(uint32_t seed)
 	return s;
 }
 
-static void destroy(void *p) { free(p); }
+static void destroy(void *p)
+{
+	st_t *st = p;
+	free(st->lc_ink);
+	free(st->lc_mat);
+	free(st);
+}
 
 /* ---- fast hairlines ------------------------------------------------------
  * Ink canvases: Xiaolin-Wu style 1px anti-aliased line (two pixels per step, no sqrt) — the core
  * us_line is a general AA thick-line rasteriser and is ~5x the cost for the thousands of fine
  * strokes this scene draws. Crisp canvases: the core's Bresenham path. */
+/* us_put, inlined: the hairlines below call it tens of thousands of times a frame */
+static inline void put1(us_canvas *c, int x, int y, float v, uint8_t mat)
+{
+	if ((unsigned)x >= (unsigned)c->w || (unsigned)y >= (unsigned)c->h)
+		return;
+	int iv = (int)(v * 255.0f + 0.5f);
+	if (iv <= 0)
+		return;
+	if (iv > 255)
+		iv = 255;
+	size_t i = (size_t)y * c->w + x;
+	int old = c->ink[i];
+	if (c->blend == US_BLEND_ADD) {
+		int n = old + iv;
+		c->ink[i] = (uint8_t)(n > 255 ? 255 : n);
+		if (iv * 2 >= old)
+			c->mat[i] = mat;
+	} else if (iv > old) {
+		c->ink[i] = (uint8_t)iv;
+		c->mat[i] = mat;
+	}
+}
+
 static void hl(us_canvas *c, float ax, float ay, float bx, float by, float v, uint8_t mat)
 {
 	if (c->crisp) {
@@ -178,11 +244,11 @@ static void hl(us_canvas *c, float ax, float ay, float bx, float by, float v, ui
 		if (i == i0 && i == i1)
 			e *= us_clampf(x1 - x0, 0.3f, 1.0f);
 		if (steep) {
-			us_put(c, j, i, e * (1.0f - f), mat);
-			us_put(c, j + 1, i, e * f, mat);
+			put1(c, j, i, e * (1.0f - f), mat);
+			put1(c, j + 1, i, e * f, mat);
 		} else {
-			us_put(c, i, j, e * (1.0f - f), mat);
-			us_put(c, i, j + 1, e * f, mat);
+			put1(c, i, j, e * (1.0f - f), mat);
+			put1(c, i, j + 1, e * f, mat);
 		}
 	}
 }
@@ -242,17 +308,23 @@ static float surge_at(const st_t *st, float x)
 
 static void build_grid(st_t *st, float A, float t)
 {
-	float e = 0.01f, nf = 3.2f, tt = st->flow_t * 0.35f;
+	float nf = 3.2f, tt = st->flow_t * 0.35f;
 	for (int j = 0; j < GY; j++)
 		for (int i = 0; i < GX; i++) {
 			float x = A * i / (GX - 1), y = (float)j / (GY - 1);
-			float n0 = us_noise3(x * nf, y * nf, tt);
-			float nxp = us_noise3((x + e) * nf, y * nf, tt);
-			float nyp = us_noise3(x * nf, (y + e) * nf, tt);
 			int k = j * GX + i;
-			st->gcx[k] = (nyp - n0) / e;
-			st->gcy[k] = -(nxp - n0) / e;
+			st->gn[k] = us_noise3(x * nf, y * nf, tt);
 			st->gmod[k] = us_noise2(x * 2.5f - t * 0.25f, y * 2.5f);
+		}
+	/* curl of the noise by central differences on the grid itself (one noise per node, not three) */
+	float ix = (GX - 1) / A, iy = (float)(GY - 1);
+	for (int j = 0; j < GY; j++)
+		for (int i = 0; i < GX; i++) {
+			int i0 = i > 0 ? i - 1 : i, i1 = i < GX - 1 ? i + 1 : i;
+			int j0 = j > 0 ? j - 1 : j, j1 = j < GY - 1 ? j + 1 : j;
+			int k = j * GX + i;
+			st->gcx[k] = (st->gn[j1 * GX + i] - st->gn[j0 * GX + i]) * iy / (j1 - j0);
+			st->gcy[k] = -(st->gn[j * GX + i1] - st->gn[j * GX + i0]) * ix / (i1 - i0);
 		}
 }
 
@@ -427,6 +499,69 @@ static void init_scene(st_t *st, const us_ctx *ctx)
 			tr->lmax = fmaxf(tr->lmax, tr->lob[v]);
 		}
 	}
+	/* countryside: hedgerows run back from the river, splitting each bank into columns of fields */
+	float A0 = ctx->aspect;
+	st->path_side = us_rand(r) < 0.5f ? 0.0f : 1.0f;
+	for (int sd = 0; sd < 2; sd++) {
+		float x = -us_randr(r, 0.02f, 0.2f);
+		int n = 0;
+		while (n <= MAX_COL) {
+			st->hx[sd][n] = x;
+			st->hlean[sd][n] = us_randr(r, -0.18f, 0.18f);
+			st->hgap[sd][n] = us_randr(r, 0.08f, 0.5f);
+			n++;
+			if (x > A0 + 0.05f)
+				break;
+			x += us_randr(r, 0.22f, 0.38f);
+		}
+		st->ncol[sd] = n - 1;
+		for (int k = 0; k < st->ncol[sd]; k++) {
+			float b1 = us_randr(r, 0.14f, 0.24f), b2 = b1 + us_randr(r, 0.13f, 0.21f);
+			float t1 = us_randr(r, -0.05f, 0.05f), t2 = us_randr(r, -0.05f, 0.05f);
+			st->bd[sd][k][0][0] = st->bd[sd][k][0][1] = D0;
+			st->bd[sd][k][1][0] = b1 - t1;
+			st->bd[sd][k][1][1] = b1 + t1;
+			st->bd[sd][k][2][0] = b2 - t2;
+			st->bd[sd][k][2][1] = b2 + t2;
+			st->bd[sd][k][3][0] = st->bd[sd][k][3][1] = DFAR;
+			for (int b = 0; b < NBAND; b++) {
+				field_t *f = &st->fd[sd][k][b];
+				float u = us_rand(r);
+				f->kind = u < 0.27f ? F_PLOUGH : u < 0.62f ? F_CROP : u < 0.82f ? F_MEADOW : F_PASTURE;
+				/* rows mostly along or across the field, sometimes on the slant */
+				float ar = us_rand(r);
+				f->ang = ar < 0.4f ? 0.0f : ar < 0.75f ? US_PI * 0.5f : us_randr(r, -0.9f, 0.9f);
+				f->ang += us_randr(r, -0.12f, 0.12f);
+				f->ca = cosf(f->ang);
+				f->sa = sinf(f->ang);
+				f->sp = us_randr(r, 0.85f, 1.2f);
+				f->ph = us_rand(r) * 50.0f;
+				u = us_rand(r);
+				f->edge = u < 0.55f ? 1 : u < 0.8f ? 2 : 0;
+			}
+		}
+	}
+	/* a small flock in each pasture near the river */
+	st->nsh = 0;
+	for (int sd = 0; sd < 2; sd++)
+		for (int k = 0; k < st->ncol[sd]; k++)
+			for (int b = 0; b < 2; b++) {
+				if (st->fd[sd][k][b].kind != F_PASTURE)
+					continue;
+				int n = 3 + (int)(us_rand(r) * 4.0f);
+				float cp = us_randr(r, 0.3f, 0.7f), cq = us_randr(r, 0.3f, 0.7f);
+				for (int i = 0; i < n && st->nsh < MAX_SHEEP; i++) {
+					sheep_t *q = &st->sh[st->nsh++];
+					q->side = sd;
+					q->col = k;
+					q->band = b;
+					q->p = us_clampf(cp + us_randn(r) * 0.12f, 0.1f, 0.9f);
+					q->q = us_clampf(cq + us_randn(r) * 0.15f, 0.12f, 0.88f);
+					q->hd = us_rand(r) * US_TAU;
+					q->ph = us_rand(r) * 30.0f;
+					q->step = 0;
+				}
+			}
 	st->np = 0;
 	st->inited = 1;
 }
@@ -462,8 +597,10 @@ static void wipe_disc(us_canvas *c, float x, float y, float r, uint8_t mat)
 		for (int i = x0 < 0 ? 0 : x0; i <= x1 && i < c->w; i++) {
 			float dx = i + 0.5f - x * c->s, dy = j + 0.5f - y * c->s;
 			size_t o = (size_t)j * c->w + i;
-			if (dx * dx + dy * dy <= r2 && c->mat[o] == mat)
+			if (dx * dx + dy * dy <= r2 && c->mat[o] == mat) {
 				c->ink[o] = 0;
+				c->mat[o] = US_MAT_WATER; /* else the ink bloom would relight it in the floater's colour */
+			}
 		}
 }
 
@@ -618,6 +755,486 @@ static void carve_crown(us_canvas *c, const tree_t *tr, float x, float y, float 
 	}
 }
 
+/* ---- countryside ---------------------------------------------------------
+ * Fields live in (x, d) space: d = distance back from the floodplain edge, so the patchwork follows the
+ * river's meander the way real field boundaries follow a valley. A field is the quad between two
+ * hedgerows and two band edges; (p, q) in [0,1]^2 are its local coordinates. */
+
+static float hsh(float a, float b)
+{
+	uint32_t h = (uint32_t)(int32_t)(a * 1013.0f) * 0x9E3779B1u ^ (uint32_t)(int32_t)(b * 917.0f) * 0x85EBCA77u;
+	h ^= h >> 15;
+	h *= 0x2C1B3C6Du;
+	h ^= h >> 12;
+	h *= 0x297A2D39u;
+	h ^= h >> 15;
+	return (h >> 8) * (1.0f / 16777216.0f);
+}
+
+static void bank_at(const st_t *st, float x, float *cc, float *hb)
+{
+	float f = us_clampf(x / st->A, 0, 1) * (NX - 1.001f);
+	int i = (int)f;
+	float t = f - i;
+	*cc = us_lerp(st->cy[i], st->cy[i + 1], t);
+	*hb = us_lerp(st->hb[i], st->hb[i + 1], t);
+}
+
+static void land_xy(const st_t *st, int sd, float x, float d, float *ox, float *oy)
+{
+	float cc, hb;
+	bank_at(st, x, &cc, &hb);
+	*ox = x;
+	*oy = cc + (sd ? 1.0f : -1.0f) * (hb + d);
+}
+
+static void fgeo(const st_t *st, int sd, int k, int b, float p, float q, float *x, float *y)
+{
+	const float(*e)[2] = st->bd[sd][k];
+	float da = us_lerp(e[b][0], e[b][1], p), db = us_lerp(e[b + 1][0], e[b + 1][1], p);
+	float d = us_lerp(da, db, q);
+	float xl = st->hx[sd][k] + st->hlean[sd][k] * d, xr = st->hx[sd][k + 1] + st->hlean[sd][k + 1] * d;
+	land_xy(st, sd, us_lerp(xl, xr, p), d, x, y);
+}
+
+/* slow cloud shadows drifting over the land, and gusts running through the crops: coarse grids rebuilt
+ * once per frame, sampled bilinearly (hundreds of noise calls instead of thousands) */
+static void build_land_grids(st_t *st)
+{
+	for (int j = 0; j < LGH; j++)
+		for (int i = 0; i < LGW; i++) {
+			float x = st->A * i / (LGW - 1), y = (float)j / (LGH - 1);
+			float n = us_noise2(x * 1.1f - st->shade_t, y * 1.5f + st->seed_off);
+			st->lshade[j * LGW + i] = 1.0f - 0.5f * us_smooth(0.0f, 0.45f, n);
+			st->lgust[j * LGW + i] = us_noise2(x * 3.5f - st->wind_t * 0.8f, y * 3.5f);
+		}
+}
+
+static float lgrid(const st_t *st, const float *g, float x, float y)
+{
+	float fx = us_clampf(x / st->A, 0, 1) * (LGW - 1.001f), fy = us_clampf(y, 0, 1) * (LGH - 1.001f);
+	int i = (int)fx, j = (int)fy;
+	float tx = fx - i, ty = fy - j;
+	const float *q = g + j * LGW + i;
+	return us_lerp(us_lerp(q[0], q[1], tx), us_lerp(q[LGW], q[LGW + 1], tx), ty);
+}
+
+static float shade_at(const st_t *st, float x, float y) { return lgrid(st, st->lshade, x, y); }
+
+/* rows across one field (furrows / drills), clipped to the field with a headland margin */
+static void field_rows(us_canvas *c, const st_t *st, int sd, int k, int b, float sp, float v, uint8_t mat, float gust,
+		       int dashed)
+{
+	const field_t *f = &st->fd[sd][k][b];
+	const float(*e)[2] = st->bd[sd][k];
+	float D = 0.5f * ((e[b + 1][0] - e[b][0]) + (e[b + 1][1] - e[b][1]));
+	float dm = 0.5f * (e[b][0] + e[b + 1][0]);
+	float W = (st->hx[sd][k + 1] - st->hx[sd][k]) + (st->hlean[sd][k + 1] - st->hlean[sd][k]) * dm;
+	if (W < 0.02f || D < 0.02f)
+		return;
+	float ca = f->ca, sa = f->sa;
+	float nx = -sa, ny = ca;
+	float pr[4] = {0, nx * W, ny * D, nx * W + ny * D};
+	float nmin = pr[0], nmax = pr[0];
+	for (int i = 1; i < 4; i++) {
+		nmin = fminf(nmin, pr[i]);
+		nmax = fmaxf(nmax, pr[i]);
+	}
+	sp *= f->sp;
+	int n = (int)((nmax - nmin) / sp);
+	if (n > 160)
+		n = 160;
+	float mx = 0.012f, my = 0.008f;
+	for (int i = 0; i < n; i++) {
+		float o = nmin + (i + 0.5f) * (nmax - nmin) / n;
+		float px0 = nx * o, py0 = ny * o;
+		/* Liang-Barsky clip of P0 + s*(ca, sa) to [mx, W-mx] x [my, D-my] */
+		float s0 = -4.0f, s1 = 4.0f;
+		float lo[2] = {mx, my}, hi[2] = {W - mx, D - my}, p0[2] = {px0, py0}, dd[2] = {ca, sa};
+		int ok = 1;
+		for (int a = 0; a < 2 && ok; a++) {
+			if (fabsf(dd[a]) < 1e-6f) {
+				if (p0[a] < lo[a] || p0[a] > hi[a])
+					ok = 0;
+				continue;
+			}
+			float ta = (lo[a] - p0[a]) / dd[a], tb = (hi[a] - p0[a]) / dd[a];
+			if (ta > tb) {
+				float tt = ta;
+				ta = tb;
+				tb = tt;
+			}
+			s0 = fmaxf(s0, ta);
+			s1 = fminf(s1, tb);
+		}
+		if (!ok || s1 - s0 < sp)
+			continue;
+		int m = 1 + (int)((s1 - s0) / 0.04f);
+		if (m > 18)
+			m = 18;
+		float lx = 0, ly = 0;
+		for (int j = 0; j <= m; j++) {
+			float s = s0 + (s1 - s0) * j / m;
+			float X = px0 + ca * s, Y = py0 + sa * s;
+			float x, y;
+			fgeo(st, sd, k, b, X / W, Y / D, &x, &y);
+			if (j > 0 && !(dashed && ((i + j) & 1)) && ((y > -0.01f && y < 1.01f) || (ly > -0.01f && ly < 1.01f))) {
+				float vv = v * shade_at(st, x, y);
+				if (gust > 0) /* wind running through standing crops: bright waves rolling across */
+					vv *= 1.0f + gust * lgrid(st, st->lgust, x, y);
+				hl(c, lx, ly, x, y, vv, mat);
+			}
+			lx = x;
+			ly = y;
+		}
+	}
+}
+
+/* a hedge bush from above: a scalloped clump, shaded on its lower right */
+/* unit scallops (outer clump arc, inner sunlit lump), precomputed: hedges draw ~1000 bushes a frame */
+static const float BUSH_A[2][7] = {{-0.4f, 0.3f, 1.0f, 1.7f, 2.4f, 0, 0}, {-0.1f, 0.9f, 1.9f, 0, 0, 0, 0}};
+static float bush_xy[2][7][2];
+static int bush_ready;
+
+static void bush(us_canvas *c, int crisp, float x, float y, float r, float v, uint8_t mat)
+{
+	if (y < -r || y > 1.0f + r)
+		return;
+	if (crisp) {
+		us_disc(c, x, y, r, v * 0.75f, mat);
+		us_disc(c, x - r * 0.3f, y - r * 0.3f, r * 0.5f, v, mat);
+		return;
+	}
+	if (!bush_ready) {
+		for (int a = 0; a < 2; a++)
+			for (int i = 0; i < 7; i++) {
+				bush_xy[a][i][0] = cosf(BUSH_A[a][i]);
+				bush_xy[a][i][1] = sinf(BUSH_A[a][i]);
+			}
+		bush_ready = 1;
+	}
+	for (int i = 0; i < 4; i++)
+		hl(c, x + bush_xy[0][i][0] * r, y + bush_xy[0][i][1] * r, x + bush_xy[0][i + 1][0] * r, y + bush_xy[0][i + 1][1] * r,
+		   v, mat);
+	float ix = x - r * 0.25f, iy = y - r * 0.3f, ir = r * 0.55f;
+	for (int i = 0; i < 2; i++)
+		hl(c, ix + bush_xy[1][i][0] * ir, iy + bush_xy[1][i][1] * ir, ix + bush_xy[1][i + 1][0] * ir,
+		   iy + bush_xy[1][i + 1][1] * ir, v * 0.7f, mat);
+}
+
+static void draw_land(us_canvas *c, st_t *st, const us_ctx *ctx, float wind, float bloom)
+{
+	const us_world *w = ctx->w;
+	int crisp = ctx->crisp;
+	float dens = ctx->p->density, t = (float)ctx->t;
+	float winter = us_world_winter(w), autumn = us_world_season_w(w, 2), spring = us_world_season_w(w, 0),
+	      summer = us_world_season_w(w, 1);
+	float snow = us_smooth(0.5f, 0.85f, winter);
+	float ripe = us_smooth(0.3f, 0.7f, 0.6f * summer + autumn);
+	uint8_t crop_m = ripe > 0.5f ? US_MAT_LIGHT : US_MAT_LEAF;
+	uint8_t hedge_m = snow > 0.5f ? US_MAT_STEM : US_MAT_LEAF;
+	float lush = 1.0f - 0.5f * snow;
+
+	for (int sd = 0; sd < 2; sd++)
+		for (int k = 0; k < st->ncol[sd]; k++)
+			for (int b = 0; b < NBAND; b++) {
+				const field_t *f = &st->fd[sd][k][b];
+				/* ink rows (crisp canvases fill the fields per pixel, see the land fill) */
+				if (!crisp) {
+					float spm = 1.38f - 0.45f * dens;
+					if (f->kind == F_PLOUGH)
+field_rows(c, st, sd, k, b, 0.0075f * spm, 0.27f + 0.04f * snow, snow > 0.5f ? US_MAT_WATER : US_MAT_EARTH,
+							   0, 0);
+					else if (f->kind == F_CROP) {
+						if (snow > 0.5f)
+field_rows(c, st, sd, k, b, 0.013f * spm, 0.2f, US_MAT_WATER, 0, 1);
+						else
+							field_rows(c, st, sd, k, b, 0.0098f * spm, 0.29f + 0.05f * ripe, crop_m, 0.25f + 0.5f * wind,
+								   spring > 0.5f || autumn > 0.6f);
+					}
+				}
+				/* meadow and pasture: grass ticks, wildflowers, sheep */
+				if (f->kind == F_MEADOW || f->kind == F_PASTURE) {
+					const float(*e)[2] = st->bd[sd][k];
+					float D = 0.5f * ((e[b + 1][0] - e[b][0]) + (e[b + 1][1] - e[b][1]));
+					float W = st->hx[sd][k + 1] - st->hx[sd][k];
+					if (b == NBAND - 1)
+						D = fminf(D, 0.4f);
+					int meadow = f->kind == F_MEADOW;
+					int n = (int)(W * D * (meadow ? 1800.0f : 700.0f) * (0.45f + 0.8f * dens));
+					if (n > 260)
+						n = 260;
+					float sw = 0.6f * wind;
+					for (int i = 0; i < n; i++) {
+						float hp = hsh(i + f->ph, 1.7f), hq = hsh(i * 1.31f, f->ph + 4.1f), hk = hsh(i * 0.7f, f->ph);
+						float x, y;
+						fgeo(st, sd, k, b, 0.03f + 0.94f * hp, 0.04f + 0.92f * hq, &x, &y);
+						if (y < -0.01f || y > 1.01f)
+							continue;
+						float sh = shade_at(st, x, y);
+						int flower = meadow && hk < 0.55f * (1.0f - snow) * (0.4f + 0.6f * (spring + summer));
+						if (flower) {
+							/* buttercups, campion, ox-eye daisies; the bass opens them */
+							uint8_t fm = hk < 0.2f ? US_MAT_LIGHT : hk < 0.38f ? US_MAT_BLOOM : US_MAT_ACCENT;
+							float rr = (0.0011f + 0.0013f * hq) * (0.8f + 0.5f * bloom);
+							float v = (0.5f + 0.35f * hp) * sh * (0.75f + 0.25f * bloom);
+							if (crisp)
+								us_put(c, (int)(x * c->s), (int)(y * c->s), 0.62f + 0.3f * hp, fm);
+							else
+								us_point(c, x, y, rr, v, fm);
+						} else if (!crisp) {
+							float L = 0.0045f * (0.6f + 0.4f * hp);
+							float a0 = -US_PI * 0.5f + sw * lgrid(st, st->lgust, x, y);
+							float v = (0.13f + 0.08f * hq) * sh * lush;
+							hl(c, x - L * 0.5f, y, x + cosf(a0 - 0.5f) * L, y + sinf(a0 - 0.5f) * L, v, US_MAT_LEAF);
+							hl(c, x + L * 0.5f, y, x + cosf(a0 + 0.5f) * L, y + sinf(a0 + 0.5f) * L, v, US_MAT_LEAF);
+						}
+					}
+				}
+				/* autumn: round bales left on the stubble */
+				if (f->kind == F_CROP && autumn > 0.5f && snow < 0.5f && b < 2) {
+					for (int i = 0; i < 5; i++) {
+						float hp = hsh(i + f->ph, 9.3f), hq = hsh(i, f->ph + 2.0f);
+						if (hsh(i, f->ph) > 0.7f)
+							continue;
+						float x, y;
+						fgeo(st, sd, k, b, 0.15f + 0.7f * hp, 0.2f + 0.6f * hq, &x, &y);
+						if (crisp)
+							us_disc(c, x, y, 0.005f, 0.75f, US_MAT_LIGHT);
+						else {
+							us_ring(c, x, y, 0.0045f, 0.0011f, 0.7f, US_MAT_LIGHT);
+							us_ring(c, x, y, 0.002f, 0.0009f, 0.45f, US_MAT_LIGHT);
+						}
+					}
+				}
+			}
+
+	/* hedgerows: back from the river between the columns, with a gateway in each */
+	float br = crisp ? 0.0085f : 0.0082f, bv = (crisp ? 0.48f : 0.42f) * (0.8f + 0.2f * lush);
+	if (crisp && snow > 0.5f)
+		bv = 0.72f; /* bare hedges must stand above the bright snowfield fill */
+	float step = crisp ? 0.011f : 0.0138f;
+	for (int sd = 0; sd < 2; sd++) {
+		for (int k = 0; k <= st->ncol[sd]; k++) {
+			float hx = st->hx[sd][k];
+			if (hx < -0.05f || hx > st->A + 0.05f)
+				continue;
+			for (float d = D0 + 0.004f; d < 0.7f; d += step) {
+				int j = (int)(d / step);
+				float hj = hsh(j + k * 17.0f, sd + 3.0f);
+				if (fabsf(d - st->hgap[sd][k]) < 0.022f)
+					continue;
+				float x, y;
+				land_xy(st, sd, hx + st->hlean[sd][k] * d + (hj - 0.5f) * 0.004f, d, &x, &y);
+				if (y < -0.02f || y > 1.02f)
+					continue;
+				float sh = shade_at(st, x, y);
+				float rr = br * (0.75f + 0.5f * hj) * (hj > 0.94f ? 2.4f : 1.0f);
+				float sx = 0.0015f * wind * lgrid(st, st->lgust, x, y);
+				bush(c, crisp, x + sx, y, rr, bv * sh, hedge_m);
+				if (snow > 0.3f && !crisp)
+					harc(c, x - rr * 0.2f, y - rr * 0.2f, rr * 0.6f, 3.4f, 5.6f, 0.5f * snow, US_MAT_ACCENT);
+			}
+		}
+		/* band edges: some hedged, some fenced, some just the change of crop */
+		for (int k = 0; k < st->ncol[sd]; k++)
+			for (int b = 0; b < NBAND - 1; b++) {
+				const field_t *f = &st->fd[sd][k][b];
+				if (!f->edge)
+					continue;
+				float x0, y0, x1, y1;
+				fgeo(st, sd, k, b, 0, 1, &x0, &y0);
+				fgeo(st, sd, k, b, 1, 1, &x1, &y1);
+				float len = fabsf(x1 - x0);
+				int n = (int)(len / step);
+				float px = x0, py = y0;
+				for (int i = 0; i <= n; i++) {
+					float p = (i + 0.5f) / (n + 1);
+					float x, y;
+					fgeo(st, sd, k, b, p, 1, &x, &y);
+					if (y < -0.02f || y > 1.02f) {
+						px = x;
+						py = y;
+						continue;
+					}
+					float sh = shade_at(st, x, y);
+					if (f->edge == 1) {
+						float hj = hsh(i + k * 7.0f, b + sd * 5.0f);
+						bush(c, crisp, x, y, br * (0.7f + 0.5f * hj), bv * 0.9f * sh, hedge_m);
+					} else {
+						/* post and wire */
+						us_point(c, x, y, crisp ? 0.001f : 0.0012f, 0.4f * sh, US_MAT_EARTH);
+						if (i > 0 && !crisp)
+							hl(c, px, py, x, y, 0.16f * sh, US_MAT_STEM);
+					}
+					px = x;
+					py = y;
+				}
+			}
+	}
+
+	/* the towpath along one bank: a trodden line through the riverside grass */
+	{
+		int sd = (int)st->path_side;
+		float pa[2 * 81], pb[2 * 81];
+		for (int i = 0; i <= 80; i++) {
+			float x = st->A * i / 80.0f;
+			float d = 0.027f + 0.009f * us_noise2(x * 2.3f, st->seed_off + 7.0f);
+			land_xy(st, sd, x, d - 0.0032f, &pa[2 * i], &pa[2 * i + 1]);
+			land_xy(st, sd, x, d + 0.0032f, &pb[2 * i], &pb[2 * i + 1]);
+		}
+		if (crisp)
+			hpoly(c, pa, 81, 0.42f + 0.2f * snow, snow > 0.5f ? US_MAT_ACCENT : US_MAT_EARTH);
+		else {
+			hpoly(c, pa, 81, 0.2f + 0.1f * snow, US_MAT_EARTH);
+			hpoly(c, pb, 81, 0.16f + 0.1f * snow, US_MAT_EARTH);
+		}
+	}
+
+	/* sheep grazing: drift a step at a time, heads down; a hard hit sets them trotting */
+	{
+		int nsh = (int)(st->nsh * (0.4f + 0.6f * dens) + 0.5f);
+		float trot = us_sat(ctx->a->kick * 0.8f);
+		for (int i = 0; i < nsh; i++) {
+			sheep_t *q = &st->sh[i];
+			q->step = us_approach(q->step, us_sat(0.5f + 0.5f * sinf(t * 0.4f + q->ph)) * 0.3f + trot, 0.6f, ctx->dt);
+			q->hd += ctx->dt * 0.5f * us_noise2(t * 0.15f, q->ph);
+			float spd = 0.004f * q->step * ctx->dt;
+			const float(*e)[2] = st->bd[q->side][q->col];
+			float W = st->hx[q->side][q->col + 1] - st->hx[q->side][q->col];
+			float D = 0.5f * ((e[q->band + 1][0] - e[q->band][0]) + (e[q->band + 1][1] - e[q->band][1]));
+			q->p += cosf(q->hd) * spd / fmaxf(W, 0.05f);
+			q->q += sinf(q->hd) * spd / fmaxf(D, 0.05f);
+			if (q->p < 0.1f || q->p > 0.9f || q->q < 0.12f || q->q > 0.88f) {
+				q->hd += US_PI * ctx->dt * 2.0f;
+				q->p = us_clampf(q->p, 0.1f, 0.9f);
+				q->q = us_clampf(q->q, 0.12f, 0.88f);
+			}
+			float x, y;
+			fgeo(st, q->side, q->col, q->band, q->p, q->q, &x, &y);
+			if (y < -0.02f || y > 1.02f)
+				continue;
+			float ax = cosf(q->hd), ay = sinf(q->hd) * (q->side ? 1.0f : -1.0f);
+			float sv = 0.85f * (0.7f + 0.3f * shade_at(st, x, y));
+			uint8_t sm = US_MAT_ACCENT;
+			if (crisp) {
+				us_disc(c, x, y, 0.0055f, sv, sm);
+				us_point(c, x + ax * 0.008f, y + ay * 0.008f, 0.001f, 0.35f, US_MAT_EARTH);
+			} else {
+				float pts[2 * 13];
+				for (int v = 0; v <= 12; v++) {
+					float a = US_TAU * v / 12.0f;
+					float wob = 1.0f + 0.12f * sinf(a * 5.0f + q->ph);
+					float ex = cosf(a) * 0.0058f * wob, ey = sinf(a) * 0.0039f * wob;
+					pts[2 * v] = x + ax * ex - ay * ey;
+					pts[2 * v + 1] = y + ay * ex + ax * ey;
+				}
+				hpoly(c, pts, 13, sv, sm);
+				us_point(c, x, y, 0.0026f, sv * 0.4f, sm);
+				us_point(c, x + ax * 0.0074f, y + ay * 0.0074f, 0.0017f, 0.45f, US_MAT_EARTH);
+			}
+		}
+	}
+}
+
+/* crisp canvases: the land filled per pixel, every field its own colour and row pattern. The fields barely
+ * move (the channel drifts over minutes), so the classification is cached and a quarter of the columns
+ * are refreshed each frame; only the water edge is exact every frame. */
+static void land_fill_crisp(us_canvas *c, st_t *st, const us_ctx *ctx)
+{
+	float winter = us_world_winter(ctx->w), autumn = us_world_season_w(ctx->w, 2), summer = us_world_season_w(ctx->w, 1);
+	float snow = us_smooth(0.5f, 0.85f, winter);
+	float ripe = us_smooth(0.3f, 0.7f, 0.6f * summer + autumn);
+	float inv = 1.0f / c->s;
+	float spc = 3.0f * inv;
+	int full = 0;
+	if (!st->lc_ink || st->lc_w != c->w || st->lc_h != c->h) {
+		free(st->lc_ink);
+		free(st->lc_mat);
+		st->lc_ink = malloc((size_t)c->w * c->h);
+		st->lc_mat = malloc((size_t)c->w * c->h);
+		if (!st->lc_ink || !st->lc_mat) {
+			free(st->lc_ink);
+			free(st->lc_mat);
+			st->lc_ink = st->lc_mat = NULL;
+			return;
+		}
+		st->lc_w = c->w;
+		st->lc_h = c->h;
+		full = 1;
+	}
+	st->lc_phase = (st->lc_phase + 1) & 3;
+	uint8_t snow_iv = (uint8_t)((snow > 0.5f ? 0.62f : 0.16f) * 255.0f), snow_m = snow > 0.5f ? US_MAT_ACCENT : US_MAT_EARTH;
+	for (int px = 0; px < c->w; px++) {
+		float x = (px + 0.5f) * inv, cc, h, sl, hb;
+		chan(st, x, &cc, &h, &sl);
+		int yt = (int)((cc - h) * c->s), yb = (int)((cc + h) * c->s);
+		uint8_t *li = st->lc_ink + px, *lm = st->lc_mat + px;
+		if (full || ((px + st->lc_phase) & 3) == 0) {
+			bank_at(st, x, &cc, &hb);
+			int kk[2] = {0, 0};
+			uint8_t *ci = li, *cm = lm;
+			for (int py = 0; py < c->h; py++, ci += c->w, cm += c->w) {
+				float v;
+				uint8_t m;
+				float y = (py + 0.5f) * inv;
+				int sd = y > cc;
+				float d = (sd ? y - cc : cc - y) - hb;
+				if (d < D0) {
+					*ci = snow_iv;
+					*cm = snow_m;
+					continue;
+				}
+				int k = kk[sd], nc = st->ncol[sd];
+				const float *hx = st->hx[sd], *hlv = st->hlean[sd];
+				while (k + 1 < nc && x > hx[k + 1] + hlv[k + 1] * d)
+					k++;
+				while (k > 0 && x < hx[k] + hlv[k] * d)
+					k--;
+				kk[sd] = k;
+				float xl = hx[k] + hlv[k] * d, xr = hx[k + 1] + hlv[k + 1] * d;
+				float p = (x - xl) / (xr - xl);
+				const float(*e)[2] = st->bd[sd][k];
+				int b = 0;
+				while (b < NBAND - 1 && d > e[b + 1][0] + (e[b + 1][1] - e[b + 1][0]) * p)
+					b++;
+				float da = e[b][0] + (e[b][1] - e[b][0]) * p;
+				const field_t *f = &st->fd[sd][k][b];
+				float X = x - xl, Y = d - da;
+				float pr = (-f->sa * X + f->ca * Y) / (spc * f->sp);
+				int stripe = pr - floorf(pr) < 0.42f;
+					if (snow > 0.5f) { /* snowfields: furrows show as a faint brighter ribbing */
+						v = stripe && f->kind != F_MEADOW && f->kind != F_PASTURE ? 0.85f : 0.62f;
+						m = US_MAT_ACCENT;
+				} else if (f->kind == F_PLOUGH) {
+					v = stripe ? 0.38f : 0.18f;
+					m = US_MAT_EARTH;
+				} else if (f->kind == F_CROP) {
+					v = stripe ? 0.24f : 0.15f;
+					m = stripe ? (ripe > 0.5f ? US_MAT_LIGHT : US_MAT_LEAF) : (ripe > 0.5f ? US_MAT_EARTH : US_MAT_STEM);
+				} else if (f->kind == F_MEADOW) {
+					v = 0.2f;
+					m = US_MAT_LEAF;
+				} else {
+					v = 0.2f;
+					m = US_MAT_STEM;
+				}
+				*ci = (uint8_t)(v * 255.0f + 0.5f);
+				*cm = m;
+			}
+		}
+		uint8_t *ink = c->ink + px, *mt = c->mat + px;
+		for (int py = 0; py < c->h; py++, ink += c->w, mt += c->w, li += c->w, lm += c->w) {
+			uint8_t iv = (py >= yt && py <= yb) ? 23 : *li;
+			uint8_t m = (py >= yt && py <= yb) ? US_MAT_WATER : *lm;
+			if (iv > *ink) {
+				*ink = iv;
+				*mt = m;
+			}
+		}
+	}
+}
+
 static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 {
 	st_t *st = sp;
@@ -737,18 +1354,11 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 		if (st->fl[i].dr_ > 0)
 			wipe_disc(c, st->fl[i].dx_, st->fl[i].dy_, st->fl[i].dr_, flt_mat[st->fl[i].kind]);
 
-	/* ---- land (crisp fill) + water fill ---- */
-	if (ctx->crisp) {
-		/* per pixel column: land above/below the banks, a faint water body between */
-		float lv = 0.14f + 0.2f * winter;
-		for (int px = 0; px < c->w; px++) {
-			float cc, h, sl;
-			chan(st, (px + 0.5f) / c->s, &cc, &h, &sl);
-			int yt = (int)((cc - h) * c->s), yb = (int)((cc + h) * c->s);
-			for (int py = 0; py < c->h; py++)
-				us_put(c, px, py, (py < yt || py > yb) ? lv : 0.09f, (py < yt || py > yb) ? US_MAT_EARTH : US_MAT_WATER);
-		}
-	}
+	/* ---- land (crisp fill: a patchwork of fields) + water fill ---- */
+	st->shade_t += dt * (0.012f + 0.04f * wind);
+	build_land_grids(st);
+	if (ctx->crisp)
+		land_fill_crisp(c, st, ctx);
 
 	/* ---- banks: water edge + terraced contours (the floodplain remembers higher water) ---- */
 	{
@@ -756,7 +1366,7 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 		/* topographic terraces: the floodplain drawn as a contour map */
 		float offs[8] = {0.0f, -0.012f, 0.012f, 0.045f, 0.09f, 0.15f, 0.22f, 0.3f};
 		float vals[8] = {0.62f, 0.34f, 0.24f, 0.17f, 0.13f, 0.11f, 0.09f, 0.08f};
-		int nL = 5 + (int)(dens * 3.0f + 0.5f);
+		int nL = 4; /* the outer terraces would cross the fields: the headland line is the last */
 		for (int L = 0; L < nL; L++) {
 			int stp = L ? 3 : 1, n = 0;
 			for (int i = 0; i < NX; i += stp) {
@@ -789,8 +1399,8 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 			bot[2 * i + 1] = st->cy[i] + o;
 		}
 		float sv = 0.16f + 0.5f * st->ice;
-		hpoly(c, top, NX, sv, st->ice > 0.3f ? US_MAT_LIGHT : US_MAT_WATER);
-		hpoly(c, bot, NX, sv, st->ice > 0.3f ? US_MAT_LIGHT : US_MAT_WATER);
+		hpoly(c, top, NX, sv, st->ice > 0.3f ? US_MAT_ACCENT : US_MAT_WATER);
+		hpoly(c, bot, NX, sv, st->ice > 0.3f ? US_MAT_ACCENT : US_MAT_WATER);
 		/* shelf ice hatching in winter */
 		if (st->ice > 0.05f) {
 			/* irregular frost fractures between the bank and the ice edge */
@@ -807,33 +1417,31 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 					float L = d * (0.3f + 0.7f * h2);
 					float ang = (h3 - 0.5f) * 1.4f;
 					float y0 = st->cy[i] + side * h;
-					hl(c, x, y0, x + sinf(ang) * L, y0 - side * cosf(ang) * L, 0.32f * st->ice, US_MAT_LIGHT);
+					hl(c, x, y0, x + sinf(ang) * L, y0 - side * cosf(ang) * L, 0.32f * st->ice, US_MAT_ACCENT);
 				}
 			}
 		}
 	}
 
-	/* ---- land tufts (grass from above; snow-dusted in winter) ---- */
+	/* ---- riverside grass tufts (snow-dusted in winter), then the fields beyond ---- */
 	{
 		int nt = (int)(MAX_TUFTS * (0.3f + 0.7f * dens));
 		float leafy = 1.0f - 0.7f * winter;
 		for (int i = 0; i < nt; i++) {
 			tuft_t *q = &st->tf[i];
-			float x = q->u * A, cc, h, s;
-			chan(st, x, &cc, &h, &s);
-			float d = fabsf(q->y - cc) - h;
-			if (d < 0.05f)
-				continue;
-			float sz = 0.007f * q->sz;
-			float sw = us_noise2(x * 2.0f - st->wind_t * 0.5f, q->y * 3.0f) * wind * 0.5f;
-			uint8_t m = winter > 0.6f ? US_MAT_LIGHT : US_MAT_LEAF;
+			float x, y;
+			land_xy(st, i & 1, q->u * A, 0.004f + q->y * (D0 - 0.01f), &x, &y);
+			float sz = 0.006f * q->sz;
+			float sw = us_noise2(x * 2.0f - st->wind_t * 0.5f, y * 3.0f) * wind * 0.5f;
+			uint8_t m = winter > 0.6f ? US_MAT_ACCENT : US_MAT_LEAF;
 			float v = (0.2f + 0.12f * q->sz) * (0.6f + 0.4f * leafy) + 0.12f * winter;
 			for (int b = -1; b <= 1; b++) {
 				float ang = -US_PI * 0.5f + b * 0.55f + sw;
-				hl(c, x, q->y, x + cosf(ang) * sz, q->y + sinf(ang) * sz, v, m);
+				hl(c, x, y, x + cosf(ang) * sz, y + sinf(ang) * sz, v, m);
 			}
 		}
 	}
+	draw_land(c, st, ctx, wind, st->swell_env);
 
 	/* ---- stones + bow waves ---- */
 	for (int k = 0; k < st->nrocks; k++) {
@@ -984,6 +1592,23 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 			float x = f->u * A, cc, h, sl;
 			chan(st, x, &cc, &h, &sl);
 			float y = cc + f->s * h * 0.85f;
+			/* never swim over a stone: slide aside (the body is a segment along the current) */
+			for (int k = 0; k < st->nrocks; k++) {
+				float dxr = x - st->rock_x[k], dyr = y - st->rock_y[k];
+				float half = f->len * 0.5f;
+				float dxs = dxr - us_clampf(dxr, -half, half);
+				float dd = sqrtf(dxs * dxs + dyr * dyr);
+				float need = st->rk[k].r * 1.3f + f->len * 0.16f + 0.004f;
+				if (dd < need) {
+					float sgn = dyr >= 0 ? 1.0f : -1.0f;
+					if (fabsf(f->s + sgn * 0.15f) > 0.62f)
+						sgn = -sgn;
+					float push = (need - dd) / (h * 0.85f);
+					f->hs = us_clampf(f->hs + sgn * push * 0.6f, -0.55f, 0.55f);
+					f->s = us_clampf(f->s + sgn * push, -0.7f, 0.7f);
+					y = cc + f->s * h * 0.85f;
+				}
+			}
 			/* head into the current, turned a little by sideways motion */
 			float vs = (f->s - ps) * h / fmaxf(dt, 1e-3f), vu = (f->u - pu) * A / fmaxf(dt, 1e-3f);
 			float tgt = US_PI + atanf(sl) - us_clampf(atan2f(vs, fmaxf(0.02f, -vu + 0.02f)), -0.35f, 0.35f);
@@ -1207,7 +1832,7 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 				}
 			}
 			/* limbs: faint through the leaves, the whole picture in winter */
-			float lv = (ctx->crisp ? 0.0f : 0.05f) * crown + 0.5f * bare;
+		float lv = (ctx->crisp ? 0.0f : 0.05f) * crown + (ctx->crisp ? 0.72f : 0.5f) * bare;
 			if (lv > 0.02f) {
 				for (int b = 0; b < 6; b++) {
 					float th = tr->ph + b * US_TAU / 6.0f + 0.2f * sinf(tr->ph * 3.0f + b);

@@ -8,6 +8,9 @@
  * ridges of a noise field, i.e. organic loops and holes — then runs up the sand as a lacy swash front,
  * stalls, slides back and leaves a dotted wet line that slowly dries. At night the moon (phase from the
  * world's season clock, position from the time of day) lays a twinkling glitter path; by day the sun.
+ * Above: the Milky Way, a haloed moon, banks of cumulus lit on the moon's side, horizon haze. On the beach:
+ * long ripple marks catching the moonlight, shells and pebbles, a driftwood log, and marram grass on the
+ * dunes framing the foreground corners, combed by the wind.
  *
  * Audio: swell (phrase loudness) + a slow ~50 s set rhythm -> wave size and how often they come; bass
  *        pushes the run-up; highs/air -> foam lace density + glitter twinkle + spindrift; onsets throw spray
@@ -24,7 +27,10 @@
 #define MAX_SPRAY 320
 #define NX 128 /* wet-line columns */
 #define NS 192 /* surface samples across the screen (ink) */
-#define N_STARS 140
+#define N_STARS 520 /* scattered + the Milky Way band */
+#define N_CLOUDS 5
+#define N_SHELLS 46
+#define N_DUNE 70  /* marram grass blades framing the foreground corners */
 #define FW 220 /* foam lace grid */
 #define FH 22
 #define TW 192 /* per-column crest tables */
@@ -81,6 +87,10 @@ typedef struct {
 	int32_t llab[(LXN + 1) * LZN];
 	float lu[(LXN + 1) * LZN], lv[(LXN + 1) * LZN], lsx[(LXN + 1) * LZN], lsy[(LXN + 1) * LZN], lal[(LXN + 1) * LZN];
 	float lx[FH][FW + 1], ly[FH][FW + 1], lf[FH][FW + 1]; /* foam lace scratch */
+	float cl_x[N_CLOUDS], cl_y[N_CLOUDS], cl_w[N_CLOUDS], cl_s[N_CLOUDS];
+	float sh_x[N_SHELLS], sh_z[N_SHELLS], sh_a[N_SHELLS], sh_k[N_SHELLS];
+	float du_x[N_DUNE], du_h[N_DUNE], du_p[N_DUNE];
+	float mw_a, mw_b, wind_t, log_x, log_z, log_a;
 } st_t;
 
 static void *create(uint32_t seed)
@@ -226,11 +236,42 @@ static void init_scene(st_t *st, const us_ctx *ctx)
 	us_rng *r = &st->rng;
 	for (int i = 0; i < MAX_WAVES; i++)
 		st->wv[i].state = DONE;
+	/* stars: a third scattered, the rest crowded into a Milky Way band slanting across the sky */
+	st->mw_a = us_randr(r, -0.35f, 0.35f);
+	st->mw_b = us_randr(r, 0.35f, 0.65f);
 	for (int i = 0; i < N_STARS; i++) {
 		st->star_x[i] = us_rand(r);
-		st->star_y[i] = us_rand(r);
+		if (i % 3 == 0)
+			st->star_y[i] = us_rand(r);
+		else {
+			float g = (us_rand(r) + us_rand(r) + us_rand(r) - 1.5f) * 0.22f; /* ~gaussian across the band */
+			st->star_y[i] = us_clampf(st->mw_b + st->mw_a * (st->star_x[i] - 0.5f) + g, 0.0f, 1.0f);
+		}
 		st->star_p[i] = us_rand(r) * 30.0f;
 	}
+	for (int i = 0; i < N_CLOUDS; i++) {
+		st->cl_x[i] = (i + us_rand(r) * 0.6f) / N_CLOUDS * 1.3f - 0.15f;
+		st->cl_y[i] = us_randr(r, 0.08f, HOR - 0.08f);
+		st->cl_w[i] = us_randr(r, 0.12f, 0.3f);
+		st->cl_s[i] = us_rand(r) * 50.0f;
+	}
+	for (int i = 0; i < N_SHELLS; i++) {
+		st->sh_x[i] = us_rand(r);
+		st->sh_z[i] = us_rand(r);
+		st->sh_a[i] = us_rand(r) * US_PI;
+		st->sh_k[i] = us_rand(r);
+	}
+	for (int i = 0; i < N_DUNE; i++) {
+		/* two clumps: bottom-left and bottom-right corners */
+		float side = (i & 1) ? 1.0f : 0.0f;
+		float o = powf(us_rand(r), 1.6f) * 0.24f;
+		st->du_x[i] = side ? 1.0f - o : o;
+		st->du_h[i] = us_randr(r, 0.35f, 1.0f) * (1.0f - 1.6f * o);
+		st->du_p[i] = us_rand(r) * 20.0f;
+	}
+	st->log_x = us_randr(r, 0.3f, 0.7f);
+	st->log_z = us_randr(r, 0.66f, 0.8f);
+	st->log_a = us_randr(r, -0.25f, 0.25f);
 	st->tide_s = 1.15f - 0.4f * ctx->w->water_level;
 	for (int k = 0; k <= TW; k++)
 		st->shore_n[k] = us_noise2((float)k / TW * 3.0f, 7.7f);
@@ -343,13 +384,28 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 
 	/* ---- sky: stars, moon or sun, a few cloud streaks ---- */
 	if (night > 0.02f) {
-		int ns = (int)(N_STARS * (0.4f + 0.6f * dens));
+		int ns = (int)(N_STARS * (0.4f + 0.6f * dens) * (ctx->crisp ? 0.5f : 1.0f));
 		for (int i = 0; i < ns; i++) {
 			float sy = 0.02f + st->star_y[i] * (HOR - 0.05f);
 			float tw = 0.5f + 0.5f * sinf(t * (0.7f + st->star_p[i] * 0.05f) + st->star_p[i]);
-			float v = night * (0.1f + 0.3f * tw * tw) * (0.4f + 0.6f * hash1(st->star_p[i]));
-			us_point(c, st->star_x[i] * A, sy, ctx->crisp ? 0.0016f : 0.001f, v, US_MAT_LIGHT);
+			float hb = hash1(st->star_p[i]);
+			int band = i % 3 != 0;
+			/* the band is dust: many faint pinpricks; a few scattered stars are bright and twinkle */
+			float v = night * (band ? (0.1f + 0.16f * hb) * (0.7f + 0.3f * tw) : (0.12f + 0.4f * tw * tw) * (0.4f + 0.6f * hb));
+			/* haze near the horizon swallows the faintest */
+			v *= us_smooth(HOR - 0.005f, HOR - 0.07f, sy);
+			if (band && !ctx->crisp) /* dust: a single pixel each (hundreds of them) */
+				us_put(c, (int)(st->star_x[i] * A * c->s), (int)(sy * c->s), v * 1.3f, (i & 4) ? US_MAT_WATER : US_MAT_LIGHT);
+			else
+				us_point(c, st->star_x[i] * A, sy, ctx->crisp ? 0.0016f : 0.001f + 0.0006f * hb, v, US_MAT_LIGHT);
 		}
+	}
+	/* horizon haze: faint strata where the sky meets the sea */
+	for (int k = 0; k < 5; k++) {
+		float y = HOR - 0.006f - 0.011f * k * (1.0f + 0.3f * k);
+		float v = (0.08f - 0.014f * k) * (0.5f + 0.5f * night + 0.6f * day);
+		float x0 = (0.03f * k + 0.05f * us_noise2(k * 1.7f, t * 0.01f)) * A;
+		us_line(c, x0, y, A - x0 * 0.7f, y, 0.001f, v, US_MAT_WATER);
 	}
 	float body_x = -1, body_v = 0;
 	{
@@ -363,6 +419,11 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 			float mr = 0.034f;
 			float mv = night * (0.75f + 0.25f * illum);
 			us_ring(c, mx, my, mr, 0.001f, 0.14f * night, US_MAT_LIGHT); /* earthshine */
+			/* a soft halo in the thin high haze */
+			if (!ctx->crisp) {
+				us_ring(c, mx, my, mr * 2.6f, 0.0012f, 0.07f * mv, US_MAT_LIGHT);
+				us_ring(c, mx, my, mr * 4.2f, 0.0012f, 0.04f * mv, US_MAT_WATER);
+			}
 			float cphi = cosf(lp * US_TAU);
 			int waxing = lp < 0.5f;
 			if (ctx->crisp) {
@@ -409,37 +470,169 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 			if (sv > body_v)
 				body_x = sx, body_v = sv * 0.9f;
 		}
-		for (int k = 0; k < 4; k++) {
-			float cy = 0.06f + 0.06f * k + 0.01f * us_noise2(k * 3.1f, t * 0.01f);
-			float cx = fmodf(0.3f * k + t * (0.004f + 0.006f * w->wind) + 10.0f, 1.4f) - 0.2f;
-			float len = 0.15f + 0.1f * hash1(k + 0.3f);
-			float v = 0.04f + 0.1f * day + 0.08f * body_v;
-			us_line(c, cx * A, cy, (cx + len) * A, cy + 0.002f, 0.001f, v, US_MAT_WATER); /* clouds: water vapour */
-			us_line(c, (cx + 0.05f) * A, cy + 0.007f, (cx + len * 0.7f) * A, cy + 0.008f, 0.001f, v * 0.6f, US_MAT_WATER);
+		/* clouds: slow banks of cumulus drifting with the wind, flat-bottomed, their tops a row of billows;
+		 * the side toward the moon (sun) is lit, engraved hatching shades the rest */
+		st->wind_t += dt * (0.3f + 1.5f * st->hi_env + 0.5f * w->wind);
+		int ncl = 2 + (int)(dens * (N_CLOUDS - 2) + 0.5f);
+		for (int k = 0; k < ncl; k++) {
+			float cxf = fmodf(st->cl_x[k] + t * (0.0035f + 0.006f * w->wind) + 10.0f, 1.5f) - 0.25f;
+			float cw = st->cl_w[k] * A, x0 = cxf * A, yb = st->cl_y[k];
+			int nb = 3 + (int)(st->cl_w[k] * 14.0f);
+			float lv = 0.1f + 0.1f * day + 0.1f * body_v;
+			float lit_dir = body_x >= 0 ? (body_x > x0 + cw * 0.5f ? 1.0f : -1.0f) : 0.0f;
+			/* billows: overlapping circles along the top; the outline is their upper envelope */
+			float bc[24], br[24];
+			if (nb > 24)
+				nb = 24;
+			for (int q = 0; q < nb; q++) {
+				float f = (q + 0.5f) / nb;
+				br[q] = cw / nb * (0.9f + 0.6f * hash1(st->cl_s[k] + q * 0.71f)) * (0.7f + 0.6f * sinf(US_PI * f));
+				bc[q] = x0 + cw * f;
+			}
+#define NE 56
+			float ex[NE + 1], ey[NE + 1];
+			for (int e = 0; e <= NE; e++) {
+				float x = x0 + cw * e / NE, top = yb;
+				for (int q = 0; q < nb; q++) {
+					float dx = x - bc[q];
+					if (fabsf(dx) < br[q]) {
+						float fq = (q + 0.5f) / nb;
+						float yy = yb - sqrtf(br[q] * br[q] - dx * dx) * (0.6f + 0.9f * sinf(US_PI * fq)) + br[q] * 0.15f;
+						if (yy < top)
+							top = yy;
+					}
+				}
+				ex[e] = x;
+				ey[e] = fminf(top, yb);
+			}
+			if (ctx->crisp) {
+				/* filled per pixel column under the envelope, a lit rim on top, dithered thin at the base */
+				int p0 = (int)(x0 * c->s), p1 = (int)((x0 + cw) * c->s);
+				for (int px = p0 < 0 ? 0 : p0; px <= p1 && px < c->w; px++) {
+					float fe = ((px + 0.5f) / c->s - x0) / cw * NE;
+					int e = (int)us_clampf(fe, 0, NE - 1);
+					float top = us_lerp(ey[e], ey[e + 1], us_clampf(fe - e, 0, 1));
+					int y0 = (int)(top * c->s), y1 = (int)(yb * c->s);
+					for (int py = y0 < 0 ? 0 : y0; py <= y1 && py < c->h; py++) {
+						int rim = py == y0;
+						/* soft pixel-art body: solid under the rim, then a checker dither */
+						if (!rim && py > y0 + 1 && ((px + py) & 1))
+							continue;
+						us_put(c, px, py, rim ? 0.36f + 0.2f * body_v : 0.14f + 0.05f * day, US_MAT_WATER);
+					}
+				}
+			} else {
+				for (int e = 0; e < NE; e++) {
+					float side = lit_dir * ((ex[e] + ex[e + 1]) * 0.5f - (x0 + cw * 0.5f)) / (cw * 0.5f);
+					float v = lv * (1.0f + 1.4f * us_sat(side));
+					wu_line(c, ex[e], ey[e], ex[e + 1], ey[e + 1], v, side > 0.5f && body_v > 0.3f ? US_MAT_LIGHT : US_MAT_WATER);
+				}
+				wu_line(c, x0 + cw * 0.04f, yb, x0 + cw * 0.96f, yb, lv * 0.6f, US_MAT_WATER);
+				/* shading: horizontal strokes inside, following the billows down */
+				for (int h = 1; h <= 4; h++) {
+					float px = 0, py = 0;
+					int on = 0;
+					for (int e = 0; e <= NE; e += 2) {
+						float yy = yb - (yb - ey[e]) * h / 5.0f;
+						if (on && yb - ey[e] > 0.01f)
+							wu_line(c, px, py, ex[e], yy, lv * 0.35f, US_MAT_WATER);
+						px = ex[e];
+						py = yy;
+						on = yb - ey[e] > 0.01f;
+					}
+				}
+			}
 		}
 	}
 
+#undef NE
 	/* ---- sand: ripple dashes ---- */
 	{
-		int rows = 12 + (int)(dens * 10);
+		/* ripple marks: long wavy ridges across the beach, parallel to the water, breaking up and rejoining;
+		 * moonlight catches the crests */
+		int rows = ctx->crisp ? 9 + (int)(dens * 6) : 16 + (int)(dens * 14);
+		const int NR = ctx->crisp ? 32 : 64;
 		for (int k = 0; k < rows; k++) {
 			float f = (k + 0.5f) / rows;
-			float z = st->tide_s * powf(0.5f / st->tide_s, f) * 0.97f;
+			float z = st->tide_s * powf(0.56f / st->tide_s, f) * 0.97f;
 			float y = proj_y(z);
 			if (y > 1.02f)
 				continue;
 			float scale = KP / z;
-			int nd = 14 + (int)(dens * 16);
-			for (int i = 0; i < nd; i++) {
-				float xf = (i + hash1(k * 3.7f + i * 0.91f)) / nd;
+			float px = 0, py = 0, pv = 0;
+			for (int i = 0; i <= NR; i++) {
+				float xf = (float)i / NR;
 				float X = (xf - 0.5f) * A / scale;
-				float s = us_noise2(X * 0.8f + 11.0f, z * 3.0f);
-				if (s < 0.05f)
-					continue;
-				float len = 0.03f * scale * (0.6f + s);
-				float wob = 0.004f * scale * us_noise2(X * 2.0f, z * 5.0f);
-				us_line(c, xf * A - len, y + wob, xf * A + len, y - wob, ctx->crisp ? 0.002f : 0.001f,
-					0.08f + 0.12f * s + 0.05f * day, US_MAT_EARTH);
+				float s = us_noise2(X * 0.7f + 11.0f, z * 4.0f + k * 0.37f);
+				float x = xf * A, yy = y + 0.006f * scale * us_noise2(X * 1.6f, z * 5.0f + k);
+				float shine = body_x >= 0 ? body_v * expf(-((x - body_x) * (x - body_x)) / (0.09f * A * A)) : 0.0f;
+				float v = us_smooth(-0.15f, 0.35f, s) * (0.14f + 0.12f * s + 0.05f * day + 0.15f * shine) * (0.6f + 0.4f * scale);
+				if (i > 0 && (v > 0.03f || pv > 0.03f)) {
+					if (ctx->crisp) {
+						if (v > 0.1f)
+							us_line(c, px, py, x, yy, 0.001f, v + 0.1f, US_MAT_EARTH);
+					} else
+						wu_line(c, px, py, x, yy, 0.5f * (v + pv), shine > 0.35f && s > 0.3f ? US_MAT_LIGHT : US_MAT_EARTH);
+				}
+				px = x, py = yy, pv = v;
+			}
+		}
+		/* shells and pebbles, sized by distance */
+		int nsh = (int)(N_SHELLS * (0.4f + 0.6f * dens));
+		float zfar = st->tide_s * 0.9f, znear = 0.56f;
+		for (int i = 0; i < nsh; i++) {
+			float z = znear + (zfar - znear) * st->sh_z[i];
+			float x = st->sh_x[i] * A, y = proj_y(z);
+			if (y > 1.01f)
+				continue;
+			float sc = KP / z;
+			float rr = (0.0025f + 0.004f * st->sh_k[i]) * sc;
+			int shell = st->sh_k[i] > 0.55f;
+			uint8_t m = shell ? US_MAT_ACCENT : US_MAT_EARTH;
+			float v = (shell ? 0.4f : 0.28f) + 0.15f * day;
+			if (ctx->crisp) {
+				us_point(c, x, y, 0.0012f + rr * 0.5f, v, m);
+				continue;
+			}
+			float ca = cosf(st->sh_a[i]), sa = sinf(st->sh_a[i]);
+			float pts[2 * 11];
+			for (int k = 0; k <= 10; k++) {
+				float a = US_TAU * k / 10.0f;
+				float ex = cosf(a) * rr * (shell ? 1.0f : 1.3f), ey = sinf(a) * rr * 0.45f * (shell ? 1.0f - 0.25f * cosf(a) : 1.0f);
+				pts[2 * k] = x + ex * ca - ey * sa * 0.4f;
+				pts[2 * k + 1] = y + ex * sa * 0.3f + ey;
+			}
+			for (int k = 0; k < 10; k++)
+				wu_line(c, pts[2 * k], pts[2 * k + 1], pts[2 * k + 2], pts[2 * k + 3], v, m);
+			if (shell) /* ribs fanning from the hinge */
+				for (int k = -1; k <= 1; k++)
+					wu_line(c, x - rr * ca * 0.8f, y, x + rr * cosf(st->sh_a[i] + k * 0.5f) * 0.7f, y - rr * 0.3f + k * rr * 0.12f, v * 0.6f, m);
+		}
+		/* a driftwood log stranded above the tideline */
+		{
+			float z = st->log_z, sc = KP / z;
+			float L = 0.42f * sc, th = 0.016f * sc;
+			float cx = st->log_x * A, cy = proj_y(z);
+			if (cy < 1.0f) {
+				float ca = cosf(st->log_a), sa = sinf(st->log_a) * 0.3f;
+				float ax = cx - ca * L * 0.5f, ay = cy - sa * L * 0.5f, bx = cx + ca * L * 0.5f, by = cy + sa * L * 0.5f;
+				float v = 0.36f + 0.12f * day;
+				if (ctx->crisp) {
+					us_line(c, ax, ay, bx, by, th * 1.6f, v * 0.8f, US_MAT_EARTH);
+				} else {
+					for (int k = -2; k <= 2; k++) { /* grain */
+						float o = k * th * 0.45f;
+						float s0 = 0.04f * (k & 1), s1 = 1.0f - 0.05f * ((k + 2) & 1);
+						wu_line(c, us_lerp(ax, bx, s0), us_lerp(ay, by, s0) + o, us_lerp(ax, bx, s1), us_lerp(ay, by, s1) + o,
+							k == -2 || k == 2 ? v : v * 0.45f, US_MAT_EARTH);
+					}
+					/* the root end */
+					for (int k = 0; k < 4; k++) {
+						float ra = US_PI + (k - 1.5f) * 0.55f;
+						wu_line(c, ax, ay, ax + cosf(ra) * th * 2.2f, ay + sinf(ra) * th * 1.6f, v * 0.8f, US_MAT_EARTH);
+					}
+					us_ring(c, bx, by, th * 0.9f, 0.001f, v, US_MAT_EARTH);
+				}
 			}
 		}
 	}
@@ -458,7 +651,7 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 			/* rows evenly spaced on screen (a ridge plot), from the shoreline up to just below the horizon */
 			float ys = proj_y(zs0), ye = HOR + 0.006f;
 			float z = KP / (us_lerp(ys, ye, f) - HOR);
-			float base = (0.22f + 0.16f * day) * (1.0f - 0.75f * f * f);
+			float base = (0.27f + 0.16f * day) * (1.0f - 0.7f * f * f);
 			float px = 0, py = 0;
 			int pvis = 0;
 			for (int i = 0; i <= ns; i++) {
@@ -803,7 +996,7 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 				}
 				/* foam lies in rafts: a smooth density field; as the lace dries the rafts shrink to islands */
 				float fd = 0.5f + 0.5f * us_noise2(st->lu[id[0]] * 0.12f + L->seed, st->lv[id[0]] * 0.22f);
-				float edge = fd - (0.84f - 0.5f * al);
+				float edge = fd - (0.93f - 0.38f * al * (0.55f + 0.45f * foam_k));
 				if (edge <= 0)
 					continue;
 				float v = vbase * (0.35f + 0.65f * al) * us_smooth(0.0f, 0.12f, edge);
@@ -916,6 +1109,33 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 		}
 		us_point(c, s->x, s->y, ctx->crisp ? 0.0016f : 0.001f, 0.8f * us_sat(s->life * 2.0f), US_MAT_WATER);
 		i++;
+	}
+
+	/* ---- marram grass on the dunes framing the foreground corners, combed by the wind (highs) ---- */
+	{
+		int nd = (int)(N_DUNE * (0.5f + 0.5f * dens));
+		float wnd = 0.15f + 0.6f * st->hi_env + 0.3f * w->wind;
+		for (int i = 0; i < nd; i++) {
+			float x = st->du_x[i] * A, H = 0.2f * st->du_h[i];
+			if (H < 0.03f)
+				continue;
+			float gust = us_noise2(x * 2.5f - st->wind_t * 0.6f, st->du_p[i]);
+			float bend = (0.25f + 0.5f * wnd) * (0.6f + 0.6f * gust) * ((i & 2) ? 1.0f : 0.8f);
+			float lean = (st->du_x[i] < 0.5f ? 0.15f : -0.15f) + 0.1f * sinf(st->du_p[i]);
+			float pts[2 * 7];
+			for (int k = 0; k <= 6; k++) {
+				float f = k / 6.0f;
+				pts[2 * k] = x + (lean + bend) * H * f * f;
+				pts[2 * k + 1] = 1.01f - H * f * (1.0f - 0.25f * bend * f);
+			}
+			float v = 0.3f + 0.25f * st->du_h[i];
+			uint8_t m = (i % 5 == 0) ? US_MAT_STEM : US_MAT_LEAF;
+			if (ctx->crisp)
+				us_polyline(c, pts, 7, 0.001f, v, m);
+			else
+				for (int k = 0; k < 6; k++)
+					wu_line(c, pts[2 * k], pts[2 * k + 1], pts[2 * k + 2], pts[2 * k + 3], v * (1.0f - 0.25f * k / 6.0f), m);
+		}
 	}
 }
 
