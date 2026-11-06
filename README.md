@@ -75,7 +75,19 @@ Each Understory source draws on its own worker thread; OBS's video thread only u
 frames, so a busy moment in a scene never stalls your stream. Ink draws at 0.67× the output size by
 default (a 1080p source draws at ~720p and upscales smoothly); raise **Ink resolution** for finer lines.
 
-## Install (macOS, Apple Silicon, OBS 32)
+Ready-made downloads for macOS and Windows are on the
+[Releases page](https://github.com/om-i-god/understory/releases/latest).
+
+## Install (macOS, Apple Silicon, macOS 13+, OBS 32)
+
+From a release: unzip `understory-macos-arm64.zip` and move `understory.plugin` into
+`~/Library/Application Support/obs-studio/plugins/`. The plugin isn't notarized, so clear the download flag once:
+
+```sh
+xattr -dr com.apple.quarantine ~/Library/Application\ Support/obs-studio/plugins/understory.plugin
+```
+
+Or build it from source:
 
 ```sh
 sh tools/install.sh        # fetches headers, builds, copies understory.plugin into
@@ -86,8 +98,8 @@ Restart OBS, then **Sources → + → Understory (living nature)**.
 
 ## Install (Windows x64, OBS 32)
 
-Download `understory-windows-x64.zip` from the latest
-[build](https://github.com/om-i-god/understory/actions/workflows/build.yml) (or a release), unzip it, then in
+Download `understory-windows-x64.zip` from the
+[latest release](https://github.com/om-i-god/understory/releases/latest), unzip it, then in
 an administrator PowerShell in that folder:
 
 ```powershell
