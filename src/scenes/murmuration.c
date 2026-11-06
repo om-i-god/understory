@@ -8,22 +8,28 @@
  * (falcon) and visibly re-form. A smaller satellite sheet splits away now and then and merges back.
  *   centroid (melody brightness) -> where the flock wanders (left .. right) and how high it rides
  *   mid                          -> how fast the sheet yaws and twists (the flock banks and wheels)
- *   swell                        -> how long the ribbon stretches across the sky
- *   level                        -> compaction: loud music squeezes the sheet into tight dense folds
- *   kicks / beats                -> agitation waves: dark bands of banking birds race along the ribbon
+ *   swell                        -> how long the ribbon stretches across the sky; the afterglow fans up
+ *   level                        -> the light: louder = a bigger, broader, brighter flock, a warmer afterglow
+ *                                   and brighter lit clouds; quiet = a dim, slim, calm ribbon
+ *   kick                         -> the hawk-strike flinch: the whole flock snaps in toward its heart, rebounds
+ *                                   and settles (a damped heartbeat, ~0.2 s), brightening; a ring of squeezed
+ *                                   birds races out along the ribbon; sometimes a dark banking band follows
+ *   snare / clap                 -> the ribbon tears open at one place, a burst of birds peels off the torn
+ *                                   edge and swings back over the next second, and the sheet banks hard;
+ *                                   a starling is startled off the wire and the wire thrums
+ *   hats                         -> wing glints: a fresh scatter of bright cross-strokes along the flock's thin
+ *                                   edges each tick, and a handful of glitter on the sun's path on the mere
  *   big transients               -> a falcon stoops through: a flash-expansion hole, a split, then re-forming
  *   silence                      -> the flock funnels down and pours into the reeds to roost, a trickle cycling
- *   kick pulse                   -> a ring of squeezed, brightened birds runs out from the middle of the sheet
- *   high / air (hats)            -> wingbeats quicken into a shimmer; sitters on the wires flick their wings;
+ *   high / air                   -> wind in the reeds and branches (smoothed, as weather); sitters flick wings;
  *                                   air scatters sparkles on the mere
  *   bass                         -> the sheet draws in on itself (narrower, shorter, denser)
  *   sub                          -> slow swells roll across the mere and waver the flock's reflection
  *   lowmid                       -> the church window glows (an organ somewhere inside)
  *   width                        -> the flock splits into two lobes
- *   swell                        -> the afterglow fans up the sky, the lit cloud streaks lengthen
- *   sharp onsets                 -> a starling is startled off the wire to join the flock; the wire thrums
- * Context: a pylon line with sagging wires and perched starlings, a hedgerow and church on the horizon,
- *          a mere below it that holds a broken reflection of the flock.
+ * Context: a dusk sky (a soft rose afterglow, first stars overhead, lens-shaped cloud banks engraved in fine
+ *          strokes with sun-lit undersides), a pylon line with sagging wires and perched starlings, a hedgerow
+ *          and church on the horizon, a mere below it that holds a broken reflection of the flock.
  * World: reads flock (bird count at open, slowly followed), pollen + insects (food => more birds), season,
  *        daylight, wind; writes flock (lively music with food around draws birds in).
  */
@@ -49,6 +55,8 @@
 #define NPERCH 18 /* starlings sitting out the show on the wires */
 #define NGLINT 24 /* sparkles on the mere */
 #define NHEDGE 384 /* hedgerow profile samples across the width */
+#define NSTAR 60   /* first stars, high up */
+#define NBANK 7    /* cloud banks lit from below by the low sun */
 
 /* pylon line: x as a fraction of width, height (normalized); receding, so each is smaller */
 static const float PYL_X[NPYL] = {-0.06f, 0.33f, 0.585f, 0.765f};
@@ -126,6 +134,13 @@ typedef struct {
 	float thr[NPYL - 1], thr_ph[NPYL - 1];
 	float glint_ph[NGLINT], glint_f[NGLINT];
 	float hedge[NHEDGE]; /* hedgerow height above the horizon (0 = none) */
+	/* drums: kick = the flock flinches inward (a hawk-strike contraction); snare = the ribbon tears open at
+	 * one place and a burst of birds peels off; hats = wing glints flicker along the edges */
+	float wind_s, kq, kb, k_age, k_amp, sn_env, sn_age, sn_u, hat_env, light_s;
+	uint32_t frame_n;
+	uint32_t hat_seed;
+	float hx_col[257]; /* sky glow: horizontal sun factor, sampled across the width */
+	float star_x[NSTAR], star_y[NSTAR], star_b[NSTAR];
 } st_t;
 
 static void *create(uint32_t seed)
@@ -155,7 +170,9 @@ static inline void splat(us_canvas *c, float x, float y, float v, uint8_t m)
 static inline void dash(us_canvas *c, float x, float y, float hx, float hy, float L, float v, uint8_t m)
 {
 	if (c->crisp) {
-		us_put(c, (int)(x * c->s), (int)(y * c->s), v, m);
+		/* coverage split over the 2x2 pixels under the bird: the palette's shade steps still keep it crisp,
+		 * but a bird gliding across a pixel edge fades over instead of hopping */
+		splat(c, x, y, v, m);
 		if (L * c->s > 1.3f)
 			us_put(c, (int)((x - hx * L) * c->s), (int)((y - hy * L) * c->s), v * 0.6f, m);
 		return;
@@ -349,6 +366,58 @@ static void tint_weight(const float *acc, float *wgt, int gw, int gh, int rad, f
 		wgt[i] = us_sat(wgt[i]);
 }
 
+/* The afterglow behind everything: a soft vertical gradient that warms toward the horizon, with a gold halo
+ * around the low sun. amp = the band's brightness at the horizon, samp = the halo's. Written straight into
+ * the canvas (MAX blend, drawn first); Pixel looks get an ordered-dither gradient instead of flat bands. */
+static void sky_glow(st_t *st, us_canvas *c, float A, float sun_x, float sun_y, float amp, float samp)
+{
+	static const uint8_t bayer[16] = {0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5};
+	int py0 = (int)(0.1f * c->s), py1 = (int)(HORIZON * c->s);
+	if (py0 < 0)
+		py0 = 0;
+	if (py1 > c->h)
+		py1 = c->h;
+	amp = us_clampf(amp, 0.0f, 0.4f);
+	samp = us_clampf(samp, 0.0f, 0.4f);
+	for (int i = 0; i <= 256; i++) {
+		float d = ((float)i / 256.0f * A - sun_x) / 0.5f;
+		st->hx_col[i] = expf(-d * d);
+	}
+	float gsc = 256.0f / (float)(c->w > 0 ? c->w : 1);
+	for (int py = py0; py < py1; py++) {
+		float y = (py + 0.5f) / c->s, hgt = HORIZON - y;
+		float base = amp * expf(-hgt / 0.13f);
+		float dy = (y - sun_y) / 0.1f;
+		float halo = samp * expf(-dy * dy);
+		if (base + halo < 0.004f)
+			continue;
+		uint8_t *ink = c->ink + (size_t)py * c->w, *mat = c->mat + (size_t)py * c->w;
+		const uint8_t *bz = bayer + (py & 3) * 4;
+		for (int px = 0; px < c->w; px++) {
+			float gx = px * gsc;
+			int gi = (int)gx;
+			if (gi > 255)
+				gi = 255;
+			float hv = halo * us_lerp(st->hx_col[gi], st->hx_col[gi + 1], gx - gi);
+			float v = base + hv, th = (bz[px & 3] + 0.5f) * (1.0f / 16.0f);
+			/* hue by ordered dither over wide zones, so no edge shows: rose low down fading into the night
+			 * colour above (Pixel: gold too, in proportion to the sun's share; in Ink a faint gold reads muddy) */
+			uint8_t m = c->crisp && hv > (base + hv) * (0.35f + 0.6f * th) ? US_MAT_LIGHT
+					: (hgt < 0.06f + 0.22f * th ? US_MAT_BLOOM : US_MAT_BG);
+			int iv;
+			if (c->crisp) {
+				if (v * 4.0f <= th)
+					continue;
+				iv = 70; /* one quiet palette step, dithered: density carries the gradient */
+			} else {
+				iv = (int)(v * 255.0f + 0.5f);
+			}
+			if (iv > ink[px])
+				ink[px] = (uint8_t)iv, mat[px] = m;
+		}
+	}
+}
+
 /* ---- context: bare trees -------------------------------------------- */
 
 static void grow_tree(st_t *st, tree_t *t, float x, float y, float ang, float len, float w, int depth)
@@ -378,9 +447,11 @@ static void place_bird(st_t *st, bird_t *b)
 {
 	us_rng *r = &st->rng;
 	b->u = us_rand(r);
-	float v = us_randr(r, -1.0f, 1.0f);
-	/* slightly crowded edges: real flocks have sharp boundaries */
-	b->v = (v < 0 ? -1.0f : 1.0f) * powf(fabsf(v), 0.8f);
+	/* a dense core that thins out to wispy edges; a few stragglers trail beyond the sheet's rim */
+	if (us_rand(r) < 0.88f)
+		b->v = us_clampf(us_randn(r) * 0.42f, -1.0f, 1.0f);
+	else
+		b->v = (us_rand(r) < 0.5f ? -1.0f : 1.0f) * us_randr(r, 0.8f, 1.45f);
 	b->n = us_clampf(us_randn(r) * 0.5f, -1.0f, 1.0f);
 	b->hash = us_rand(r);
 	b->ph = us_rand(r) * US_TAU;
@@ -444,6 +515,13 @@ static void init_extras(st_t *st)
 		st->glint_f[k] = us_randr(r, 0.35f, 0.9f);
 	}
 	st->kp_t = 10.0f;
+	for (int k = 0; k < NSTAR; k++) {
+		st->star_x[k] = us_rand(r);
+		float f = us_rand(r);
+		st->star_y[k] = 0.02f + 0.36f * f * f; /* thicker overhead, fading out into the afterglow */
+		float b = us_rand(r);
+		st->star_b[k] = 0.12f + 0.4f * b * b * b;
+	}
 	/* a hedgerow in two stretches either side of the low sun, a gap for the churchyard */
 	const float hx0[2] = {0.37f, 0.745f}, hx1[2] = {0.6f, 0.875f};
 	for (int i = 0; i < NHEDGE; i++) {
@@ -477,12 +555,13 @@ static void build_sheet(st_t *st, int k, const us_ctx *ctx, float tx, float ty, 
 	float len_t = (k ? 0.22f + 0.3f * st->sat_frac : 0.5f) + (k ? 0.1f : 0.4f) * st->swell_s + 0.14f * us_noise2(t * 0.031f, 1.3f + ks);
 	/* bass draws the flock in on itself: a narrower, shorter, denser sheet */
 	float bs = st->bass_s;
-	float wid_t = (0.035f + 0.07f * us_sat(0.5f + 0.7f * us_noise2(t * 0.043f, 4.1f + ks))) * (1.0f - 0.25f * lvl) *
-			      (1.0f - 0.4f * bs) + 0.015f;
-	len_t *= 1.0f - 0.18f * bs;
-	s->len = us_approach(s->len, len_t * (1.0f - 0.3f * roost), 2.5f, dt);
+	/* loud music opens the flock out: a bigger, broader sheet; quiet draws it into a slim ribbon */
+	float wid_t = (0.03f + 0.07f * us_sat(0.5f + 0.7f * us_noise2(t * 0.043f, 4.1f + ks))) * (0.7f + 0.65f * lvl) *
+			      (1.0f - 0.3f * bs) + 0.012f;
+	len_t *= (0.85f + 0.3f * lvl) * (1.0f - 0.12f * bs);
+	s->len = us_approach(s->len, len_t * (1.0f - 0.3f * roost), 2.0f, dt);
 	s->wid = us_approach(s->wid, wid_t, 0.9f, dt);
-	s->thick = us_approach(s->thick, 0.008f * (1.0f - 0.5f * lvl) + 0.003f, 1.0f, dt);
+	s->thick = us_approach(s->thick, 0.006f + 0.006f * lvl, 1.0f, dt);
 
 	/* wheeling: yaw spins the sheet through edge-on; twist rolls along its length */
 	if (us_noise2(t * 0.013f, 9.0f + ks) < -0.25f)
@@ -746,7 +825,9 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 	st->quiet = us_approach(st->quiet, q_in, q_in > st->quiet ? 3.0f : 0.8f, rdt);
 	st->roost = us_approach(st->roost, us_smooth(0.25f, 0.85f, st->quiet), 2.5f, rdt);
 	float roost = st->roost;
-	float wind = us_sat(0.2f * w->wind + 0.7f * a->high + 0.3f * a->air);
+	/* wind in the reeds and branches follows the top end, but as weather: smoothed over most of a second */
+	st->wind_s = us_approach(st->wind_s, us_sat(0.2f * w->wind + 0.7f * a->high + 0.3f * a->air), 0.9f, rdt);
+	float wind = st->wind_s;
 	st->wind_t += dt * (0.15f + 0.6f * wind);
 	st->twist_kick = 0;
 	{
@@ -760,12 +841,42 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 		st->lm_s = us_approach(st->lm_s, us_sat(a->lowmid), 0.5f, rdt);
 		st->wid_s = us_approach(st->wid_s, us_sat(a->width), 1.5f, rdt);
 		/* kick: a density pulse rings out from the heart of the flock */
-		if (a->beat && a->kick > 0.3f && st->kp_t > 0.25f) {
+		if (a->kick_hit && st->kp_t > 0.2f) {
 			st->kp_t = 0;
 			st->kp_amp = 0.55f + 0.45f * us_sat(a->kick);
 		}
 		st->kp_t += dt;
-		st->kp_amp *= expf(-dt * 1.8f);
+		st->kp_amp *= expf(-dt * 3.0f);
+		/* kick: the whole flock flinches in on itself, then breathes back out */
+		if (a->kick_hit)
+			st->k_age = 0, st->k_amp = 0.65f + 0.35f * us_sat(a->kick);
+		else
+			st->k_age += rdt;
+		if (st->k_age > 1.0f)
+			st->k_age = 1.0f, st->k_amp = 0;
+		/* a damped heartbeat: in hard on the hit, a rebound outward, settled within a quarter second */
+		st->kq = st->k_amp * expf(-st->k_age / 0.12f) * cosf(US_TAU * 6.0f * st->k_age);
+		st->kb = st->k_amp * expf(-st->k_age / 0.12f);
+		/* snare: the ribbon tears open somewhere along its length */
+		if (a->snare_hit) {
+			st->sn_age = 0;
+			st->sn_u = us_randr(r, 0.22f, 0.78f);
+			st->twist_kick += 0.6f * (us_rand(r) < 0.5f ? 1.0f : -1.0f); /* and the sheet banks hard */
+		}
+		else
+			st->sn_age = fminf(st->sn_age + rdt, 2.0f);
+		/* the tear opens over two frames and heals over a few hundred ms */
+		st->sn_env = st->sn_age >= 2.0f ? 0.0f : us_sat(0.45f + st->sn_age / 0.05f) * expf(-st->sn_age / 0.25f);
+		/* hats: a fresh scatter of wing glints for every tick */
+		if (a->hat_hit) {
+			st->hat_env = 1.0f;
+			st->hat_seed = us_rng_u32(r);
+		}
+		st->hat_env *= expf(-rdt / 0.07f);
+		st->frame_n++;
+		/* loudness lights the sky: quick to brighten, slow to fade */
+		float l_in = us_sat(a->level);
+		st->light_s = us_approach(st->light_s, l_in, l_in > st->light_s ? 0.35f : 1.2f, rdt);
 	}
 
 	/* ---- world ---- */
@@ -784,7 +895,7 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 	st->wcool -= rdt;
 	int want_wave = 0;
 	float wstr = 0;
-	if (a->beat && a->kick > 0.25f && st->wcool <= 0 && us_rand(r) < 0.75f)
+	if (a->kick_hit && st->wcool <= 0 && us_rand(r) < 0.6f)
 		want_wave = 1, wstr = 0.55f + 0.45f * us_sat(a->kick);
 	else if (us_rand(r) < dt * 0.2f) /* restless even in quiet */
 		want_wave = 1, wstr = 0.45f;
@@ -891,33 +1002,59 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 	float glow = 0.55f + 0.45f * (1.0f - fabsf(day - 0.35f) * 1.6f);
 	float sun_x = A * 0.66f, sun_y = HORIZON - 0.045f - 0.1f * day, sun_r = 0.07f;
 	{
-		int nl = ctx->crisp ? 17 : 42;
-		float swl = st->swell_s, rose = 0.22f + 0.4f * swl;
-		for (int k = 0; k < nl; k++) {
-			float f = (k + 0.5f) / nl; /* 0 at the horizon .. 1 at the top */
-			float y = HORIZON - 0.012f - 0.7f * powf(f, 1.55f);
-			float lo = powf(1.0f - f, 1.7f);
-			float v = (ctx->crisp ? 0.4f + 0.2f * powf(1.0f - f, 1.5f) : 0.06f + 0.15f * lo) * glow;
-			/* the phrase-scale swell fans the afterglow up the sky */
-			v *= 1.0f + 0.6f * swl * lo;
-			/* broken into drifting cloud runs; the runs nearest the sun burn brighter */
-			float x = 0, step = 0.03f;
-			float drift = t * 0.006f * (1.0f + 0.3f * f);
-			while (x < A) {
-				float x0 = x;
-				while (x < A && us_noise2(x * 2.3f - drift * 12.0f, k * 0.61f) > -0.35f + 0.25f * (1.0f - f))
-					x += step;
-				if (x > x0 + 0.001f) {
-					float xc = 0.5f * (x0 + x), d = (xc - sun_x) / 0.5f;
-					float near = expf(-d * d) * lo;
-					uint8_t m = US_MAT_BG;
-					if (!ctx->crisp)
-						/* cool night blue overhead, a rose afterglow low down, gold around the sun */
-						m = near > 0.45f - 0.2f * swl ? US_MAT_LIGHT : (f < rose ? US_MAT_BLOOM : US_MAT_WATER);
-					float vv = v * (1.0f + (ctx->crisp ? 0.3f : 0.7f) * near);
-					hline_sky(c, x0, x, y, vv, m, st->mcov, f > 0.55f ? 3 : (f > 0.2f ? 2 : 1));
+		float swl = st->swell_s, L = st->light_s;
+		/* the afterglow: a soft gradient, rose low down and gold around the sun; loudness lights it up */
+		sky_glow(st, c, A, sun_x, sun_y, (0.018f + 0.05f * L + 0.015f * swl) * glow, (0.02f + 0.07f * L + 0.015f * swl) * glow);
+		/* first stars overhead, paling as the afterglow brightens */
+		{
+			float sv = (1.0f - 0.5f * day) * (1.0f - 0.45f * L);
+			for (int k = 0; k < NSTAR; k++) {
+				float v = st->star_b[k] * sv * (0.8f + 0.2f * sinf(t * (0.5f + st->star_b[k]) + k * 2.1f));
+				float x = st->star_x[k] * A, y = st->star_y[k];
+				if (ctx->crisp) {
+					if (st->star_b[k] > 0.3f)
+						us_put(c, (int)(x * c->s), (int)(y * c->s), 0.3f + 0.4f * v, US_MAT_LIGHT);
+				} else {
+					splat(c, x, y, v, US_MAT_LIGHT);
 				}
-				x += step;
+			}
+		}
+		/* cloud banks: stacked fine strokes in lens shapes, their undersides lit by the low sun */
+		for (int b = 0; b < NBANK; b++) {
+			float fb = (b + 0.5f) / NBANK; /* 0 = low .. 1 = high */
+			float yb = HORIZON - 0.045f - 0.52f * powf(fb, 1.25f) + 0.012f * us_noise2(b * 3.1f, t * 0.01f);
+			int nl = ctx->crisp ? 3 : 6 + (b & 1);
+			float sp = ctx->crisp ? 2.0f / c->s : 0.0036f + 0.0022f * fb;
+			float drift = t * (0.0035f + 0.003f * fb) * ((b & 1) ? 1.0f : -0.7f);
+			float fq = 1.4f + 1.6f * fb, lo = 1.0f - fb;
+			/* how much of this bank there is breathes slowly */
+			float cover = 0.12f * us_noise2(t * 0.013f, b * 5.3f + 1.0f) + 0.08f * fb - 0.05f;
+			float step = ctx->crisp ? 1.0f / c->s : 0.012f;
+			for (int j = 0; j < nl; j++) {
+				float fj = (float)j / (nl - 1); /* 0 = top stroke .. 1 = the lit underside */
+				float y = yb + (j - 0.5f * (nl - 1)) * sp;
+				float thr = cover + 0.32f * fabsf(fj - 0.55f) * 2.0f;
+				float shear = (fj - 0.5f) * 0.05f;
+				float base = ctx->crisp ? 0.24f + 0.22f * fj * fj
+						      : (0.1f + 0.12f * lo) * (0.45f + 0.9f * fj * fj) * (0.75f + 0.6f * L) * glow;
+				float x = 0;
+				while (x < A) {
+					float x0 = x;
+					while (x < A && us_noise2((x + shear) * fq - drift * 12.0f, b * 1.37f + 5.0f) > thr)
+						x += step;
+					if (x > x0 + 0.004f) {
+						float xc = 0.5f * (x0 + x), d = (xc - sun_x) / 0.45f;
+						float near = expf(-d * d) * (0.35f + 0.65f * lo) * (0.3f + 0.7f * fj);
+						uint8_t m;
+						if (ctx->crisp)
+							m = near > 0.4f && fj > 0.5f ? US_MAT_LIGHT : US_MAT_BG;
+						else
+							m = near > 0.42f ? US_MAT_LIGHT : (fj > 0.6f && fb < 0.65f ? US_MAT_BLOOM : US_MAT_WATER);
+						float vv = base * (1.0f + (ctx->crisp ? 0.4f : 1.6f) * near);
+						hline_sky(c, x0, x, y, vv, m, st->mcov, ctx->crisp && fj < 0.5f ? 2 : 1);
+					}
+					x += step;
+				}
 			}
 		}
 		/* low sun / moon: an engraved disc of horizontal strokes, cloud bars drifting across it */
@@ -1054,7 +1191,7 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 		}
 		/* sharp transients (claps, snares, hats on a hit) startle one off the wire to join the flock */
 		st->pcool -= rdt;
-		if (a->beat && a->onset > 0.5f && st->pcool <= 0 && roost < 0.3f && us_rand(r) < 0.55f) {
+		if (a->snare_hit && st->pcool <= 0 && roost < 0.3f && us_rand(r) < 0.55f) {
 			for (int tries = 0; tries < 6; tries++) {
 				int k = (int)(us_rand(r) * NPERCH);
 				if (k < NPERCH && st->pstate[k] == 0) {
@@ -1163,6 +1300,20 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 			float gl = 0.002f + 0.003f * sb;
 			hline(c, gx - gl, gx + gl, gy, gv, US_MAT_LIGHT);
 		}
+		/* hats: each tick throws a fresh handful of glitter across the sun's path on the water */
+		if (st->hat_env > 0.1f) {
+			int ng = ctx->crisp ? 10 : 18;
+			for (int k = 0; k < ng; k++) {
+				uint32_t h = hash2((uint32_t)k + 977u, st->hat_seed);
+				float u1 = (h & 0xffffu) / 65536.0f, u2 = ((h >> 16) & 0xffu) / 255.0f, u3 = (h >> 24) / 255.0f;
+				float gy = HORIZON + 0.003f + 0.07f * u2 * u2;
+				/* clustered under the sun, widening toward the viewer */
+				float gx = sun_x + (u1 - 0.5f) * (0.25f + 1.2f * u2);
+				float gv = st->hat_env * (0.45f + 0.4f * u3) * (1.0f - 0.4f * u2);
+				float gl = 0.003f + 0.008f * u3 * (0.5f + u2);
+				wline(c, gx - gl, gy, gx + gl, gy, gv, US_MAT_LIGHT);
+			}
+		}
 	}
 
 	/* ---- trees ---- */
@@ -1186,8 +1337,16 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 	/* ---- birds ---- */
 	c->blend = US_BLEND_ADD;
 	memset(st->mg, 0, sizeof(st->mg));
-	float bv = ctx->crisp ? 0.28f : 0.75f;
+	/* louder = a brighter flock (quiet keeps it a dim, calm ribbon, never gone) */
+	float bv = (ctx->crisp ? 0.28f : 0.75f) * (0.62f + 0.6f * st->lvl_s);
 	float idt = dt > 1e-4f ? 1.0f / dt : 0.0f;
+	/* kick flinch: every bird is drawn pulled toward the heart of its sheet, then released */
+	float sq = (ctx->crisp ? 0.36f : 0.2f) * st->kq * (1.0f - roost);
+	/* Pixel birds hop whole pixels as they fly, so the drums answer a touch harder there to read as clearly */
+	float tear = ctx->crisp ? 1.8f : 1.0f;
+	float fcx[NSHEET], fcy[NSHEET];
+	for (int k = 0; k < NSHEET; k++)
+		fcx[k] = st->sh[k].sx[NS / 2], fcy[k] = st->sh[k].sy[NS / 2];
 	for (int i = 0; i < MAXB; i++) {
 		bird_t *b = &st->b[i];
 		int want = i < N;
@@ -1249,7 +1408,7 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 		/* kick pulse: a ring of squeezed, brightened birds running out from the middle of the sheet */
 		float kp = 0;
 		if (st->kp_amp > 0.02f && b->sheet == 0) {
-			float d = (st->kp_t * 0.8f - fabsf(b->u - 0.5f)) * (1.0f / 0.085f);
+			float d = (st->kp_t * 2.4f - fabsf(b->u - 0.5f)) * (1.0f / 0.08f);
 			if (d > -2.5f && d < 2.5f)
 				kp = st->kp_amp * expf(-d * d);
 		}
@@ -1260,6 +1419,20 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 		float tx = px + wxx * vv * wsc + nxx * nn * s->thick;
 		float ty = py + wyy * vv * wsc + nyy * nn * s->thick;
 		float tz = pz + us_lerp(s->wz[i0], s->wz[i1], tu) * vv * wsc;
+		/* snare: the sheet tears open around sn_u, the two halves thrown apart across its width */
+		float seg = 0;
+		if (st->sn_env > 0.02f && b->sheet == 0 && !b->leaving) {
+			float du = (b->u - st->sn_u) * (1.0f / 0.13f);
+			if (du > -3.0f && du < 3.0f)
+				seg = expf(-du * du);
+			if (a->snare_hit && seg > 0.2f && roost < 0.5f) {
+				/* the torn edge peels off as a burst of birds and swings back over the next second */
+				float sg = vv < 0 ? -1.0f : 1.0f, kk = seg * (0.5f + 0.5f * b->fq);
+				b->vx += (sg * wxx * 0.9f + 0.25f * (b->hash - 0.5f)) * kk;
+				b->vy += (sg * wyy * 0.9f - 0.15f) * kk;
+				b->panic = fmaxf(b->panic, 0.75f * seg);
+			}
+		}
 
 		float tvx = 0, tvy = 0;
 		if (b->ptx > -1e8f && !wrapped) {
@@ -1339,12 +1512,22 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 			continue; /* dropped into the reeds */
 		float endf = b->leaving ? 1.0f : us_smooth(0.0f, 0.05f, b->u) * us_smooth(1.0f, 0.95f, b->u);
 		float depth = us_clampf(1.0f + 1.2f * b->z, 0.55f, 1.4f);
-		/* hats: wingbeats quicken and deepen into a shimmer that runs through the flock */
-		float hs = st->hi_s;
-		float wb = sinf(t * (13.0f + 9.0f * hs) * b->fq + b->ph);
-		float flick = 1.0f - (0.2f + 0.45f * hs) * (0.5f - 0.5f * wb);
-		float v = bv * depth * us_sat(b->life) * endf * (1.0f + 1.6f * band + 0.6f * b->panic + 1.5f * kp) * flick;
-		float L = 0.003f * depth * (1.0f + 0.9f * band + 0.6f * b->panic + 0.5f * kp) * (1.0f + 0.35f * hs * wb);
+		/* the stragglers beyond the rim are fainter */
+		float av = fabsf(vv), wisp = 1.0f - 0.55f * us_smooth(0.85f, 1.5f, av);
+		float v = bv * depth * us_sat(b->life) * endf * wisp *
+			  (1.0f + 1.6f * band + 0.6f * b->panic + 1.5f * kp + 1.2f * st->kb + 1.4f * st->sn_env * seg);
+		float L = 0.003f * depth * (1.0f + 0.9f * band + 0.6f * b->panic + 0.5f * kp + 0.5f * st->kb);
+		/* where it is drawn: the kick's flinch toward the sheet's heart, the snare's tear across its width */
+		float dxp = b->x, dyp = b->y;
+		if (sq > 0.001f && !b->leaving) {
+			dxp += (fcx[b->sheet] - b->x) * sq;
+			dyp += (fcy[b->sheet] - b->y) * sq;
+		}
+		if (seg > 0.01f) {
+			float sg = vv < 0 ? -1.0f : 1.0f, op = st->sn_env * seg * (1.0f * wsc + 0.03f) * (1.0f - roost) * tear;
+			dxp += sg * wxx * op;
+			dyp += sg * wyy * op;
+		}
 		/* true motion blur instead of trail ghosts: a fast bird stretches along its path, dimmer per sample */
 		float mb = spd * dt * 1.1f;
 		if (mb > L) {
@@ -1353,13 +1536,29 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 			v *= 0.55f + 0.45f * L / mb;
 			L = mb;
 		}
-		dash(c, b->x, b->y, b->hx, b->hy, L, v, US_MAT_ACCENT);
+		dash(c, dxp, dyp, b->hx, b->hy, L, v, US_MAT_ACCENT);
+		/* hats: wing glints, a fresh scatter for each tick, gathered toward the sheet's thin edges */
+		if (st->hat_env > 0.08f) {
+			float edge = us_smooth(0.35f, 1.0f, av);
+			uint32_t h = hash2((uint32_t)i, st->hat_seed + st->frame_n * 0x9e37u);
+			if ((float)(h & 1023u) < 1024.0f * (0.07f + 0.45f * edge) * us_sat(st->hat_env * 1.4f)) {
+				float g = st->hat_env * us_sat(b->life) * endf * (0.7f + 0.3f * depth);
+				if (c->crisp) {
+					int gx = (int)(dxp * c->s), gy = (int)(dyp * c->s);
+					us_put(c, gx - 1, gy - 1, 0.5f * g, US_MAT_LIGHT);
+					us_put(c, gx + 1, gy - 1, 0.5f * g, US_MAT_LIGHT);
+				} else {
+					/* both wings up: a bright stroke across the heading */
+					dash(c, dxp, dyp, -b->hy, b->hx, 0.008f * depth, g, US_MAT_ACCENT);
+				}
+			}
+		}
 		/* a broken, wavering reflection in the mere (every third bird is plenty) */
 		if ((i % 3) == 0) {
-			float ry = HORIZON + 0.005f + (HORIZON - b->y) * 0.17f;
+			float ry = HORIZON + 0.005f + (HORIZON - dyp) * 0.17f;
 			if (ry < HORIZON + 0.095f) {
-				float rx = b->x + (0.002f + 0.005f * st->sub_s) * sinf(ry * 700.0f + t * 2.3f);
-				float rv = v * 0.32f * (0.6f + 0.4f * sinf(ry * 1900.0f - t * 3.0f));
+				float rx = dxp + (0.002f + 0.005f * st->sub_s) * sinf(ry * 700.0f + t * 2.3f);
+				float rv = v * 0.42f * (0.6f + 0.4f * sinf(ry * 1900.0f - t * 3.0f));
 				if (c->crisp)
 					us_put(c, (int)(rx * c->s), (int)(ry * c->s), rv, US_MAT_WATER);
 				else
@@ -1367,7 +1566,7 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 			}
 		}
 		{
-			int gx = (int)(b->x / A * MGX), gy = (int)(b->y * MGY);
+			int gx = (int)(dxp / A * MGX), gy = (int)(dyp * MGY);
 			if (gx >= 0 && gy >= 0 && gx < MGX && gy < MGY)
 				st->mg[gy * MGX + gx] += v;
 		}
