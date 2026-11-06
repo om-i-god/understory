@@ -1,16 +1,20 @@
 /* Understory scene: Storm Front — a storm rolls in over open farmland; the drums are its weather.
  *
- * The sky is built from billows: three cloud decks at different depths (a low, heavy near deck at the
- * top of the frame, a middle bank below it, a far bank sitting on the horizon) plus a towering
- * thunderhead on the horizon. Each deck is rows of overlapping puffs grouped into masses by a drifting
- * noise field; the decks drift at parallax speeds, nearer ones faster.
- *   Ink:   each billow is drawn as the part of its outline not hidden by billows in front of it, so the
- *          masses read as rounded, overlapping cauliflower forms; the near deck's underside is the
- *          brightest edge, the folds above it fade into the deck.
- *   Crisp: billows are painted back to front, each shaded (lit crown, dark underside, dithered), so the
- *          masses read as solid volumes with lit edges.
- * Under the decks: rain curtains hang from the heaviest masses; far fields with a telegraph line, birds
- * on the wire and a farmhouse; a near ridge with a lone oak in the foreground.
+ * The focal point is a cumulonimbus in the middle distance: a tower of cauliflower billows on a flat dark
+ * base, an overshooting dome, an anvil sheared flat at its top streaming downwind with mammatus under it,
+ * and a flanking line of younger towers stepping down on the upwind side. Around it, at parallax depths:
+ * ragged scud overhead at the top corners, a middle bank of flat-based cumulus masses, a pale far bank on
+ * the horizon. Billows vary in size and stretch (wider than tall), and slots are skipped, so no deck
+ * reads as a row of circles.
+ *   All looks share one sky raster: the front billow per cell, the light reaching it through the clouds
+ *   above (a slanted shadow sweep: lit crowns, dark bases), a bright gap of sky under the storm on the
+ *   horizon, rain shafts hanging from the bases (a precipitation core under the thunderhead), and the far
+ *   fields as a patchwork in perspective with a wet sheen near the horizon.
+ *   Ink:   that raster is a soft wash under the line work: each mass's silhouette, its inner folds only
+ *          along their crowns, flat bases as one line, each edge as bright as the light that reaches it.
+ *   Crisp: the raster painted with ordered dither: slate bodies, lilac/cream only where light catches.
+ * Below: far fields with hedgerows, a telegraph line, birds on the wire and a farmhouse; a near ridge with
+ * a lone oak in the foreground.
  *
  * Reactivity (each drum has its own answer):
  *   kick  = the decks heave: every mass drops and swells for a moment (heavier masses more), the rain
@@ -41,7 +45,11 @@
 #define NBIN 48
 #define BINCAP 128
 #define MAX_SPLASH 64
-#define MASK_MAX (640 * 400) /* crisp canvases up to this size paint front to back, each pixel once */
+#define MASK_MAX (640 * 400) /* sky raster cells (crisp canvases up to this size get one cell per pixel) */
+#define GROW 1024   /* max sky-raster width */
+#define NOPUFF 0xFFFF
+#define GPAINT 4096 /* widest Ink canvas the sky wash covers */
+#define TOWER_B 0.6f /* the thunderhead's flat base */
 #define NPOLE 6    /* telegraph poles on the far fields */
 #define NBIRD 9    /* birds on the wire */
 #define HZ 0.835f  /* mean horizon height */
@@ -76,6 +84,8 @@ typedef struct {
 	float v;       /* base brightness */
 	float m;       /* mass weight 0..1 (how heavy the cloud is here) */
 	float h;       /* height above its deck's base row (0 = underside row) */
+	float ax;      /* horizontal stretch (>= 1: flatter billows) */
+	float top, cut; /* the billow only exists between these y (flat cloud bases, the anvil's sheared top) */
 	uint8_t layer;
 	uint8_t occ;   /* 1: a core, painted but never outlined */
 } puff_t;
@@ -88,6 +98,7 @@ typedef struct {
 	us_rng rng;
 	float col[GW];   /* cloud weight at the deck's underside per column (rain source) */
 	float colb[GW];  /* y of the underside per column (0 = clear sky) */
+	float rw[GW], rb[GW]; /* rain-shaft weight + base per column (smoothed) */
 
 	/* the billows, back to front, binned by x for occlusion tests */
 	puff_t puff[MAX_PUFF];
@@ -95,6 +106,7 @@ typedef struct {
 	uint16_t bin[NBIN][BINCAP];
 	int nbin[NBIN];
 	float bin_k; /* bins per normalized x */
+	float ax_next; /* stretch given to the billows being generated */
 
 	/* lightning */
 	seg_t seg[MAX_SEG];
@@ -117,7 +129,17 @@ typedef struct {
 	int ndrop;
 	splash_t splash[MAX_SPLASH];
 	int nsplash;
-	uint8_t mask[MASK_MAX];
+	/* the sky raster: front billow per cell, light reaching it, its value + material */
+	uint16_t gid[MASK_MAX];
+	float gT[MASK_MAX];
+	float gv[MASK_MAX];
+	uint8_t gm[MASK_MAX];
+	float srow[2][GROW];
+	float ghz[GROW];
+	uint16_t pxa[GPAINT], pxb[GPAINT];
+	float ptx[GPAINT];
+	int gw, gh;
+	float gs;
 
 	tree_t tree[MAX_TREES];
 	int ntrees;
@@ -131,12 +153,12 @@ typedef struct {
 	float rain;    /* smoothed rain intensity */
 	float build;   /* slowly eased loudness: how built-up the storm is */
 	float lum;     /* faster eased loudness: light inside the storm, rain */
+	float lumf;    /* quicker still: how much light the clouds hold right now */
 	float deck_y;  /* the near deck's base */
 	int inited;
 
 	/* the distant thunderhead on the horizon */
 	float tower_u, tower_h, tower_rise;
-	float anv_x0, anv_x1, anv_y, anv_th; /* the anvil's extent (ink draws it as strokes) */
 	int anv_n;                           /* its billows come first in the list */
 
 	/* audio envelopes, each with its own meaning */
@@ -412,7 +434,7 @@ static uint32_t hash3(int a, int b, int c)
 
 static float hf(uint32_t h, int k) { return ((h >> (k * 10)) & 1023) / 1023.0f; }
 
-static void add_puff(st_t *s, float x, float y, float r, float v, float m, float hgt, int layer, int occ)
+static void add_puff(st_t *s, float x, float y, float r, float v, float m, float hgt, int layer, int occ, float top, float cut)
 {
 	if (s->npuff >= MAX_PUFF || !(r > 0.004f))
 		return;
@@ -422,9 +444,12 @@ static void add_puff(st_t *s, float x, float y, float r, float v, float m, float
 	p->x = x;
 	p->y = y;
 	p->r = r;
+	p->ax = s->ax_next > 0.0f ? s->ax_next : 1.0f;
 	p->v = v;
 	p->m = m;
 	p->h = hgt;
+	p->top = top;
+	p->cut = cut;
 	p->layer = (uint8_t)layer;
 	p->occ = (uint8_t)occ;
 }
@@ -438,111 +463,167 @@ typedef struct {
 	float fq;      /* mass-field frequency (masses are ~1/fq wide) */
 	float heave;   /* how far a kick drops it */
 	int nrows;
+	int flat;      /* 1: flat bases (clouds seen side-on); 0: a hanging, lumpy underside (overhead scud) */
+	float avoid;   /* thin the deck out around the thunderhead */
+	float ax;      /* billow stretch: wider than tall */
 } deck_t;
 
 /* one deck: rows of billows (the top rows only where the mass is thick, so thin masses dome over),
- * grouped into masses by a drifting noise field; coverage thins it into separate clouds */
-static void gen_deck(st_t *s, float A, int L, const deck_t *d, float cov, float t)
+ * grouped into masses by a drifting noise field; coverage thins it into separate clouds. Billow sizes vary
+ * a lot (small tight heads beside big rolling ones) and slots are skipped, so no row reads as a pattern. */
+static void gen_deck(st_t *s, float A, int L, const deck_t *d, float cov)
 {
 	float off = s->drift * d->speed;
 	int n0 = (int)floorf((off - 0.25f) / d->sp) - 1, n1 = (int)ceilf((off + A + 0.25f) / d->sp) + 1;
 	float thr = 0.62f - 0.95f * cov;
+	float tcx = s->tower_u * A;
+	s->ax_next = d->ax;
 	for (int row = d->nrows - 1; row >= 0; row--)
 		for (int n = n0; n <= n1; n++) {
 			uint32_t h = hash3(n, row, L);
-			float xw = (n + 0.5f * (row & 1) + 0.85f * (hf(h, 0) - 0.5f)) * d->sp;
+			if (row > 0 && hf(h, 2) < 0.22f)
+				continue;
+			float xw = (n + 0.5f * (row & 1) + 0.9f * (hf(h, 0) - 0.5f)) * d->sp;
+			float x = xw - off;
 			float mf = 0.5f + 0.5f * us_fbm2(xw * d->fq + L * 13.1f, s->evo * 0.3f + L * 3.3f, 2);
+			if (d->avoid > 0.0f)
+				mf -= d->avoid * (1.0f - us_smooth(0.12f, 0.55f, fabsf(x - tcx)));
 			float tr = thr + 0.07f * row;
 			float m = us_smooth(tr, tr + 0.28f, mf);
 			if (m < 0.06f)
 				continue;
-			float x = xw - off;
 			float boil = 1.0f + 0.12f * us_noise2(n * 0.71f + row * 3.1f, s->evo * 1.5f + L);
-			/* masses differ in scale: big rolling heads beside smaller, tighter ones */
 			float sc = 0.7f + 0.55f * (0.5f + 0.5f * us_noise2(xw * d->fq * 0.55f + 4.0f * L, 9.3f + s->evo * 0.1f));
-			float r = d->r0 * sc * (0.55f + 0.6f * hf(h, 1)) * (0.4f + 0.6f * m) * boil;
-			if (L == LY_NEAR)
+			float hz = hf(h, 1);
+			float r = d->r0 * sc * (0.45f + 1.0f * hz * hz) * (0.4f + 0.6f * m) * boil;
+			if (row > 0 && hf(h, 0) > 0.82f)
+				r *= 1.45f; /* now and then a big rolling head */
+			if (L == LY_NEAR || L == LY_MID)
 				r *= 1.0f + 0.16f * s->heave * m; /* the kick: masses swell as they drop */
-			if (x < -r || x > A + r)
+			if (x < -r * d->ax || x > A + r * d->ax)
 				continue;
-			float y = d->yb - 0.8f * r - row * d->rowstep * sc + d->rowstep * 0.9f * (hf(h, 2) - 0.5f);
-			y += d->heave * s->heave * (0.4f + 0.6f * m); /* heavier masses heave further */
-			if (row == 0) {
-				/* heavy masses hang lower; the base rolls */
-				y += (0.05f * m + 0.03f * us_noise2(xw * d->fq * 1.7f, 2.1f + L)) * d->rowstep / 0.06f;
-				if (L == LY_NEAR) /* sub: the base sags, heavier where the bass sits */
-					y += s->rumble * 0.014f * (0.5f + 0.5f * sinf(xw * 4.0f + 1.3f)); /* sags where the bass sits */
+			float drop = d->heave * s->heave * (0.4f + 0.6f * m); /* heavier masses heave further */
+			float y, cut = 9.0f;
+			if (d->flat) {
+				/* side-on cumulus: heads pile up from a flat, slightly ragged base */
+				y = d->yb - 0.5f * r - row * d->rowstep * sc + d->rowstep * 0.8f * (hf(h, 2) - 0.5f) + drop;
+				/* each mass has its own base height; thin edges ride higher */
+				cut = d->yb + drop + d->rowstep * (1.0f * us_noise2(xw * d->fq * 1.3f, L * 1.7f + 5.0f) - 0.25f * (1.0f - m)) +
+				      0.003f * us_noise2(xw * 9.0f, L * 1.7f);
+			} else {
+				y = d->yb - 0.8f * r - row * d->rowstep * sc + d->rowstep * 0.9f * (hf(h, 2) - 0.5f) + drop;
+				if (row == 0) {
+					/* heavy masses hang lower; the base rolls */
+					y += (0.05f * m + 0.03f * us_noise2(xw * d->fq * 1.7f, 2.1f + L)) * d->rowstep / 0.06f;
+					y += s->rumble * 0.014f * (0.5f + 0.5f * sinf(xw * 4.0f + 1.3f)); /* sub: sags where the bass sits */
+				}
 			}
-			add_puff(s, x, y, r, d->v0 * (0.75f + 0.25f * m), m, (float)row, L, 0);
+			add_puff(s, x, y, r, d->v0 * (0.75f + 0.25f * m), m, (float)row, L, 0, -9.0f, cut);
 		}
 }
 
-/* the distant thunderhead: tiers of billows stacked into a tower (broad foot, a waist, a swelling crown)
- * and, as the storm matures, an anvil streaming downwind (left) from its top. Outline-less cores fill
- * each tier, so in Ink only the tower's lumpy silhouette shows. Its billows boil slowly. */
+/* the thunderhead: the scene's focal point. A cumulonimbus rising from a flat, dark base: tiers of billows
+ * (broad foot, a waist, a swelling cauliflower crown), an overshooting dome, and an anvil sheared flat at its
+ * top, streaming downwind (left) with mammatus pouches hanging under it. Outline-less cores fill each tier. */
 static void gen_tower(st_t *s, float A)
 {
+	static const float prof[9] = {1.0f, 0.93f, 0.88f, 0.87f, 0.9f, 0.95f, 1.0f, 0.97f, 0.72f};
 	float H = s->tower_h, cx = s->tower_u * A;
-	float W = 0.05f + 0.015f * s->ch_vis + 0.015f * s->swellv;
-	float anv = 0.35f + 0.65f * us_smooth(0.15f, 0.7f, s->ch_vis + 0.6f * s->swellv);
-	float boil = s->evo * 2.0f + s->tower_rise * 8.0f;
-	float ybase = HZ + 0.01f, ytop = HZ - H;
+	float hv = s->heave;
+	float yB = TOWER_B + 0.006f * hv, yT = yB - H;
+	float W = 0.12f + 0.025f * s->ch_vis + 0.025f * s->swellv + 0.02f * s->build;
+	float anv = 0.3f + 0.7f * us_smooth(0.1f, 0.75f, s->ch_vis + 0.6f * s->swellv + 0.4f * s->build);
+	float boil = s->evo * 4.0f + s->tower_rise * 8.0f; /* the thunderhead boils, even in a lull */
+	float sc = 1.0f + 0.05f * hv;
 	/* the anvil, behind the crown */
-	if (anv > 0.05f) {
-		float x0 = cx + W * (0.9f + 0.6f * anv), x1 = cx - W * (1.4f + 3.4f * anv);
-		float th = 0.02f + 0.025f * anv;
-		s->anv_x0 = x0;
-		s->anv_x1 = x1;
-		s->anv_y = ytop - 0.01f;
-		s->anv_th = th;
+	s->ax_next = 1.8f;
+	{
+		float x0 = cx + W * (0.7f + 0.5f * anv), x1 = cx - W * (1.3f + 2.4f * anv);
+		float th = 0.03f + 0.03f * anv, yA = yT - 0.006f;
 		int n = (int)((x0 - x1) / 0.02f) + 1;
-		if (n > 40)
-			n = 40;
+		if (n > 70)
+			n = 70;
 		for (int k = 0; k < n; k++) {
 			float f = (float)k / (n > 1 ? n - 1 : 1), x = us_lerp(x0, x1, f);
 			uint32_t h = hash3(k, 9, 78);
-			float tk = th * (1.0f - 0.6f * f);
-			float r = (0.012f + 0.01f * hf(h, 1)) * (1.0f - 0.4f * f) * (1.0f + 0.15f * us_noise2(k * 0.7f, boil));
-			add_puff(s, x, ytop - 0.01f + r * 0.9f, r, 0.32f, 0.6f, 9.0f, LY_TOWER, 0);
-			add_puff(s, x + 0.006f, ytop - 0.01f + tk + 0.004f * (hf(h, 2) - 0.5f), r * 0.9f, 0.3f, 0.6f, 9.0f, LY_TOWER, 0);
-			if ((k & 1) == 0)
-				add_puff(s, x, ytop - 0.01f + tk * 0.55f, tk * 0.75f + 0.006f, 0.3f, 0.6f, 9.0f, LY_TOWER, 1);
+			float dc = fabsf(x - cx) / W;
+			float tk = th * (0.3f + 0.7f * expf(-dc / 1.8f));
+			float top = yA + 0.004f * us_noise2(x * 11.0f, boil * 0.2f) + 0.02f * f * f;
+			float cut = top + tk + 0.005f * us_noise2(x * 17.0f, 3.0f + boil * 0.3f);
+			float r = tk * (0.8f + 0.5f * hf(h, 1)) + 0.006f;
+			s->ax_next = 1.8f;
+			add_puff(s, x, top + r * 0.85f, r, 0.58f, 0.5f, 9.0f, LY_TOWER, 0, top, cut);
+			/* mammatus: pouches hanging from the anvil's underside, near the crown */
+			if (hf(h, 0) < 0.55f && dc > 0.6f && dc < 2.6f) {
+				float rm = 0.007f + 0.009f * hf(h, 2);
+				s->ax_next = 1.2f;
+				add_puff(s, x + 0.006f, cut + rm * 0.15f, rm, 0.42f, 0.5f, 9.0f, LY_TOWER, 0, cut - 0.003f, 9.0f);
+			}
 		}
 	}
 	s->anv_n = s->npuff;
+	s->ax_next = 1.05f;
+	/* the overshooting top: a dome punching up through the anvil above the updraft */
+	add_puff(s, cx + 0.2f * W, yT + 0.012f, (0.03f + 0.025f * anv) * sc, 0.62f, 0.8f, 8.0f, LY_TOWER, 0, -9.0f, 9.0f);
+	/* the flanking line: younger cumulus towers stepping down on the upwind side, behind the main tower */
+	s->ax_next = 1.0f;
+	for (int j = 3; j >= 1; j--) {
+		uint32_t hj = hash3(j, 5, 79);
+		float fx = cx + W * (0.75f + 0.62f * j) + 0.02f * (hf(hj, 0) - 0.5f);
+		float fh = H * (0.62f - 0.14f * j) * (0.85f + 0.3f * hf(hj, 1)) * (1.0f + 0.06f * us_noise2(j * 2.3f, boil * 0.1f));
+		float fw = W * (0.5f - 0.08f * j);
+		int nt = 4;
+		for (int k = nt - 1; k >= 0; k--) {
+			float q = (float)k / (nt - 1);
+			float rk = (0.026f + 0.016f * q) * (1.15f - 0.1f * j) * sc;
+			float y = yB - rk * 0.45f - q * (fh - rk * 1.2f);
+			float hw = fw * (1.0f - 0.25f * q * q);
+			int n = 2 + (k < 2);
+			for (int i = 0; i < n; i++) {
+				uint32_t h = hash3(i + 10 * j, k, 80);
+				float f = n > 1 ? (float)i / (n - 1) : 0.5f;
+				float rr = rk * (0.7f + 0.55f * hf(h, 1)) * (1.0f + 0.15f * us_noise2(i + j * 3.0f + k, boil));
+				float x = fx - hw + f * 2.0f * hw + 0.3f * rk * (hf(h, 0) - 0.5f);
+				add_puff(s, x, y + 0.4f * rk * (hf(h, 2) - 0.5f), rr, 0.6f, 0.7f, (float)k, LY_TOWER, 0, -9.0f,
+					 yB + 0.003f * us_noise2(x * 25.0f, 2.0f));
+			}
+		}
+	}
+	s->ax_next = 1.05f;
 	/* tiers, top first (lower tiers sit in front) */
-	enum { NT = 7 };
+	enum { NT = 9 };
 	float cy_[NT], hw_[NT], r_[NT];
 	for (int k = NT - 1; k >= 0; k--) {
 		float q = (float)k / (NT - 1);
-		float hw = W * (0.9f + 0.4f * q * q - 0.3f * us_smooth(0.85f, 1.0f, q));
-		float r = (0.026f + 0.016f * q) * (1.0f + 0.1f * us_noise2(k * 1.7f, boil));
-		float y = ybase - r * 0.6f - q * (H - r * 1.6f);
+		float hw = W * prof[k] * (1.0f + 0.08f * us_noise2(k * 1.3f, boil * 0.15f));
+		float rk = (0.04f + 0.028f * q) * sc;
+		float y = yB - rk * 0.45f - q * (H - rk * 1.4f);
 		cy_[k] = y;
 		hw_[k] = hw;
-		r_[k] = r;
-		int n = (int)(2.0f * hw / (1.15f * r)) + 1;
+		r_[k] = rk;
+		int n = (int)(2.0f * hw / (0.95f * rk)) + 1;
 		if (n < 2)
 			n = 2;
-		if (n > 9)
-			n = 9;
+		if (n > 12)
+			n = 12;
 		for (int j = 0; j < n; j++) {
 			uint32_t h = hash3(j, k, 77);
 			float f = (float)j / (n - 1);
-			float rr = r * (0.8f + 0.4f * hf(h, 1)) * (1.0f + 0.15f * us_noise2(j * 0.9f + k * 3.1f, boil));
-			float x = cx - hw + rr * 0.5f + f * (2.0f * hw - rr) + 0.25f * r * (hf(h, 0) - 0.5f);
-			add_puff(s, x, y + 0.3f * r * (hf(h, 2) - 0.5f), rr, 0.5f, 0.7f, (float)k, LY_TOWER, 0);
+			float rr = rk * (0.6f + 0.7f * hf(h, 1)) * (1.0f + 0.15f * us_noise2(j * 0.9f + k * 3.1f, boil));
+			float x = cx - hw + rr * 0.6f + f * (2.0f * hw - 1.2f * rr) + 0.4f * rk * (hf(h, 0) - 0.5f);
+			float cut = yB + 0.004f * us_noise2(x * 25.0f, 1.0f);
+			add_puff(s, x, y + 0.45f * rk * (hf(h, 2) - 0.5f), rr, 0.62f, 0.8f, (float)k, LY_TOWER, 0, -9.0f, cut);
 		}
 	}
-	/* cores (no outline): hide the inner edges, leave the silhouette */
+	/* cores (no outline): fill each tier so the inside reads as one mass */
 	for (int k = 0; k < NT; k++) {
-		float rc = r_[k] * 0.9f, span = hw_[k] - r_[k] * 0.9f;
+		float rc = r_[k] * 0.75f, span = hw_[k] - r_[k];
 		int n = span > 0.0f ? (int)(2.0f * span / rc) + 1 : 1;
-		if (n > 8)
-			n = 8;
+		if (n > 10)
+			n = 10;
 		for (int j = 0; j < n; j++) {
 			float x = n > 1 ? cx - span + 2.0f * span * j / (n - 1) : cx;
-			add_puff(s, x, cy_[k] + 0.25f * rc, rc, 0.34f, 0.7f, (float)k, LY_TOWER, 1);
+			add_puff(s, x, cy_[k] + 0.3f * rc, rc, 0.6f, 0.8f, (float)k, LY_TOWER, 1, -9.0f, yB);
 		}
 	}
 }
@@ -553,7 +634,7 @@ static void bin_puffs(st_t *s, float A)
 	memset(s->nbin, 0, sizeof(s->nbin));
 	for (int i = 0; i < s->npuff; i++) {
 		const puff_t *p = &s->puff[i];
-		int b0 = (int)floorf((p->x - p->r) * s->bin_k), b1 = (int)floorf((p->x + p->r) * s->bin_k);
+		int b0 = (int)floorf((p->x - p->r * p->ax) * s->bin_k), b1 = (int)floorf((p->x + p->r * p->ax) * s->bin_k);
 		if (b0 < 0)
 			b0 = 0;
 		if (b1 > NBIN - 1)
@@ -564,162 +645,353 @@ static void bin_puffs(st_t *s, float A)
 	}
 }
 
-/* is (x,y) inside any billow drawn after (in front of) billow `from`? (-1: any billow) */
-static int covered(const st_t *s, int from, float x, float y)
+/* is (x,y) inside another billow? front=1: one drawn after (in front of) `from` (-1: any billow);
+ * front=0: any other billow of the same layer (to tell a mass's silhouette from its inner folds).
+ * mg shrinks the billows' flat cuts, so billows sharing a base don't hide each other's base line. */
+static int cover(const st_t *s, int from, float x, float y, float mg, int front)
 {
 	int b = (int)floorf(x * s->bin_k);
 	if (b < 0 || b >= NBIN)
 		return 0;
+	int lay = from >= 0 ? s->puff[from].layer : -1;
 	const uint16_t *bl = s->bin[b];
 	for (int k = s->nbin[b] - 1; k >= 0; k--) { /* indices ascend: walk back from the front */
 		int i = bl[k];
-		if (i <= from)
+		if (front && i <= from)
 			break;
+		if (i == from)
+			continue;
 		const puff_t *p = &s->puff[i];
-		float dx = x - p->x, dy = y - p->y;
+		if (!front && p->layer != lay)
+			continue;
+		if (y < p->top + mg || y > p->cut - mg)
+			continue;
+		float dx = (x - p->x) / p->ax, dy = y - p->y;
 		if (dx * dx + dy * dy < p->r * p->r * 0.96f)
 			return 1;
 	}
 	return 0;
 }
 
-/* Ink: the visible part of each billow's outline. Undersides are the lit edges of the decks; the folds
- * higher up fade back into the deck; the thunderhead's crown catches the light on top. */
-static void draw_puffs_ink(st_t *s, us_canvas *c, float A)
+static float gT_at(const st_t *s, float x, float y)
 {
-	float sl = 0.7f + 0.5f * s->lum; /* louder: more light inside the storm */
-	for (int i = 0; i < s->npuff; i++) {
-		const puff_t *p = &s->puff[i];
-		if (p->occ || (p->layer == LY_NEAR && p->h > 3.5f) || p->h > 8.5f) /* cores; the near deck's high folds are lost in its mass */
-			continue;
-		int N = (int)(p->r * c->s * 0.45f);
-		if (N < 12)
-			N = 12;
-		if (N > 64)
-			N = 64;
-		float lw, rowf;
-		int top_lit = p->layer == LY_TOWER;
-		switch (p->layer) {
-		case LY_NEAR: lw = 0.00145f; rowf = p->h < 0.5f ? 1.0f : 0.62f / (1.0f + 0.35f * p->h); break;
-		case LY_MID: lw = 0.0012f; rowf = p->h < 0.5f ? 1.0f : 0.7f; break;
-		default: lw = 0.001f; rowf = 1.0f; break;
-		}
-		int clip_hz = p->layer <= LY_FAR && p->y + p->r > HZ - 0.03f;
-		float a0 = (float)(i % 7) * 0.9f, lp = (float)(i % 11) * 0.57f;
-		float px = 0, py = 0;
-		int pv = 0;
-		for (int q = 0; q <= N; q++) {
-			float ang = a0 + q * US_TAU / N;
-			float ca = cosf(ang), sa = sinf(ang);
-			float rl = p->r * (1.0f + 0.05f * sinf(3.0f * ang + lp) + 0.03f * sinf(5.0f * ang - 2.0f * lp)); /* billows are lumpy, not round */
-			float x = p->x + ca * rl, y = p->y + sa * rl;
-			/* distant billows: only their crowns, the bases dissolve into the haze */
-			int vis = y > -0.02f && x > -0.02f && x < A + 0.02f && (p->layer != LY_FAR || sa < 0.35f) && !covered(s, i, x, y);
-			if (vis && clip_hz && y > horizon_y(us_sat(x / A)) - 0.002f)
-				vis = 0;
-			if (vis && pv) {
-				float mx = (x + px) * 0.5f, my = (y + py) * 0.5f;
-				/* decks: the underside is the bright edge, the fold over each billow's top fades into the mass */
-				float shade = top_lit ? 0.45f + 0.55f * us_sat(0.3f - sa) : 0.12f + 0.88f * us_sat(0.2f + 1.2f * sa);
-				float L = lit(s, mx, my);
-				float v = p->v * shade * rowf * sl + 0.95f * L * (0.6f + 0.4f * rowf) * (0.4f + 0.6f * shade);
-				if (v > 0.075f) /* the faintest folds are not worth their ink */
-					wline(c, px, py, x, y, lw, us_sat(v), L > 0.35f ? US_MAT_LIGHT : US_MAT_ACCENT);
-			}
-			px = x;
-			py = y;
-			pv = vis;
-		}
-	}
+	int gx = (int)(x * s->gs), gy = (int)(y * s->gs);
+	if (gx < 0) gx = 0;
+	if (gy < 0) gy = 0;
+	if (gx > s->gw - 1) gx = s->gw - 1;
+	if (gy > s->gh - 1) gy = s->gh - 1;
+	return s->gT[(size_t)gy * s->gw + gx];
 }
 
-/* Ink: the anvil as a few long strokes: a flat, sheared top and a ragged underside thinning downwind */
-static void draw_anvil_ink(st_t *s, us_canvas *c, float A)
-{
-	if (s->anv_x0 - s->anv_x1 < 0.02f)
-		return;
-	const int N = 40;
-	for (int e = 0; e < 2; e++) {
-		float px = 0, py = 0;
-		for (int k = 0; k <= N; k++) {
-			float f = (float)k / N, x = us_lerp(s->anv_x0, s->anv_x1, f);
-			float tk = s->anv_th * (1.0f - 0.6f * f);
-			/* top: a gentle, sheared dome; underside: small hanging scallops */
-			float y = e == 0 ? s->anv_y + 0.006f * us_noise2(x * 5.0f, s->evo) - 0.012f * f * (1.0f - f) * 4.0f * 0.5f
-				: s->anv_y + tk + 0.004f * us_noise2(x * 8.0f, s->evo * 1.3f) + 0.006f * (1.0f - f) * fabsf(sinf(x * 60.0f + s->evo));
-			if (k > 0 && x >= 0 && x <= A && !covered(s, s->anv_n - 1, x, y)) {
-				float fade = us_smooth(1.0f, 0.75f, f) * us_smooth(0.0f, 0.08f, f);
-				float L = lit(s, x, y);
-				float v = 0.3f * fade * (0.7f + 0.5f * s->lum) + 0.8f * L;
-				if (v > 0.05f)
-					wline(c, px, py, x, y, 0.001f, us_sat(v), L > 0.35f ? US_MAT_LIGHT : US_MAT_ACCENT);
-			}
-			px = x;
-			py = y;
-		}
-	}
-}
-
-/* Crisp: paint billows back to front, each a shaded volume (lit crown, dark underside, ordered dither) */
 static const uint8_t bayer4[16] = {0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5};
 
-static void draw_puffs_crisp(st_t *s, us_canvas *c, float A)
+/* the far fields: a patchwork of fields in perspective (crops in rows, plough, pasture), a wet sheen
+ * near the horizon where they mirror the bright gap under the storm */
+static float ground_val(float xn, float d, float A, uint8_t *mat, int crisp)
 {
-	float sl = 0.68f + 0.55f * s->lum;
-	int any_light = s->flash > 0.001f || s->sf > 0.003f || s->heat_v > 0.001f || s->glow_a > 0.004f;
-	/* front to back, skipping pixels a nearer billow already painted (same picture as back to front) */
-	int use_mask = (size_t)c->w * c->h <= MASK_MAX;
-	if (use_mask)
-		memset(s->mask, 0, (size_t)c->w * c->h);
-	for (int ii = 0; ii < s->npuff; ii++) {
-		int i = use_mask ? s->npuff - 1 - ii : ii;
+	float Z = 1.0f / (d + 0.006f);
+	float X = (xn - 0.5f * A) * Z;
+	uint32_t h = hash3((int)floorf(X * 0.32f + 1000.0f), (int)floorf(Z * 0.09f), 5);
+	float tone = 0.72f + 0.28f * hf(h, 0);
+	int crop = hf(h, 1) < 0.5f;
+	float rows = crop && !crisp ? 0.5f + 0.5f * sinf(X * 7.0f + hf(h, 2) * 6.0f) : 0.5f;
+	float amp = 0.5f * us_smooth(40.0f, 10.0f, Z);
+	*mat = crop && !crisp ? US_MAT_LEAF : US_MAT_EARTH;
+	return tone * (0.75f + 0.5f * amp * (rows - 0.5f)) + 1.3f * expf(-d / 0.008f);
+}
+
+/* The sky as one raster (canvas resolution when crisp, ~216 rows in Ink): the front billow of each cell,
+ * the light reaching it through the clouds above (a slanted shadow sweep: lit crowns, dark bases), the gap
+ * of bright sky under the storm on the horizon, rain shafts hanging from the bases, and the far fields.
+ * Crisp canvases get it painted with ordered dither; Ink gets it as a soft wash under its line work. */
+static void sky_raster(st_t *s, const us_ctx *ctx, us_canvas *c, float A, float slope)
+{
+	int crisp = c->crisp;
+	int gw, gh;
+	float gs;
+	if (crisp && (size_t)c->w * c->h <= MASK_MAX && c->w <= GROW) {
+		gw = c->w;
+		gh = c->h;
+		gs = c->s;
+	} else {
+		gs = 216.0f;
+		for (;;) {
+			gw = (int)ceilf(A * gs);
+			gh = (int)ceilf(gs);
+			if (gw <= GROW && (size_t)gw * gh <= MASK_MAX)
+				break;
+			gs *= 0.9f;
+		}
+	}
+	s->gw = gw;
+	s->gh = gh;
+	s->gs = gs;
+	float cell = 1.0f / gs;
+	for (int gx = 0; gx < gw; gx++)
+		s->ghz[gx] = horizon_y(us_sat((gx + 0.5f) * cell / A));
+	/* front billow per cell (front to back, first hit wins) */
+	memset(s->gid, 0xFF, (size_t)gw * gh * sizeof(uint16_t));
+	for (int i = s->npuff - 1; i >= 0; i--) {
 		const puff_t *p = &s->puff[i];
-		float rp = p->r * c->s;
-		int px0 = (int)floorf((p->x - p->r) * c->s), px1 = (int)ceilf((p->x + p->r) * c->s);
-		int py0 = (int)floorf((p->y - p->r) * c->s), py1 = (int)ceilf((p->y + p->r) * c->s);
-		if (px0 < 0) px0 = 0;
-		if (py0 < 0) py0 = 0;
-		if (px1 > c->w) px1 = c->w;
-		if (py1 > c->h) py1 = c->h;
-		int clip_hz = p->layer <= LY_FAR && p->y + p->r > HZ - 0.03f;
-		float inv = 1.0f / (rp + 1e-6f);
-		float cxp = p->x * c->s, cyp = p->y * c->s;
-		/* the near deck is darkest (heavy, close); distant billows paler */
-		float body = p->v * sl;
-		int rim = (p->layer >= LY_MID && p->h < 0.5f) || (p->layer == LY_TOWER && p->h > 2.5f);
-		for (int py = py0; py < py1; py++) {
-			float dy = (py + 0.5f - cyp) * inv;
-			if (dy <= -1.0f || dy >= 1.0f)
+		float ylo = fmaxf(p->y - p->r, p->top), yhi = fminf(p->y + p->r, p->cut);
+		int x0 = (int)floorf((p->x - p->r * p->ax) * gs), x1 = (int)ceilf((p->x + p->r * p->ax) * gs);
+		int y0 = (int)floorf(ylo * gs), y1 = (int)ceilf(yhi * gs);
+		if (x0 < 0) x0 = 0;
+		if (y0 < 0) y0 = 0;
+		if (x1 > gw) x1 = gw;
+		if (y1 > gh) y1 = gh;
+		float r2 = p->r * p->r * gs * gs, cx = p->x * gs, cy = p->y * gs;
+		int clip = p->layer == LY_FAR;
+		for (int gy = y0; gy < y1; gy++) {
+			float yc = gy + 0.5f, yn = yc * cell;
+			if (yn < p->top || yn > p->cut)
 				continue;
-			float yn = (py + 0.5f) / c->s;
-			for (int px = px0; px < px1; px++) {
-				float dx = (px + 0.5f - cxp) * inv;
-				float d2 = dx * dx + dy * dy;
-				size_t k = (size_t)py * c->w + px;
-				if (d2 >= 1.0f || (use_mask && s->mask[k]))
+			float dy = yc - cy, q = r2 - dy * dy;
+			if (q <= 0.0f)
+				continue;
+			float hwx = sqrtf(q) * p->ax;
+			int a = (int)ceilf(cx - hwx - 0.5f), b = (int)floorf(cx + hwx - 0.5f);
+			if (a < x0) a = x0;
+			if (b > x1 - 1) b = x1 - 1;
+			uint16_t *row = &s->gid[(size_t)gy * gw];
+			for (int gx = a; gx <= b; gx++) {
+				if (row[gx] != NOPUFF)
 					continue;
-				float xn = (px + 0.5f) / c->s;
-				if (clip_hz && yn > HZ - 0.03f && yn > horizon_y(us_sat(xn / A)))
+				if (clip && yn > s->ghz[gx] - 0.002f)
 					continue;
-				float top = p->occ ? us_sat(0.32f - 0.2f * dy) : us_sat(0.55f - 0.7f * dy - 0.2f * dx); /* cores: nearly flat */
-				float v = body * (0.5f + 0.62f * top);
-				uint8_t m = US_MAT_BG;
-				if (d2 > 0.74f && top > 0.7f && rim) { /* the lit rim of each billow's crown */
-					m = US_MAT_ACCENT;
-					v = 0.12f + 0.3f * p->v * sl;
-				}
-				v += (bayer4[(py & 3) * 4 + (px & 3)] * (1.0f / 16.0f) - 0.47f) * 0.1f;
+				row[gx] = (uint16_t)i;
+			}
+		}
+	}
+	/* light + values, row by row from the top; light comes from the upper right */
+	float kemp = expf(-cell / 0.012f);
+	float *prev = s->srow[0], *cur = s->srow[1];
+	for (int gx = 0; gx < gw; gx++)
+		prev[gx] = 0.0f;
+	float sl = 0.4f + 0.85f * s->lumf;
+	float hv = s->heave;
+	int any_light = s->flash > 0.001f || s->sf > 0.003f || s->heat_v > 0.001f || s->glow_a > 0.004f;
+	float skyflash = 0.3f * s->flash * s->bolt_amp + 0.08f * s->sf + 0.06f * s->heat_v;
+	float tt = (float)ctx->t;
+	float ck = 0.36f; /* Ink: a soft wash, the lines carry the light */
+	for (int gy = 0; gy < gh; gy++) {
+		float yn = (gy + 0.5f) * cell;
+		for (int gx = 0; gx < gw; gx++) {
+			size_t k = (size_t)gy * gw + gx;
+			int id = s->gid[k];
+			float xn = (gx + 0.5f) * cell;
+			float up = 0.35f * prev[gx] + 0.65f * prev[gx + 1 < gw ? gx + 1 : gx];
+			const puff_t *p = id != NOPUFF ? &s->puff[id] : NULL;
+			float S = p ? up + cell * (p->layer == LY_FAR ? 0.4f : p->h > 8.5f ? 0.2f : 1.0f) : up * kemp;
+			cur[gx] = S;
+			float T = expf(-S / 0.12f);
+			s->gT[k] = T;
+			float v;
+			uint8_t m;
+			int dith = 0;
+			float hz = s->ghz[gx];
+			int front_cloud = p && p->layer != LY_FAR;
+			if (p) {
+				float dy = (yn - p->y) / p->r, dx = (xn - p->x) / (p->r * p->ax);
+				float crown = p->occ ? 0.45f : us_sat(0.55f - 0.75f * dy + 0.25f * dx);
+				if (p->layer == LY_NEAR)
+					crown = 0.3f + 0.4f * crown;
+				float basek = p->cut < 5.0f ? us_smooth(p->cut - (p->layer == LY_TOWER ? 0.14f : 0.05f), p->cut, yn) : 0.0f;
+				float lt = (0.22f + 0.78f * T) * (0.74f + 0.36f * crown) * (1.0f - 0.5f * basek) * (p->layer == LY_NEAR ? 0.75f : 1.0f);
+				dith = 1;
+				m = US_MAT_ACCENT;
+				if (crisp) {
+					/* pixel: slate bodies, lilac/cream only where the light catches (dithered edge) */
+					float dth = (bayer4[(gy & 3) * 4 + (gx & 3)] + 0.5f) / 16.0f;
+					v = p->v * sl * (0.18f + 0.95f * lt * lt + 0.1f * lt) * (p->layer == LY_NEAR ? 1.5f : 1.0f);
+					if (lt + 0.25f * dth < (p->h > 8.5f ? 0.74f : 0.84f) || p->layer == LY_NEAR)
+						m = US_MAT_BG;
+				} else
+					v = p->v * sl * lt * ck;
 				if (any_light) {
-					float L = lit(s, xn, yn) * (0.3f + 0.7f * top) * (0.75f + 0.25f * d2); /* lights the billows' crowns + edges: keeps their form */
-					if (L > 0.12f) {
-						v = 0.45f * v + 0.85f * L;
-						m = L > 0.42f ? US_MAT_LIGHT : US_MAT_ACCENT;
+					float L = lit(s, xn, yn);
+					L = L / (1.0f + 1.2f * L) * (0.35f + 0.25f * T + 0.4f * crown); /* lit from within, the billows still show */
+					if (L > 0.04f) {
+						v += (crisp ? 0.85f : 0.7f) * L;
+						if (L > 0.15f)
+							m = L > 0.4f ? US_MAT_LIGHT : US_MAT_ACCENT;
 					}
 				}
-				c->ink[k] = (uint8_t)(us_sat(v) * 255.0f);
-				c->mat[k] = m;
-				if (use_mask)
-					s->mask[k] = 1;
+			} else if (yn < hz) {
+				/* sky: dark overhead, opening to a bright gap under the storm on the horizon */
+				float glow = expf(-(hz - yn) / 0.03f);
+				v = (crisp ? 0.1f : 0.025f + 0.06f * yn) + (crisp ? 0.3f : 0.17f) * glow * (0.5f + 0.9f * s->lumf) + skyflash * (0.5f + 0.5f * glow);
+				m = US_MAT_BG;
+				dith = glow > 0.05f;
+				if (glow > 0.3f)
+					m = !crisp || v > 0.3f ? US_MAT_ACCENT : US_MAT_BG;
+			} else {
+				float d = yn - hz;
+				float L = s->flash * s->bolt_amp, dxh = xn - s->hit_x;
+				v = ground_val(xn, d, A, &m, crisp) * (crisp ? 0.22f : 0.1f) * (0.7f + 0.3f * T) +
+				    L * 0.36f * (0.3f + 0.7f * expf(-dxh * dxh / 0.2f)) + 0.06f * s->heat_v;
+				if (crisp && d < 0.006f && v > 0.3f)
+					m = US_MAT_ACCENT;
+			}
+			/* rain shafts hanging from the bases, in front of the far sky, far clouds and fields */
+			if (!front_cloud && s->rain > 0.02f) {
+				float xs = xn - slope * (yn - TOWER_B);
+				float fi = xs / A * GW - 0.5f;
+				int i = (int)floorf(fi);
+				float ti = fi - i;
+				int i1 = i + 1;
+				if (i < 0) i = 0;
+				if (i1 > GW - 1) i1 = GW - 1;
+				float cb = us_lerp(s->rb[i], s->rb[i1], ti);
+				if (fi > -1.0f && fi < GW && cb > 0.0f && yn > cb) {
+					float reach = 0.08f + 0.5f * s->rain;
+					float fall = 1.0f - us_smooth(cb + reach * 0.35f, cb + reach, yn);
+					float cw = us_lerp(s->rw[i], s->rw[i1], ti);
+					float w = cw * fall * us_smooth(0.0f, 0.02f, yn - cb) * us_sat(s->rain * 1.4f);
+					if (w > 0.01f) {
+						float st = us_smooth(-0.35f, 0.55f, us_noise2(xs * 60.0f, yn * 2.2f - tt * 5.0f));
+						float rv = w * st;
+						if (crisp) {
+							if (rv * (1.1f + 0.5f * hv) > (bayer4[(gy & 3) * 4 + (gx & 3)] + 0.5f) / 16.0f + 0.15f) {
+								v = fmaxf(v * 0.7f, 0.3f + 0.12f * hv + 0.3f * skyflash);
+								m = US_MAT_WATER;
+								dith = 1;
+							}
+						} else {
+							float r2v = rv * (0.2f + 0.12f * hv) + skyflash * 0.3f * w;
+							v = v * (1.0f - 0.35f * w) + r2v + 0.03f * w;
+							if (st > 0.8f && r2v > 0.75f * v)
+								m = US_MAT_WATER;
+						}
+					}
+				}
+			}
+			if (crisp && dith)
+				v += (bayer4[(gy & 3) * 4 + (gx & 3)] * (1.0f / 16.0f) - 0.47f) * 0.1f;
+			s->gv[k] = v;
+			s->gm[k] = m;
+		}
+		float *tmp = prev;
+		prev = cur;
+		cur = tmp;
+	}
+	/* paint */
+	if (crisp) {
+		int same = gw == c->w && gh == c->h;
+		for (int py = 0; py < c->h; py++) {
+			int gy = same ? py : (int)((py + 0.5f) / c->s * gs);
+			if (gy > gh - 1) gy = gh - 1;
+			for (int px = 0; px < c->w; px++) {
+				int gx = same ? px : (int)((px + 0.5f) / c->s * gs);
+				if (gx > gw - 1) gx = gw - 1;
+				size_t k = (size_t)gy * gw + gx, o = (size_t)py * c->w + px;
+				c->ink[o] = (uint8_t)(us_sat(s->gv[k]) * 255.0f);
+				c->mat[o] = s->gm[k];
+			}
+		}
+	} else {
+		float f = gs / c->s;
+		int cw = c->w < GPAINT ? c->w : GPAINT;
+		for (int px = 0; px < cw; px++) {
+			float fx = (px + 0.5f) * f - 0.5f;
+			int x0 = (int)floorf(fx);
+			float tx = fx - x0;
+			s->pxa[px] = (uint16_t)(x0 < 0 ? 0 : (x0 > gw - 1 ? gw - 1 : x0));
+			s->pxb[px] = (uint16_t)(x0 + 1 > gw - 1 ? gw - 1 : (x0 + 1 < 0 ? 0 : x0 + 1));
+			s->ptx[px] = tx < 0.0f ? 0.0f : tx;
+		}
+		for (int py = 0; py < c->h; py++) {
+			float fy = (py + 0.5f) * f - 0.5f;
+			int y0 = (int)floorf(fy);
+			float ty = fy - y0;
+			int ya = y0 < 0 ? 0 : (y0 > gh - 1 ? gh - 1 : y0), yb = y0 + 1 > gh - 1 ? gh - 1 : (y0 + 1 < 0 ? 0 : y0 + 1);
+			const float *ra = &s->gv[(size_t)ya * gw], *rb = &s->gv[(size_t)yb * gw];
+			const uint8_t *ma = &s->gm[(size_t)(ty < 0.5f ? ya : yb) * gw];
+			uint8_t *ink = &c->ink[(size_t)py * c->w], *mt = &c->mat[(size_t)py * c->w];
+			for (int px = 0; px < cw; px++) {
+				int xa = s->pxa[px], xb = s->pxb[px];
+				float tx = s->ptx[px];
+				float va = ra[xa] + (rb[xa] - ra[xa]) * ty, vb = ra[xb] + (rb[xb] - ra[xb]) * ty;
+				float v = va + (vb - va) * tx;
+				int iv = (int)(v * 255.0f + 0.5f);
+				if (iv > 255)
+					iv = 255;
+				if (iv > ink[px]) {
+					ink[px] = (uint8_t)iv;
+					mt[px] = ma[tx < 0.5f ? xa : xb];
+				}
+			}
+		}
+	}
+}
+
+/* Ink: the visible part of each billow's outline: a mass's silhouette all round, its inner folds only
+ * along their crowns (so they read as cauliflower heads, not stacked circles), flat bases as one line.
+ * Each edge is as bright as the light reaching it: lit crowns bright, bases dim. Big sunlit crowns get a
+ * second, inner contour stroke (hatching that rounds the form). */
+static void draw_puffs_ink(st_t *s, us_canvas *c, float A)
+{
+	float sl = 0.55f + 0.6f * s->lumf;
+	float in = 1.5f / s->gs;
+	for (int i = 0; i < s->npuff; i++) {
+		const puff_t *p = &s->puff[i];
+		if (p->occ)
+			continue;
+		float lw, lf;
+		switch (p->layer) {
+		case LY_NEAR: lw = 0.0014f; lf = 0.85f; break;
+		case LY_MID: lw = 0.0013f; lf = 0.9f; break;
+		case LY_FAR: lw = 0.001f; lf = 0.75f; break;
+		default: lw = 0.0015f; lf = 1.0f; break;
+		}
+		int clip_hz = p->layer == LY_FAR;
+		float a0 = (float)(i % 7) * 0.9f, lp = (float)(i % 11) * 0.57f;
+		for (int pass = 0; pass < 2; pass++) {
+			float rs = pass ? 0.8f : 1.0f;
+			if (pass && (p->r < 0.022f || p->h > 8.5f || p->layer == LY_NEAR))
+				break;
+			int N = (int)(p->r * p->ax * rs * c->s * 0.45f);
+			if (N < 12)
+				N = 12;
+			if (N > 64)
+				N = 64;
+			float px = 0, py = 0;
+			int pv = 0;
+			for (int q = 0; q <= N; q++) {
+				float ang = a0 + q * US_TAU / N;
+				float ca = cosf(ang), sa = sinf(ang);
+				float rl = p->r * rs * (1.0f + 0.04f * sinf(3.0f * ang + lp) + 0.025f * sinf(5.0f * ang - 2.0f * lp));
+				float x = p->x + ca * rl * p->ax, y = p->y + sa * rl;
+				int flat = 0;
+				if (y > p->cut) {
+					y = p->cut;
+					flat = 1;
+				} else if (y < p->top) {
+					y = p->top;
+					flat = 1;
+				}
+				int vis = y > -0.02f && x > -0.02f && x < A + 0.02f && !cover(s, i, x, y, flat ? 0.002f : 0.0f, 1);
+				if (vis && clip_hz && y > horizon_y(us_sat(x / A)) - 0.002f)
+					vis = 0;
+				int sil = 1;
+				if (vis && !pass) {
+					sil = !cover(s, i, x, y, flat ? 0.002f : 0.0f, 0);
+					if (!sil && (sa > -0.05f || p->h > 8.5f)) /* inner folds: only the crowns (none in the anvil) */
+						vis = 0;
+				}
+				if (vis && pass && sa > -0.4f)
+					vis = 0;
+				if (vis && pv) {
+					float mx = (x + px) * 0.5f, my = (y + py) * 0.5f;
+					float T = gT_at(s, mx - ca * in, my - sa * in);
+					float L = lit(s, mx, my);
+					float v = 1.5f * p->v * sl * lf * (0.12f + 0.88f * T) * (sil ? 1.0f : 0.62f) * (pass ? 0.45f : 1.0f) + 0.9f * L;
+					if (v > 0.06f)
+						wline(c, px, py, x, y, lw, us_sat(v), L > 0.35f ? US_MAT_LIGHT : US_MAT_ACCENT);
+				}
+				px = x;
+				py = y;
+				pv = vis;
 			}
 		}
 	}
@@ -981,11 +1253,12 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 		float bt = us_sat(a->level * act * 1.15f);
 		s->build = us_approach(s->build, bt, bt > s->build ? 1.2f : 1.8f, rdt); /* the clouds gather slowly */
 		s->lum = us_approach(s->lum, bt, bt > s->lum ? 0.25f : 0.5f, rdt);     /* light + rain follow faster */
+		s->lumf = us_approach(s->lumf, bt, bt > s->lumf ? 0.08f : 0.2f, rdt);
 	}
 	float bd = s->build;
 	float wind = 0.008f + 0.025f * w->wind + 0.02f * cv + 0.02f * bd;
-	s->drift += dt * (0.005f + 0.012f * w->wind + 0.01f * cv + 0.012f * bd); /* slow: the drums should be what moves it */
-	s->evo += dt * (0.012f + 0.015f * cv + 0.02f * bd);
+	s->drift += dt * (0.02f + 0.012f * w->wind + 0.01f * cv + 0.012f * bd); /* slow: the drums should be what moves it */
+	s->evo += dt * (0.02f + 0.015f * cv + 0.02f * bd);
 
 	/* ---- the music's parts, each eased into its own envelope ---- */
 	s->rumble = us_approach(s->rumble, a->sub * act, a->sub > s->rumble ? 0.6f : 1.2f, rdt);
@@ -1026,50 +1299,51 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 
 	/* ---- the decks ---- */
 	float cov = us_sat(0.08f + 0.62f * bd + 0.25f * cv + 0.08f * w->moisture + 0.24f * (dens - 0.5f));
-	float yb = 0.15f + 0.12f * cov + 0.05f * cv;
-	s->deck_y = yb;
+	float yb = 0.04f + 0.1f * cov + 0.04f * cv; /* the overhead scud's base */
+	s->deck_y = TOWER_B - 0.05f;
 	s->npuff = 0;
-	gen_tower(s, A);
 	{
-		deck_t far = {HZ - 0.07f - 0.03f * cov, 0.03f, 0.027f, 0.022f, 0.25f, 0.34f, 3.0f, 0.006f, 2};
-		deck_t mid = {yb + 0.16f + 0.04f * cov, 0.05f, 0.046f, 0.036f, 0.55f, 0.46f, 1.7f, 0.026f, 2 + (dens > 0.35f) + (dens > 0.75f)};
-		int nr = 2 + (int)((yb + 0.08f) / 0.06f);
-		if (nr > 8)
-			nr = 8;
-		deck_t nearl = {yb, 0.085f, 0.074f, 0.06f, 1.0f, 0.62f, 0.9f, 0.046f, nr};
-		gen_deck(s, A, LY_FAR, &far, us_sat(cov * 0.35f + 0.05f), t);
-		gen_deck(s, A, LY_MID, &mid, us_sat(cov * 0.9f), t);
-		gen_deck(s, A, LY_NEAR, &nearl, cov, t);
+		deck_t far = {HZ - 0.035f - 0.012f * cov, 0.02f, 0.034f, 0.012f, 0.25f, 0.5f, 2.2f, 0.006f, 2, 1, 0.0f, 2.3f};
+		deck_t mid = {TOWER_B + 0.04f + 0.02f * cov, 0.05f, 0.055f, 0.032f, 0.55f, 0.46f, 0.95f, 0.026f,
+			      2 + (dens > 0.35f) + (dens > 0.75f), 1, 0.75f, 1.3f};
+		int nr = 2 + (int)((yb + 0.06f) / 0.06f);
+		if (nr > 5)
+			nr = 5;
+		deck_t nearl = {yb, 0.06f, 0.07f, 0.045f, 1.6f, 0.3f, 0.9f, 0.046f, nr, 0, 0.55f, 1.9f};
+		gen_deck(s, A, LY_FAR, &far, us_sat(cov * 0.35f + 0.15f));
+		gen_deck(s, A, LY_MID, &mid, 0.06f + 0.24f * cov);
+		gen_tower(s, A);
+		gen_deck(s, A, LY_NEAR, &nearl, us_sat(cov * 0.85f));
 	}
 	bin_puffs(s, A);
-	/* the visible underside per column (near + middle decks): rain source + strike origins */
+	/* the visible underside per column (thunderhead, middle bank, scud): rain source + strike origins */
 	for (int i = 0; i < GW; i++) {
 		s->col[i] = 0;
 		s->colb[i] = 0;
 	}
 	for (int k = 0; k < s->npuff; k++) {
 		const puff_t *p = &s->puff[k];
-		if (p->layer < LY_MID)
+		if (p->layer == LY_FAR || p->h > 8.5f)
 			continue;
-		int i0 = (int)floorf((p->x - p->r) / A * GW), i1 = (int)ceilf((p->x + p->r) / A * GW);
+		int i0 = (int)floorf((p->x - p->r * p->ax) / A * GW), i1 = (int)ceilf((p->x + p->r * p->ax) / A * GW);
 		if (i0 < 0) i0 = 0;
 		if (i1 > GW - 1) i1 = GW - 1;
 		for (int i = i0; i <= i1; i++) {
-			float dx = (i + 0.5f) / GW * A - p->x;
+			float dx = ((i + 0.5f) / GW * A - p->x) / p->ax;
 			float q = p->r * p->r - dx * dx;
 			if (q <= 0)
 				continue;
-			float bot = p->y + sqrtf(q);
+			float bot = fminf(p->y + sqrtf(q), p->cut);
 			if (bot > s->colb[i]) {
 				s->colb[i] = bot;
-				s->col[i] = p->m * (p->layer == LY_NEAR ? 1.0f : 0.8f);
+				s->col[i] = p->m * (p->layer == LY_MID ? 0.8f : 1.0f);
 			}
 		}
 	}
 
 	/* mids: a soft light wanders inside the deck; brighter music lifts it higher into the cloud */
 	s->glow_x = A * (0.5f + 0.45f * us_noise2(t * 0.045f, 1.7f));
-	s->glow_y = us_approach(s->glow_y, us_clampf(yb - 0.03f - 0.15f * a->centroid, 0.05f, 0.5f), 1.0f, rdt);
+	s->glow_y = us_approach(s->glow_y, us_clampf(TOWER_B - 0.06f - 0.3f * a->centroid, 0.1f, 0.6f), 1.0f, rdt);
 	s->glow_a = (ctx->crisp ? 0.12f : 0.18f) * s->glow_v * (0.75f + 0.25f * us_noise2(t * 1.3f, 5.5f));
 
 	/* ---- snare: lightning inside the clouds; a built-up storm sends some of it to the ground ---- */
@@ -1152,14 +1426,67 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 		s->heat_v = v * s->heat_amp;
 	}
 
+	/* ---- rain: how much, how slanted, where the shafts hang ---- */
+	float rain_t = us_sat(0.15f * cv + 1.0f * s->lum * (0.35f + 0.65f * cov) + 0.12f * w->moisture - 0.15f);
+	s->rain = us_approach(s->rain, rain_t, 0.6f, rdt);
+	us_world_add(w, &w->moisture, 0.006f * s->rain, dt);
+	float hv = s->heave;
+	float slant = 0.15f + 1.2f * wind + 0.45f * hv; /* the kick's gust leans the rain over */
+	float shaft[GW];
+	for (int i = 0; i < GW; i++)
+	{
+		float u = (i + 0.5f) / GW * A;
+		shaft[i] = us_smooth(-0.1f, 0.45f, us_noise3(u * 2.6f + s->drift * 1.2f, 3.3f, s->evo * 0.6f)) *
+			   (0.25f + 0.75f * us_smooth(-0.2f, 0.35f, us_noise2(u * 9.0f + s->drift * 1.2f, s->evo * 0.4f + 7.0f)));
+	}
+
+	/* ---- the sky: clouds, the bright gap on the horizon, rain shafts, far fields ---- */
+	/* where the shafts hang: the heavy bases, softened across columns so curtains fade at their edges */
+	{
+		float tmp[GW];
+		for (int i = 0; i < GW; i++) {
+			s->rw[i] = s->colb[i] > 0.0f ? us_smooth(0.3f, 0.75f, s->col[i]) * shaft[i] : 0.0f;
+			{
+				float dxt = ((i + 0.5f) / GW - s->tower_u) * A;
+				float core = expf(-dxt * dxt / 0.006f) * (0.45f + 0.55f * s->build);
+				if (s->colb[i] > TOWER_B - 0.03f && core > s->rw[i])
+					s->rw[i] = core;
+			}
+			float b = s->colb[i];
+			for (int k = 1; k < 5 && b <= 0.0f; k++) {
+				if (i - k >= 0 && s->colb[i - k] > 0.0f)
+					b = s->colb[i - k];
+				else if (i + k < GW && s->colb[i + k] > 0.0f)
+					b = s->colb[i + k];
+			}
+			s->rb[i] = b > 0.0f ? b : 2.0f;
+		}
+		for (int pass = 0; pass < 2; pass++) {
+			for (int i = 0; i < GW; i++) {
+				float a = 0, wsum = 0;
+				for (int k = -2; k <= 2; k++)
+					if (i + k >= 0 && i + k < GW) {
+						float wk = 3.0f - abs(k);
+						a += s->rw[i + k] * wk;
+						wsum += wk;
+					}
+				tmp[i] = a / wsum;
+			}
+			memcpy(s->rw, tmp, sizeof(tmp));
+		}
+	}
+	sky_raster(s, ctx, c, A, slant);
+	if (!ctx->crisp)
+		draw_puffs_ink(s, c, A);
+
 	/* ---- stars in the gaps of a thin deck (gone once it closes over) ---- */
 	{
 		float sv = (1.0f - us_smooth(0.35f, 0.85f, cov)) * (1.0f - us_smooth(0.2f, 0.6f, w->daylight));
 		if (sv > 0.02f)
 			for (int i = 0; i < (ctx->crisp ? 50 : 110); i++) {
 				uint32_t h = (uint32_t)i * 2654435761u + 77u;
-				float u = ((h >> 8) & 4095) / 4095.0f, y = ((h >> 20) & 1023) / 1023.0f * 0.7f;
-				if (covered(s, -1, u * A, y))
+				float u = ((h >> 8) & 4095) / 4095.0f, y = ((h >> 20) & 1023) / 1023.0f * 0.55f;
+				if (cover(s, -1, u * A, y, 0.0f, 1))
 					continue;
 				float tw = 0.7f + 0.3f * us_noise2(i * 1.3f, t * 1.5f);
 				float m = ((h >> 3) & 31) / 31.0f;
@@ -1167,29 +1494,14 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 			}
 	}
 
-	/* ---- the clouds ---- */
-	if (ctx->crisp)
-		draw_puffs_crisp(s, c, A);
-	else {
-		draw_anvil_ink(s, c, A);
-		draw_puffs_ink(s, c, A);
-	}
-
-	/* ---- rain curtains under the heavy masses ---- */
-	float rain_t = us_sat(0.15f * cv + 1.0f * s->lum * (0.35f + 0.65f * cov) + 0.12f * w->moisture - 0.15f);
-	s->rain = us_approach(s->rain, rain_t, 0.6f, rdt);
-	us_world_add(w, &w->moisture, 0.006f * s->rain, dt);
+	/* ---- rain drops under the heavy masses ---- */
 	{
-		float hv = s->heave;
-		float slant = 0.15f + 1.2f * wind + 0.45f * hv; /* the kick's gust leans the rain over */
 		int spawn = (int)(s->rain * (160.0f + 900.0f * dens) * rdt * (1.0f + 1.5f * hv) + us_rand(r));
 		for (int k = 0; k < spawn && s->ndrop < MAX_DROP; k++) {
 			int i = (int)(us_rand(r) * GW) % GW;
 			if (s->colb[i] <= 0.0f)
 				continue;
-			float u = (i + 0.5f) / GW;
-			float shaft = us_smooth(-0.1f, 0.45f, us_noise3(u * A * 2.6f + s->drift * 1.2f, 3.3f, s->evo * 0.6f));
-			if (us_rand(r) > us_smooth(0.3f, 0.75f, s->col[i]) * (0.3f + 0.7f * shaft))
+			if (us_rand(r) > us_smooth(0.3f, 0.75f, s->col[i]) * (0.3f + 0.7f * shaft[i]))
 				continue;
 			drop_t *d = &s->drop[s->ndrop++];
 			d->x = (i + us_rand(r)) / GW;
@@ -1257,26 +1569,31 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 			pts[2 * i] = u * A;
 			pts[2 * i + 1] = horizon_y(u);
 		}
-		float hv = 0.4f + 0.5f * L + 0.15f * s->heat_v;
-		us_polyline(c, pts, 65, 0.0016f, us_sat(hv), US_MAT_EARTH);
-		if (ctx->crisp)
-			for (int i = 0; i < 64; i++) {
-				float x0 = pts[2 * i], y0 = pts[2 * i + 1], x1 = pts[2 * i + 2], y1 = pts[2 * i + 3];
-				float gv = 0.16f + 0.3f * L;
-				us_tri(c, x0, y0, x1, y1, x0, 1.01f, gv, US_MAT_EARTH);
-				us_tri(c, x1, y1, x1, 1.01f, x0, 1.01f, gv, US_MAT_EARTH);
-			}
-		else {
-			/* a few furrows in the foreground field, catching the flash */
-			for (int k = 1; k <= 4; k++) {
-				float yy = 0.84f + 0.04f * k * k * 0.6f;
-				float fp[2 * 17];
-				for (int i = 0; i <= 16; i++) {
-					float u = i / 16.0f;
+		float hzv = 0.4f + 0.5f * L + 0.15f * s->heat_v;
+		us_polyline(c, pts, 65, 0.0016f, us_sat(hzv), US_MAT_EARTH);
+		if (!ctx->crisp) {
+			/* Ink: the patchwork's hedgerows and field edges, in perspective (rows crowd toward the horizon,
+			 * edges run to a vanishing point), so the fields read as a plain going away; the flash lights them */
+			float vx = 0.5f * A;
+			for (int k = 1; k <= 7; k++) {
+				float d = 1.0f / (k / 0.09f) - 0.006f;
+				if (d < 0.004f)
+					continue;
+				float fp[2 * 33];
+				for (int i = 0; i <= 32; i++) {
+					float u = i / 32.0f;
 					fp[2 * i] = u * A;
-					fp[2 * i + 1] = yy + 0.01f * us_noise2(u * 3.0f, k * 1.7f) * k;
+					fp[2 * i + 1] = horizon_y(u) + d;
 				}
-				us_polyline(c, fp, 17, 0.001f, us_sat((0.10f + 0.05f * k) + 0.5f * L), US_MAT_EARTH);
+				float fv = 0.1f + 0.6f * d + 0.6f * L * (0.4f + 0.6f * expf(-(fp[2 * 16] - s->hit_x) * (fp[2 * 16] - s->hit_x) / 0.2f));
+				us_polyline(c, fp, 33, 0.001f, us_sat(fv), US_MAT_EARTH);
+			}
+			for (int n = -9; n <= 9; n++) {
+				float X = n / 0.32f;
+				float d1 = 0.17f, x1 = vx + X / (1.0f / (d1 + 0.006f));
+				float d0 = 0.012f, x0 = vx + X / (1.0f / (d0 + 0.006f));
+				float lv = 0.12f + 0.5f * L;
+				wline(c, x0, HZ + d0, x1, HZ + d1, 0.001f, us_sat(lv), US_MAT_EARTH);
 			}
 		}
 		for (int i = 0; i < s->ntrees; i++) {
