@@ -2,7 +2,7 @@
 
 Living, generative, nature-inspired visuals for OBS that listen to your music.
 
-![All thirteen scenes, alternating Ink in colour and Pixel looks across the six palettes](docs/scenes.png)
+![All seventeen scenes, alternating Ink in colour and Pixel looks across the six palettes](docs/scenes.png)
 
 Understory adds a video source to OBS. Point it at any audio (Desktop Audio, a mic, a media source)
 and it grows a small world on screen that plays along with your music. It hears the kick, the snare and
@@ -27,6 +27,10 @@ settle. Nothing ever freezes: in silence the world keeps breathing.
 | Pollen & Seeds | a puff strips a ring of seeds from a clock | a gust shatters another clock and curls the seed stream | seed tips glint | how many seeds are in the air, and the light |
 | Coral | a surge sways the reef, the fish wheel | the reef spawns, bubbles rise, the clownfish dart | glints dance across the caustic light | sunlight reaching down through the water |
 | Aurora | light pulses along the curtain folds | a corona flare, the curtains stretch and fold | rays flicker, stars glint | curtain height and brightness |
+| Snowfall | laden boughs shed their snow in a puff and spring back up | a gust whirls a flurry across the clearing; a strong one sends the owl off | flakes and snow crystals glint in the light | heavier snowfall, a warmer, wider glow from the cabin window |
+| Dunes | a sand avalanche slides down a slip face, the dunes' light pulses | a gust tears spindrift off every crest; a strong one spins up a dust devil | sand grains glitter on the lit faces, stars flash | more sand streams off the crests, the Milky Way brightens |
+| Deep Sea | every jellyfish bell contracts and they surge upward together | a shockwave of bioluminescent plankton bursts outward | comb-jelly rainbows ripple, marine snow sparkles | how much of the abyss lights up |
+| Misty Valley | the waterfall surges and mist billows down the valley | the cranes lift off with big wingbeats, the old pine sheds needles | spray and dew glint, glitter runs down the river | the mist lifts to reveal the far peaks, the light warms |
 
 Every scene also keeps its finer mappings (bass, melody, individual frequency bands, stereo width,
 the slow swell of a phrase). In Ink looks the glow itself breathes with the music.
@@ -36,8 +40,8 @@ the slow swell of a phrase). In Ink looks the glow itself breathes with the musi
 Set **Scene changes → Follow the music** and Understory becomes a director: it learns the character
 of your set (how loud, how bright, how percussive, relative to the set itself) and the state of the
 living world, and moves to a fitting scene at musical turning points — a drop landing might bring the
-murmuration or the storm, a breakdown opens onto the tide, coral or aurora. A long storm charge makes
-Storm Front more likely, a wet world favours the river, a summer night favours fireflies. Scenes
+murmuration or the storm, a breakdown opens onto the tide, the deep sea or aurora. A long storm charge makes
+Storm Front more likely, a wet world favours the river or the misty valley, a summer night favours fireflies, winter brings the snowfall and a dry summer the dunes. Scenes
 dissolve into each other in organic patches, the new world spreading in like moss, and always stay at least the minutes you set, so each has time to grow.
 
 ### One living world

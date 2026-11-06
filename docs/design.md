@@ -88,7 +88,7 @@ Bass/Mid/High gain · Link to shared world · World speed · Reset world · Seed
 
 - CPU rasterisation + CPU compose; GPU only scales/presents. Keeps OBS and the headless harness
   pixel-identical and makes every scene verifiable without OBS.
-- 13 scenes listed above; seasons are a world layer.
+- 17 scenes (see README); seasons are a world layer.
 - 3-macro contract (density/speed/reactivity), echoing the modkit convention.
 - World steps once per video frame regardless of how many sources are live; each live scene adds
   its own contributions.
