@@ -154,6 +154,7 @@ typedef struct {
 	float st[GWM * GHM];      /* static wash value (shape * texture) */
 	float snow[GWM * GHM];    /* where snow would lie */
 	uint8_t water[GWM * GHM]; /* river coverage */
+	uint8_t face[GWM * GHM];  /* the waterfall's cliff face (1) and its wet channel (2) */
 	float fv[GWM * GHM];      /* per-frame composite value (land / water / snow, behind the mist) */
 	float fq[GWM * GHM];      /* ... and the mist in front of it */
 	uint8_t fm[GWM * GHM];    /* ... and material */
@@ -167,7 +168,7 @@ typedef struct {
 	int hrow[2];
 
 	/* envelopes */
-	float lvl, sflash, gust, surge, billow, kage, flash, glint, hat_seedf, shake, warm, sub_env, lm_env, air_env, drift, mistT, fallT;
+	float lvl, sflash, gust, dthx, dthy, surge, billow, kage, flash, glint, hat_seedf, shake, warm, sub_env, lm_env, air_env, drift, mistT, fallT;
 	float bsw, bvel; /* bamboo sway spring */
 	float bandv[US_NBANDS];
 	float snare_cool, kick_cool, land_t, cross_t, ring_t[3];
@@ -536,6 +537,7 @@ static void build_grid(st_t *s, int gw, int gh, float A, int crisp)
 					break;
 				}
 			s->water[i] = 0;
+			s->face[i] = 0;
 			s->snow[i] = 0;
 			if (L < 0) {
 				s->lay[i] = 255;
@@ -572,9 +574,14 @@ static void build_grid(st_t *s, int gw, int gh, float A, int crisp)
 					float fv = LV[2] * (0.75f + 0.25f * expf(-dy / 0.05f)) * streak;
 					if (fv * face > s->st[i])
 						s->st[i] = us_lerp(s->st[i], fv, face);
+					if (face > 0.5f)
+						s->face[i] = 1;
 				}
-				if (d < 0.013f && y > lip - 0.01f && y < Y_POOL + 0.01f)
+				if (d < 0.013f && y > lip - 0.01f && y < Y_POOL + 0.01f) {
 					s->st[i] *= 0.2f + 0.8f * us_smooth(0.005f, 0.013f, d);
+					if (d < 0.008f)
+						s->face[i] = 2;
+				}
 			}
 		}
 	}
@@ -1093,6 +1100,9 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 	s->mistT += dt * (0.025f + 0.05f * s->drift) + rdt * 2.5f * s->gust;
 	/* the kick's mist wave: races out along the valley floor, then fades */
 	float bamp = s->billow * expf(-s->kage / 0.22f) * us_smooth(0.0f, 0.04f, s->kage + 0.01f);
+	/* pixel: the mist's dither pattern crawls with a snare's gust and heaves with a kick's billow */
+	s->dthx = fmodf(s->dthx + rdt * 12.0f * s->gust, 4.0f);
+	s->dthy = fmodf(s->dthy + rdt * 7.0f * bamp, 4.0f);
 	float brad = 0.12f + 0.6f * (1.0f - expf(-s->kage / 0.1f));
 	{
 		float md = (1.05f + 0.6f * w->moisture) * (1.0f - (crisp ? 0.15f : 0.38f) * s->lvl) * (1.0f - 0.2f * summer);
@@ -1108,7 +1118,7 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 			for (int i = 0; i < MW; i++) {
 				float x = (i + 0.5f) / MW * A;
 				byc[b][i] = BY[b] - lift * (b == 3 ? 0.5f : 1.0f) + 0.035f * us_noise2(x * 0.8f + s->mistT * 0.25f, b * 4.0f);
-				bth[b][i] = BH[b] * (0.55f + 0.9f * us_smooth(-0.5f, 0.7f, us_noise2(x * 1.3f - s->mistT * 0.4f, b * 7.0f + 1.0f)));
+				bth[b][i] = BH[b] * (crisp ? 0.7f : 1.0f) * (0.55f + 0.9f * us_smooth(-0.5f, 0.7f, us_noise2(x * 1.3f - s->mistT * 0.4f, b * 7.0f + 1.0f)));
 				bam[b][i] = us_smooth(-0.5f, 0.3f, us_noise2(x * 0.9f - s->mistT * BS[b] * 0.6f, b * 9.0f + 2.0f));
 			}
 		int mstep = crisp ? 2 : 1; /* pixel canvases: every other column, filled in below */
@@ -1123,7 +1133,7 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 						continue;
 					float wsp = us_fbm2(x * 1.5f - s->mistT * BS[b] * 2.0f, y * (crisp ? 6.0f : 13.0f) + b * 5.1f + s->mistT * 0.2f, 2);
 					float sh = us_smooth(-0.4f, 0.6f, wsp);
-					m += BD[b] * br[b] * bam[b][i] * expf(-d * d) * (0.25f + 0.85f * sh);
+					m += BD[b] * (crisp && b == 3 ? 0.5f : 1.0f) * br[b] * bam[b][i] * expf(-d * d) * (0.25f + 0.85f * sh);
 				}
 				m *= md;
 				/* kick: the fall's thunder pushes a wave of mist out along the valley floor */
@@ -1227,6 +1237,10 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 						vm = vm * (1.1f + 0.4f * s->lvl) + ((BAYL[(gy & 3) * 4 + (gx & 3)] + 0.5f) / 16.0f - 0.5f) * 0.12f;
 						if (L == 3 && vm < 0.2f)
 							vm = 0.2f;
+						if (s->face[i]) { /* the fall's cliff: a solid dark slab, its wet channel darker still */
+							vm = s->face[i] == 2 ? 0.0f : STEP1;
+							ma *= 0.2f;
+						}
 						if (vm < 0)
 							vm = 0;
 					}
@@ -1249,10 +1263,16 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 				float v1 = vm * hide, v2 = ma * mv;
 				if (crisp) { /* pixel: resolve the cell here (drawn 1:1); mist edges are ordered-dithered */
 					static const uint8_t BAY[16] = {0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5};
-					float th = (BAY[(gy & 3) * 4 + (gx & 3)] + 0.5f) / 16.0f;
+					int dgx = gx + (int)s->dthx, dgy = gy + (int)s->dthy;
+					float th = (BAY[(dgy & 3) * 4 + (dgx & 3)] + 0.5f) / 16.0f;
 					float v;
-					if (ma > 0.14f + 0.32f * th) {
-						v = mv * (ma > 0.6f ? 1.0f : 0.7f) + 0.3f * vm;
+					/* translucent mist: at most every other pixel, its density graded by the mist's thickness,
+					 * so the peaks show through and the edges fade over several pixels */
+					float cover = 0.5f * us_smooth(0.1f, 0.8f, ma);
+					if (th < cover) {
+						v = mv * (0.75f + 0.25f * us_smooth(0.5f, 0.9f, ma));
+						if (vm > v)
+							v = vm;
 						m = US_MAT_ACCENT;
 					} else
 						v = vm;
