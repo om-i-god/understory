@@ -1,0 +1,101 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+env:
+  OBS_VERSION: "32.2.2"
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Fetch OBS headers
+        shell: bash
+        run: sh tools/fetch-deps.sh
+
+      - name: Fetch OBS for Windows (obs.dll + runtime for the host test)
+        shell: pwsh
+        run: |
+          $v = $env:OBS_VERSION
+          curl.exe -sSfL -o obs.zip "https://github.com/obsproject/obs-studio/releases/download/$v/OBS-Studio-$v-Windows-x64.zip"
+          Expand-Archive obs.zip -DestinationPath obs
+          $dll = Get-ChildItem -Recurse obs -Filter obs.dll | Where-Object { $_.Directory.Name -eq "64bit" } | Select-Object -First 1
+          if (-not $dll) { throw "obs.dll not found in the OBS zip" }
+          $root = $dll.Directory.Parent.Parent.FullName
+          "OBS_ROOT=$root" | Out-File -Append $env:GITHUB_ENV
+          "OBS_BIN=$($dll.Directory.FullName)" | Out-File -Append $env:GITHUB_ENV
+          Write-Host "OBS at $root"
+
+      - name: Import library for obs.dll
+        shell: pwsh
+        run: tools/make-obs-lib.ps1 -Dll "$env:OBS_BIN\obs.dll" -Out deps\obs.lib
+
+      - name: Build (MSVC)
+        shell: pwsh
+        run: |
+          cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DOBS_LIB="$PWD\deps\obs.lib"
+          cmake --build build --config Release
+
+      - name: Core tests
+        shell: pwsh
+        run: build\Release\us_tests.exe
+
+      - name: Render every scene in every look (headless)
+        shell: pwsh
+        run: |
+          $scenes = "meadow","wind","river","rain","storm","pond","fireflies","mycelium","murmuration","tide","pollen","coral","aurora"
+          foreach ($s in $scenes) { foreach ($st in "ink","color","pixel","mono") {
+            build\Release\us_render.exe --scene $s --style $st --synth --start 30 --seconds 2 --at 31 --size 640x360 --out out\$st
+            if ($LASTEXITCODE -ne 0) { throw "us_render failed: $s $st" }
+          } }
+
+      - name: Load the plugin in real OBS (headless, software GPU)
+        shell: pwsh
+        env:
+          US_NO_LAG_CHECK: "1"
+        run: |
+          Copy-Item build\Release\obs_host_test.exe $env:OBS_BIN\
+          Push-Location $env:OBS_BIN
+          .\obs_host_test.exe "$env:GITHUB_WORKSPACE\build\stage\understory\bin\64bit\understory.dll" "$env:GITHUB_WORKSPACE\out\host" meadow 3 "$env:GITHUB_WORKSPACE\build\stage\understory\data"
+          $code = $LASTEXITCODE
+          Pop-Location
+          exit $code
+
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force pkg | Out-Null
+          Copy-Item -Recurse build\stage\understory pkg\
+          Copy-Item tools\install.ps1 pkg\
+          Copy-Item README.md pkg\
+          Compress-Archive -Path pkg\* -DestinationPath understory-windows-x64.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: understory-windows-x64
+          path: understory-windows-x64.zip
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: frames-windows
+          path: out/
+
+      - name: Attach to release (tags only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: understory-windows-x64.zip

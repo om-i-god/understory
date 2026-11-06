@@ -19,7 +19,9 @@ add_library(us_core STATIC ${CORE_SRC} ${SCENE_SRC})
 target_include_directories(us_core PUBLIC src)
 set_target_properties(us_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 if(MSVC)
-  target_compile_options(us_core PRIVATE /W3)
+  # C4013: implicit function declaration — an error everywhere else, only a warning in MSVC C
+  target_compile_options(us_core PRIVATE /W3 /we4013)
+  target_compile_definitions(us_core PUBLIC _CRT_SECURE_NO_WARNINGS _USE_MATH_DEFINES)
 else()
   target_compile_options(us_core PRIVATE -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers)
   target_link_libraries(us_core PUBLIC m)
@@ -68,11 +70,42 @@ if(UNDERSTORY_BUILD_PLUGIN AND APPLE)
   endif()
 endif()
 
-# headless OBS load/render test (macOS): loads the plugin into OBS.app's libobs with a throwaway config
+# Windows: build understory.dll against libobs headers + an import library for OBS's obs.dll.
+# OBS_LIB: path to obs.lib (tools/make-obs-lib.ps1 makes one from an installed OBS's obs.dll).
+if(UNDERSTORY_BUILD_PLUGIN AND WIN32)
+  set(OBS_SRC "${CMAKE_SOURCE_DIR}/deps/obs-studio" CACHE PATH "obs-studio source (headers)")
+  set(OBS_LIB "" CACHE FILEPATH "import library for obs.dll")
+  if(EXISTS "${OBS_SRC}/libobs/obs-module.h" AND EXISTS "${OBS_LIB}")
+    set(GEN_INC "${CMAKE_BINARY_DIR}/generated")
+    file(WRITE "${GEN_INC}/obsconfig.h"
+      "#pragma once\n#define OBS_DATA_PATH \"../../data\"\n#define OBS_PLUGIN_PATH \"../../obs-plugins/64bit\"\n#define OBS_PLUGIN_DESTINATION \"obs-plugins/64bit\"\n#define OBS_RELEASE_CANDIDATE 0\n#define OBS_BETA 0\n#define OBS_INSTALL_PREFIX \"\"\n")
+    add_library(understory MODULE src/obs/plugin.c)
+    target_include_directories(understory PRIVATE "${OBS_SRC}/libobs" "${GEN_INC}" "${CMAKE_SOURCE_DIR}/deps/simde" src)
+    target_link_libraries(understory PRIVATE us_core "${OBS_LIB}")
+    target_compile_definitions(understory PRIVATE _CRT_SECURE_NO_WARNINGS)
+    target_compile_options(understory PRIVATE /W3 /we4013)
+    set_target_properties(understory PROPERTIES OUTPUT_NAME understory PREFIX "")
+    # staged layout for C:/ProgramData/obs-studio/plugins/understory/{bin/64bit,data}
+    set(STAGE "${CMAKE_BINARY_DIR}/stage/understory")
+    add_custom_command(TARGET understory POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E make_directory "${STAGE}/bin/64bit"
+      COMMAND ${CMAKE_COMMAND} -E copy "$<TARGET_FILE:understory>" "${STAGE}/bin/64bit/"
+      COMMAND ${CMAKE_COMMAND} -E copy_directory "${CMAKE_SOURCE_DIR}/data" "${STAGE}/data")
+  else()
+    message(WARNING "Windows plugin needs deps/obs-studio (tools/fetch-deps.sh) and -DOBS_LIB=<obs.lib> — skipping plugin")
+  endif()
+endif()
+
+# headless OBS load/render test: loads the plugin into the real libobs with a throwaway config
 if(TARGET understory)
   add_executable(obs_host_test tools/obs_host_test.c)
   target_include_directories(obs_host_test PRIVATE "${OBS_SRC}/libobs" "${GEN_INC}" "${CMAKE_SOURCE_DIR}/deps/simde")
-  target_link_libraries(obs_host_test PRIVATE "-F${OBS_APP}/Contents/Frameworks" "-framework libobs" "-Wl,-rpath,${OBS_APP}/Contents/Frameworks")
-  target_compile_options(obs_host_test PRIVATE -Wno-deprecated-declarations)
+  if(APPLE)
+    target_link_libraries(obs_host_test PRIVATE "-F${OBS_APP}/Contents/Frameworks" "-framework libobs" "-Wl,-rpath,${OBS_APP}/Contents/Frameworks")
+    target_compile_options(obs_host_test PRIVATE -Wno-deprecated-declarations)
+  else()
+    target_link_libraries(obs_host_test PRIVATE "${OBS_LIB}")
+    target_compile_definitions(obs_host_test PRIVATE _CRT_SECURE_NO_WARNINGS)
+  endif()
   add_dependencies(obs_host_test understory)
 endif()

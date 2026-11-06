@@ -1,8 +1,11 @@
-/* obs_host_test — loads the built understory.plugin into the real libobs from OBS.app, headless,
+/* obs_host_test — loads the built plugin into the real libobs (OBS.app on macOS, an OBS install or portable
+ * zip on Windows: run the exe from OBS's bin/64bit folder), headless,
  * with its own throwaway config dir (never touches the user's OBS profile). Creates a source per style,
  * runs OBS's own video loop for a while, renders through the GPU pipeline and writes PPM screenshots.
  *
- *   obs_host_test <path/to/understory.plugin> <out_dir> [scene] [seconds]
+ *   obs_host_test <path/to/understory.plugin> <out_dir> [scene] [seconds]          (macOS)
+ *   obs_host_test <path/to/understory.dll> <out_dir> [scene] [seconds] <data_dir> (Windows; OBS_ROOT=<obs dir>)
+ * US_BIG=1 renders at 1920x1080; US_NO_LAG_CHECK=1 skips the lag check (software GPU on CI).
  */
 #include <obs.h>
 #include <obs-module.h>
@@ -11,7 +14,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 
 #define W 960
 #define H 540
@@ -36,6 +38,12 @@ static void snap(obs_source_t *src, const char *path)
 		uint32_t ls;
 		if (gs_stagesurface_map(stage, &data, &ls)) {
 			FILE *f = fopen(path, "wb");
+			if (!f) {
+				printf("FAIL: cannot write %s\n", path);
+				fails++;
+				gs_stagesurface_unmap(stage);
+				goto done;
+			}
 			long sum = 0;
 			fprintf(f, "P6\n%d %d\n255\n", W, H);
 			for (int y = 0; y < H; y++)
@@ -61,6 +69,7 @@ static void snap(obs_source_t *src, const char *path)
 		printf("FAIL: texrender_begin\n");
 		fails++;
 	}
+done:
 	gs_stagesurface_destroy(stage);
 	gs_texrender_destroy(tr);
 	obs_leave_graphics();
@@ -83,12 +92,27 @@ int main(int argc, char **argv)
 		printf("FAIL obs_startup\n");
 		return 1;
 	}
+#ifdef _WIN32
+	const char *root = getenv("OBS_ROOT");
+	if (!root) {
+		printf("FAIL: set OBS_ROOT to the OBS folder (the one containing bin/ and data/)\n");
+		return 1;
+	}
+	char dp[1024];
+	snprintf(dp, sizeof(dp), "%s/data/libobs/", root);
+	obs_add_data_path(dp);
+#else
 	obs_add_data_path(OBS_APP "/Resources/data/libobs/");
+#endif
 
 	struct obs_audio_info ai = {.samples_per_sec = 48000, .speakers = SPEAKERS_STEREO};
 	obs_reset_audio(&ai);
 	struct obs_video_info vi = {0};
+#ifdef _WIN32
+	vi.graphics_module = "libobs-d3d11";
+#else
 	vi.graphics_module = OBS_APP "/Frameworks/libobs-opengl.dylib";
+#endif
 	vi.fps_num = 30;
 	vi.fps_den = 1;
 	vi.base_width = vi.output_width = W;
@@ -105,8 +129,13 @@ int main(int argc, char **argv)
 	}
 
 	char bin[1024], data[1024];
+#ifdef _WIN32
+	snprintf(bin, sizeof(bin), "%s", plugin);
+	snprintf(data, sizeof(data), "%s", argc > 5 ? argv[5] : "data");
+#else
 	snprintf(bin, sizeof(bin), "%s/Contents/MacOS/understory", plugin);
 	snprintf(data, sizeof(data), "%s/Contents/Resources", plugin);
+#endif
 	obs_module_t *mod = NULL;
 	r = obs_open_module(&mod, bin, data);
 	if (r != MODULE_SUCCESS) {
@@ -146,10 +175,10 @@ int main(int argc, char **argv)
 
 		obs_set_output_source(0, src); /* makes it 'showing', OBS's video thread now ticks it */
 		uint32_t lag0 = obs_get_lagged_frames(), tot0 = obs_get_total_frames();
-		sleep((unsigned)secs);
+		os_sleep_ms((uint32_t)secs * 1000);
 		uint32_t lag = obs_get_lagged_frames() - lag0, tot = obs_get_total_frames() - tot0;
 		printf("video frames %u, lagged %u\n", tot, lag);
-		if (tot > 0 && lag * 10 > tot) {
+		if (!getenv("US_NO_LAG_CHECK") && tot > 0 && lag * 10 > tot) {
 			printf("FAIL: OBS video thread lagging\n");
 			fails++;
 		}
@@ -162,7 +191,7 @@ int main(int argc, char **argv)
 		obs_data_set_string(st2, "scene", "river");
 		obs_source_update(src, st2);
 		obs_data_release(st2);
-		usleep(300000);
+		os_sleep_ms(300);
 
 		obs_set_output_source(0, NULL);
 		obs_source_release(src);
@@ -170,8 +199,8 @@ int main(int argc, char **argv)
 	obs_shutdown();
 	char wp[1100];
 	snprintf(wp, sizeof(wp), "%s/understory/world.json", cfg);
-	printf("world file %s: %s\n", wp, access(wp, F_OK) == 0 ? "written" : "MISSING");
-	if (access(wp, F_OK) != 0)
+	printf("world file %s: %s\n", wp, os_file_exists(wp) ? "written" : "MISSING");
+	if (!os_file_exists(wp))
 		fails++;
 	printf(fails ? "OBS HOST TEST FAILED (%d)\n" : "OBS HOST TEST PASSED\n", fails);
 	return fails ? 1 : 0;

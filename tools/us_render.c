@@ -19,14 +19,27 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#ifdef _WIN32
+#include <direct.h>
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#define mkdir(p, m) _mkdir(p)
+static double now_s(void)
+{
+	LARGE_INTEGER f, c;
+	QueryPerformanceFrequency(&f);
+	QueryPerformanceCounter(&c);
+	return (double)c.QuadPart / (double)f.QuadPart;
+}
+#else
 #include <sys/stat.h>
-
 static double now_s(void)
 {
 	struct timespec ts;
 	clock_gettime(CLOCK_MONOTONIC, &ts);
 	return ts.tv_sec + ts.tv_nsec * 1e-9;
 }
+#endif
 
 /* ---- synthetic test track ------------------------------------------- */
 typedef struct {
