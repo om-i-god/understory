@@ -164,6 +164,8 @@ void us_engine_frame(us_engine *e, const us_audio *a_in, float dt, double clock_
 	a.level = scale_feat(a.level, k);
 	a.onset = scale_feat(a.onset, k);
 	a.kick = scale_feat(a.kick, k);
+	a.snare = scale_feat(a.snare, k);
+	a.hat = scale_feat(a.hat, k);
 	for (int i = 0; i < US_NBANDS; i++)
 		a.bands[i] = scale_feat(a.bands[i], k);
 

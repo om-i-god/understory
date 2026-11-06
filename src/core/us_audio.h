@@ -6,7 +6,8 @@
 #define US_NBANDS 32
 
 typedef struct us_audio {
-	/* smoothed, auto-gained 0..1 */
+	/* smoothed, auto-gained 0..1. Regions the mix barely uses read low (a pad with no top end has
+	 * little high/air), so scenes can tell what is really playing. */
 	float sub;      /* 20–60 Hz  */
 	float bass;     /* 60–250 Hz */
 	float lowmid;   /* 250–800   */
@@ -17,12 +18,15 @@ typedef struct us_audio {
 	float swell;    /* slow loudness (~8 s), phrase-scale */
 	float onset;    /* transient strength, jumps on hits and decays (~0.15 s) */
 	int beat;       /* 1 on the frame a transient is detected */
-	float kick;     /* low-frequency transient envelope (kicks) */
+	float kick;     /* kick drum / low hit envelope: jumps on the hit, decays ~0.15 s */
+	float snare;    /* snare / clap / mid hit envelope, decays ~0.14 s */
+	float hat;      /* hi-hat / shaker / high tick envelope, decays ~0.07 s */
+	int kick_hit, snare_hit, hat_hit; /* 1 on the frame that drum was detected */
 	float centroid; /* spectral brightness 0..1 (log-frequency) */
 	float width;    /* stereo width 0..1 */
 	float silence;  /* seconds of near-silence */
 	float active;   /* 0..1, eases to 1 while audio is present */
-	float bands[US_NBANDS]; /* log-spaced spectrum, auto-gained */
+	float bands[US_NBANDS]; /* log-spaced spectrum 30 Hz..16 kHz, auto-gained; ~0 where the mix is empty */
 } us_audio;
 
 typedef struct us_analyzer us_analyzer;

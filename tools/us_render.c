@@ -4,12 +4,14 @@
  *             [--start S] [--seconds N] [--prewarm S] [--fps 30] [--size 1280x720] [--pixel 4]
  *             [--at 5,10,20 | --every K] [--out dir] [--tint r,g,b] [--palette i] [--invert]
  *             [--density d] [--speed s] [--react r] [--trails b] [--seed n]
- *             [--world in.json] [--world-out out.json] [--world-speed k] [--stats]
+ *             [--world in.json] [--world-out out.json] [--world-speed k] [--stats] [--measure out.csv]
  *
  * --audio expects raw float32 stereo interleaved 48 kHz:
  *     ffmpeg -i song.wav -f f32le -ac 2 -ar 48000 song.f32
  * --synth uses a built-in 120 bpm test track (64 s loop: intro / build / drop / breakdown).
  * --prewarm runs the simulation for S seconds (with the same audio, from --start - S) before writing.
+ * --measure writes one CSV row per frame: the audio features beside the picture's mean brightness and how
+ * much it changed since the previous frame (mean |delta luma|, 0..255), to check what the music visibly moves.
  * Frames are written at OUTPUT size (pixel styles upscaled nearest-neighbour, as OBS shows them).
  */
 #include "../src/core/us_scene.h"
@@ -137,6 +139,7 @@ int main(int argc, char **argv)
 	const char *scene = "meadow", *audio = NULL, *out = "out", *world_in = NULL, *world_out = NULL, *at = NULL;
 	int style = US_STYLE_INK, fps = 30, ow = 1280, oh = 720, pixel = 4, every = 0, palette = 0, invert = 0, stats = 0;
 	int synth = 0, stats_every = 0;
+	const char *measure = NULL;
 	float bloom = 0.5f, xfade = 2.0f;
 	float journey = 0; /* >0: follow-the-music director, value = min dwell seconds */
 	float start = 0, seconds = 10, prewarm = 0, wspeed = 1;
@@ -177,6 +180,7 @@ int main(int argc, char **argv)
 		else if (ARG("--xfade")) xfade = (float)atof(v);
 		else if (ARG("--bloom")) bloom = (float)atof(v);
 		else if (ARG("--journey")) journey = (float)atof(v);
+		else if (ARG("--measure")) measure = v;
 		else { fprintf(stderr, "unknown arg %s\n", k); return 2; }
 #undef ARG
 	}
@@ -247,6 +251,11 @@ int main(int argc, char **argv)
 			at_list[nat++] = (float)atof(tok);
 	}
 	us_audio feat;
+	FILE *mf = measure ? fopen(measure, "w") : NULL;
+	uint8_t *prev_luma = NULL;
+	size_t luma_n = 0;
+	if (mf)
+		fprintf(mf, "t,level,sub,bass,lowmid,mid,high,air,onset,beat,kick,centroid,width,swell,active,snare,hat,kick_hit,snare_hit,hat_hit,luma,delta\n");
 	for (int fi = 0; fi < total; fi++) {
 		float t = t0 + fi * dt;
 		if (synth) {
@@ -285,6 +294,26 @@ int main(int argc, char **argv)
 		render_time += now_s() - r0;
 		rendered++;
 
+		if (mf && t + 1e-4f >= start && e.rgba) {
+			size_t n = (size_t)e.canvas.w * e.canvas.h;
+			if (luma_n != n) {
+				free(prev_luma);
+				prev_luma = calloc(n, 1);
+				luma_n = n;
+			}
+			double sum = 0, dsum = 0;
+			for (size_t q = 0; q < n; q++) {
+				const uint8_t *px = e.rgba + q * 4;
+				int y = (px[0] * 54 + px[1] * 183 + px[2] * 19) >> 8;
+				sum += y;
+				dsum += abs(y - prev_luma[q]);
+				prev_luma[q] = (uint8_t)y;
+			}
+			fprintf(mf, "%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%d,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%d,%d,%d,%.3f,%.4f\n", t,
+				feat.level, feat.sub, feat.bass, feat.lowmid, feat.mid, feat.high, feat.air, feat.onset, feat.beat,
+				feat.kick, feat.centroid, feat.width, feat.swell, feat.active, feat.snare, feat.hat, feat.kick_hit, feat.snare_hit,
+				feat.hat_hit, sum / n, dsum / n);
+		}
 		if (t + 1e-4f < start)
 			continue;
 		int want = 0;
@@ -312,6 +341,9 @@ int main(int argc, char **argv)
 	}
 	printf("scene=%s style=%d canvas=%dx%d frames=%d written=%d avg_frame=%.2f ms\n", e.vt->id, style, e.canvas.w,
 	       e.canvas.h, rendered, written, rendered ? render_time / rendered * 1000.0 : 0);
+	if (mf)
+		fclose(mf);
+	free(prev_luma);
 	if (world_out)
 		us_world_save(us_world_shared(), world_out);
 	us_engine_free(&e);

@@ -134,6 +134,77 @@ static void test_low_bands(void)
 	us_analyzer_destroy(an);
 }
 
+/* feeds a 6 s pattern and counts which drums the analyzer reports */
+typedef enum { PAT_KICKS, PAT_SNARES, PAT_HATS, PAT_PAD, PAT_NOTES, PAT_NAN } pat_kind;
+static void count_drums(pat_kind kind, int *nk, int *ns, int *nh)
+{
+	us_analyzer *an = us_analyzer_create();
+	us_audio a;
+	float L[800];
+	us_rng rng;
+	us_rng_seed(&rng, 11);
+	double t = 0;
+	*nk = *ns = *nh = 0;
+	float lp = 0, ph = 0;
+	for (int f = 0; f < 360; f++) {
+		for (int i = 0; i < 800; i++) {
+			float bt = (float)fmod(t, 0.5); /* a hit every half second */
+			float x = 0.02f * sinf(US_TAU * 330.0f * (float)t); /* quiet bed so the mix is never empty */
+			if (kind == PAT_KICKS) {
+				ph += (50.0f + 110.0f * expf(-bt * 35.0f)) / 48000.0f;
+				x += 0.9f * expf(-bt * 9.0f) * sinf(US_TAU * ph);
+			} else if (kind == PAT_SNARES) {
+				x += 0.5f * expf(-bt * 20.0f) * us_randr(&rng, -1, 1);
+			} else if (kind == PAT_HATS) {
+				float n = us_randr(&rng, -1, 1);
+				lp += 0.7f * (n - lp);
+				x += 0.3f * expf(-bt * 70.0f) * (n - lp);
+			} else if (kind == PAT_PAD) {
+				x += 0.3f * (0.5f + 0.5f * sinf((float)t * 0.7f)) * sinf(US_TAU * 220.0f * (float)t);
+			} else if (kind == PAT_NOTES) {
+				static const float notes[4] = {523.3f, 659.3f, 784.0f, 1046.5f};
+				float fr = notes[(int)(t / 0.5) & 3];
+				x += 0.4f * expf(-bt * 4.0f) * sinf(US_TAU * fr * (float)t);
+			} else if (kind == PAT_NAN) {
+				x = (i % 97 == 0) ? NAN : (i % 89 == 0 ? INFINITY : x);
+			}
+			L[i] = x;
+			t += 1.0 / 48000;
+		}
+		us_analyzer_push(an, L, L, 800, 48000);
+		us_analyzer_update(an, 1.0f / 60, 1, 1, 1, 1, &a);
+		if (f >= 60) { /* let it settle for a second */
+			*nk += a.kick_hit;
+			*ns += a.snare_hit;
+			*nh += a.hat_hit;
+		}
+		if (kind == PAT_NAN) {
+			int finite = isfinite(a.level) && isfinite(a.bass) && isfinite(a.kick) && isfinite(a.bands[5]);
+			CHECK(finite, "NaN/inf input leaked into the features at frame %d", f);
+			if (!finite)
+				break;
+		}
+	}
+	us_analyzer_destroy(an);
+}
+
+static void test_drums(void)
+{
+	int k, s, h;
+	/* 5 s after settling = 10 hits */
+	count_drums(PAT_KICKS, &k, &s, &h);
+	CHECK(k >= 9 && k <= 11 && s <= 1 && h <= 1, "kicks: kick %d snare %d hat %d (want ~10/0/0)", k, s, h);
+	count_drums(PAT_SNARES, &k, &s, &h);
+	CHECK(s >= 8 && s <= 11 && k <= 1, "snares: kick %d snare %d hat %d (want ~0/10/any)", k, s, h);
+	count_drums(PAT_HATS, &k, &s, &h);
+	CHECK(h >= 8 && h <= 11 && k == 0 && s <= 1, "hats: kick %d snare %d hat %d (want 0/0/10)", k, s, h);
+	count_drums(PAT_PAD, &k, &s, &h);
+	CHECK(k + s + h == 0, "a swelling pad read as drums: kick %d snare %d hat %d", k, s, h);
+	count_drums(PAT_NOTES, &k, &s, &h);
+	CHECK(s + h <= 1 && k == 0, "plucked notes read as drums: kick %d snare %d hat %d", k, s, h);
+	count_drums(PAT_NAN, &k, &s, &h);
+}
+
 static void test_world(void)
 {
 	us_world w;
@@ -252,6 +323,7 @@ int main(void)
 	test_compose();
 	test_audio();
 	test_low_bands();
+	test_drums();
 	test_world();
 	test_scenes();
 	test_journey();
