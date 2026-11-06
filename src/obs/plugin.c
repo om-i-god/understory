@@ -125,8 +125,13 @@ static void world_save(void)
 	if (!g_world_path)
 		return;
 	us_mutex_lock(&g_world_mu);
-	us_world_save(us_world_shared(), g_world_path);
+	int ok = us_world_save(us_world_shared(), g_world_path);
 	us_mutex_unlock(&g_world_mu);
+	static int warned;
+	if (!ok && !warned) {
+		warned = 1;
+		blog(LOG_WARNING, "[understory] could not save the world to %s", g_world_path);
+	}
 }
 
 /* ---------------------------------------------------------------- settings */
@@ -637,6 +642,7 @@ static struct obs_source_info understory_info = {
 bool obs_module_load(void)
 {
 	g_world_path = obs_module_config_path("world.json");
+	blog(LOG_INFO, "[understory] world file: %s", g_world_path ? g_world_path : "(none)");
 	if (g_world_path) {
 		char *dir = obs_module_config_path("");
 		if (dir) {
