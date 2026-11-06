@@ -18,6 +18,7 @@ static const profile PROFILES[] = {
 	{"murmuration", 0.70f, 0.60f, 0.55f}, {"tide", 0.30f, 0.35f, 0.20f},
 	{"pollen", 0.35f, 0.80f, 0.30f},     {"coral", 0.25f, 0.30f, 0.20f},
 	{"aurora", 0.20f, 0.70f, 0.10f},
+	{"abyss", 0.30f, 0.25f, 0.20f},
 };
 
 static const profile *find_profile(const char *id)
@@ -58,6 +59,8 @@ static float world_bonus(const char *id, const us_world *w)
 		return 0.3f * w->wind;
 	if (!strcmp(id, "tide"))
 		return 0.15f * w->water_level + 0.1f * night;
+	if (!strcmp(id, "abyss"))
+		return 0.2f * night + 0.15f * w->reef + 0.1f * w->water_level;
 	if (!strcmp(id, "pond"))
 		return 0.1f * w->water_level + 0.1f * summer;
 	return 0;
