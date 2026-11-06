@@ -1,10 +1,12 @@
 /* Understory scene: Wind — a prairie of grass in perspective, combed by gusts.
  *
- * Thousands of blades and seed stalks stand in depth rows (far rows small and faint, near rows tall),
- * each with its own resting arch, in clumps and hollows, with drifts of wildflowers. A trodden path winds
- * from the bottom edge up to a lone tree; tall oat stalks in the very foreground frame the view; a hazy
- * far range and a windbreak of poplars sit on the horizon. Cloud shadows slide over the grass.
- * The steady wind is a slow travelling noise field in ground-plane coordinates: calm, broad rolling waves.
+ * An open windswept hillside under a big sky. The ground is three rolling layers, each filled (a solid grass
+ * colour in pixel, a faint glow in ink) and then planted: the far downs (fine, dense grass, a texture) with a
+ * windbreak of poplars on their crest, the mid hill with a lone tree on its knoll as the focal silhouette,
+ * and the near slope of tall, sparse blades and seed heads. A trodden path winds from the bottom edge up
+ * to the tree; tall oat stalks frame the foreground; a hazy range sits behind the horizon. Gusts show as
+ * ragged lighter sweeps of bent grass travelling over every layer (pale undersides up), cloud shadows slide
+ * over them. The steady wind is a slow travelling noise field in ground-plane coordinates.
  * The music's drums arrive as events on top of it, each with its own answer:
  *   kick  -> the whole field ducks under the gust and a bright front rolls across it (a slanted wave,
  *            far rows a beat later); the tree shudders, the oat stalks heel over, poplars bow in turn.
@@ -33,7 +35,6 @@
 #define MAX_FRONTS 8
 #define MAX_BIRD 6
 #define MAX_GNAT 28
-#define KITE_ROW 17
 #define NTAIL 14
 #define HZ 0.47f /* horizon */
 #define MAX_TSEG 96
@@ -41,7 +42,16 @@
 #define MAX_TUMB 160
 #define MAX_CLOUD 7
 #define MAX_WISP 20
-#define TREE_ROW 21
+/* the ground is three rolling layers, far to near: A the far downs (fine dense grass, a texture),
+ * B the mid hill with the tree on its knoll, C the near slope (tall, sparse, individual blades) */
+#define NLAY 3
+#define RG_N 256
+#define TREE_D 0.04f /* depth of the tree within layer B (it stands on the crest) */
+#define KITE_D 0.3f  /* the kite flyer, further down layer B */
+static const int lay_rows[NLAY] = {10, 11, 13};
+static const int lay_cnt[NLAY] = {150, 72, 17};
+static const float lay_s0[NLAY] = {0.025f, 0.09f, 0.34f}, lay_s1[NLAY] = {0.07f, 0.28f, 1.0f};
+static const float lay_drop[NLAY] = {0.14f, 0.26f, 0.40f};
 
 typedef struct {
 	float u;    /* 0..1 across the row */
@@ -123,6 +133,9 @@ typedef struct {
 	float tbend, tvel; /* tree spring */
 	float wisp_acc;
 	int row_start[MAX_ROWS + 1];
+	uint8_t rlay[MAX_ROWS];            /* which ground layer a row belongs to */
+	float rd[MAX_ROWS], rsc[MAX_ROWS]; /* depth within the layer (0 ridge .. 1 front), perspective scale */
+	float rg[NLAY][RG_N + 1];          /* ridge line of each layer (y), sampled across the width */
 	blade_t bl[MAX_BLADES];
 	seed_t sd[MAX_SEEDS];
 	int nsd;
@@ -164,11 +177,21 @@ typedef struct {
 	float cache_A;        /* aspect the blade patterns were computed for */
 } st_t;
 
-static float row_s(int r)
+/* ridge line (top edge) of ground layer k at x (normalized units) */
+static float ridge(const st_t *s, int k, float x, float A)
 {
-	/* perspective scale of row r: 0 (far) .. 1 (near); rows bunch toward the horizon */
-	float f = (r + 0.6f) / MAX_ROWS;
-	return 0.04f + 0.96f * f * f * f;
+	float f = us_clampf(x / A, 0.0f, 1.0f) * RG_N;
+	int i = (int)f;
+	if (i >= RG_N)
+		i = RG_N - 1;
+	return us_lerp(s->rg[k][i], s->rg[k][i + 1], f - i);
+}
+
+/* the ground under a blade of row r at x */
+static float row_y(const st_t *s, int r, float x, float A)
+{
+	int k = s->rlay[r];
+	return ridge(s, k, x, A) + s->rd[r] * lay_drop[k];
 }
 
 static void tbranch(st_t *s, us_rng *r, int parent, float rel, float len, float w, int depth)
@@ -196,24 +219,39 @@ static void *create(uint32_t seed)
 	st_t *s = calloc(1, sizeof(*s));
 	us_rng *r = &s->rng;
 	us_rng_seed(r, seed ^ 0x77696e64u);
-	int n = 0;
-	for (int row = 0; row < MAX_ROWS; row++) {
-		s->row_start[row] = n;
-		float sc = row_s(row);
-		/* far rows hold more (smaller) blades across the same screen width */
-		int cnt = (int)(105.0f - 62.0f * sc);
-		for (int k = 0; k < cnt && n < MAX_BLADES; k++) {
-			blade_t *b = &s->bl[n++];
-			b->u = us_randr(r, -0.03f, 1.03f);
-			b->h = us_randr(r, 0.55f, 1.0f);
-			b->ph = us_rand(r) * 100.0f;
-			b->head = us_rand(r) < 0.22f;
-			b->tint = (uint8_t)(us_rand(r) * 4);
+	int n = 0, row = 0;
+	for (int k = 0; k < NLAY; k++)
+		for (int j = 0; j < lay_rows[k]; j++, row++) {
+			s->row_start[row] = n;
+			float f = (j + 0.5f) / lay_rows[k];
+			s->rlay[row] = (uint8_t)k;
+			s->rd[row] = powf(f, 1.3f); /* rows bunch toward the ridge (farther away) */
+			s->rsc[row] = us_lerp(lay_s0[k], lay_s1[k], s->rd[row]);
+			for (int q = 0; q < lay_cnt[k] && n < MAX_BLADES; q++) {
+				blade_t *b = &s->bl[n++];
+				b->u = us_randr(r, -0.03f, 1.03f);
+				b->h = us_randr(r, k == 2 ? 0.4f : 0.55f, 1.0f);
+				b->ph = us_rand(r) * 100.0f;
+				b->head = us_rand(r) < (k == 2 ? 0.34f : 0.2f);
+				b->tint = (uint8_t)(us_rand(r) * 4);
+			}
+		}
+	s->row_start[MAX_ROWS] = n;
+	/* the lone tree: a spreading crown on a short trunk, on a knoll of the mid hill */
+	s->tree_u = us_rand(r) < 0.5f ? us_randr(r, 0.17f, 0.3f) : us_randr(r, 0.7f, 0.83f);
+	{
+		float hs = us_rand(r) * 50.0f;
+		float cs = s->tree_u < 0.5f ? -1.0f : 1.0f; /* the near slope rises away from the tree */
+		for (int i = 0; i <= RG_N; i++) {
+			float u = (float)i / RG_N;
+			float dk = (u - s->tree_u) / 0.17f;
+			s->rg[0][i] = HZ - 0.006f - 0.042f * (0.5f + 0.5f * us_noise2(u * 2.6f + hs, 1.3f)) - 0.004f * us_noise2(u * 11.0f + hs, 4.0f);
+			s->rg[1][i] = HZ + 0.125f - 0.07f * (0.5f + 0.5f * us_noise2(u * 1.9f + hs + 10.0f, 2.1f)) - 0.1f * expf(-dk * dk) -
+				      0.003f * us_noise2(u * 14.0f + hs, 6.0f);
+			s->rg[2][i] = 0.73f - 0.06f * (0.5f + 0.5f * us_noise2(u * 1.5f + hs + 20.0f, 3.3f)) + 0.1f * (u - 0.5f) * cs -
+				      0.004f * us_noise2(u * 17.0f + hs, 8.0f);
 		}
 	}
-	s->row_start[MAX_ROWS] = n;
-	/* the lone tree: a spreading crown on a short trunk */
-	s->tree_u = us_rand(r) < 0.5f ? us_randr(r, 0.16f, 0.3f) : us_randr(r, 0.7f, 0.84f);
 	tbranch(s, r, -1, us_randn(r) * 0.04f, 0.28f, 1.0f, 0);
 	for (int i = 0; i < s->nts && s->nlf < MAX_LEAF; i++) {
 		if (s->ts[i].depth < 3)
@@ -332,8 +370,20 @@ static float wind_at(const st_t *s, float X, float Z, float ax, float az)
 	/* coordinate along the wind axis: slow, broad rolling waves (the steady breeze) */
 	float along = X * ax + Z * az;
 	float across = -X * az + Z * ax;
-	float g = us_noise2(along * 0.45f - s->flow, across * 0.3f + 3.7f);
-	g += 0.35f * us_noise2(along * 1.2f - s->flow * 1.7f, across * 0.8f + 9.1f);
+	float g = us_noise2(along * 0.7f - s->flow, across * 0.18f + 3.7f);
+	g += 0.35f * us_noise2(along * 1.9f - s->flow * 1.7f, across * 0.5f + 9.1f);
+	return us_smooth(-0.45f, 0.75f, g);
+}
+
+/* the gust bands seen on the ground: lighter sweeps of bent grass with their pale undersides up. The same
+ * travelling field as the breeze, finer, and warped so the sweeps are ragged rather than ruled lines. */
+static float band_at(const st_t *s, float X, float Z, float ax, float az)
+{
+	float along = X * ax + Z * az;
+	float across = -X * az + Z * ax;
+	float wx = 0.9f * us_noise2(across * 0.35f + 1.3f, along * 0.25f + s->flow * 0.3f);
+	float g = us_noise2(along * 0.7f + wx - s->flow, across * 0.4f + 3.7f);
+	g += 0.35f * us_noise2(along * 1.9f - s->flow * 1.7f, across * 0.9f + 9.1f);
 	return us_smooth(-0.45f, 0.75f, g);
 }
 
@@ -350,7 +400,7 @@ static float front_at(const st_t *s, float u, float sc)
 		float d = (uu + 0.22f * (1.0f - sc) - f->pos) / f->width;
 		/* steep leading edge, long recovering wake behind the crest */
 		if (d > -3.5f && d < 2.0f)
-			bend += f->sgn * f->amp * (d > 0 ? expf(-d * d * 3.0f) : expf(-d * d * 0.35f));
+			bend += f->sgn * f->amp * (d > 0 ? expf(-d * d * 3.0f) : expf(-d * d * 0.7f));
 	}
 	return bend;
 }
@@ -479,9 +529,8 @@ static void draw_tree(st_t *s, us_canvas *c, const us_ctx *ctx, float A, float s
 		      float dayv, float tear)
 {
 	float bx = s->tree_u * A;
-	float sc = row_s(TREE_ROW);
-	float by = HZ + (1.03f - HZ) * sc;
-	float H = 0.36f * (0.9f + 0.2f * ctx->w->growth);
+	float by = ridge(s, 1, bx, A) + TREE_D * lay_drop[1];
+	float H = 0.4f * (0.9f + 0.2f * ctx->w->growth);
 	float t = (float)ctx->t;
 	static const float flex[6] = {0.05f, 0.1f, 0.14f, 0.19f, 0.25f, 0.32f};
 	float leafk = (1.0f - 0.97f * winter) * (1.0f - 0.5f * autumn);
@@ -498,7 +547,7 @@ static void draw_tree(st_t *s, us_canvas *c, const us_ctx *ctx, float A, float s
 			pa = s->tea[g->parent];
 		}
 		float fl = g->depth >= 2 ? (us_noise2(i * 0.37f, t * (0.5f + 2.0f * gust)) * (0.015f + 0.07f * gust) +
-					    us_noise2(i * 0.91f + 5.0f, t * 16.0f) * 0.1f * s->senv) * g->depth * 0.33f : 0.0f;
+					    us_noise2(i * 0.91f + 5.0f, t * 16.0f) * 0.24f * s->senv) * g->depth * 0.33f : 0.0f;
 		/* crowns compress downwind: branches swing over with the bend */
 		float ang = pa + g->rel * (1.0f - 0.25f * us_sat(fabsf(s->tbend))) + sgn * s->tbend * flex[g->depth] + fl;
 		float L = g->len * H;
@@ -506,16 +555,31 @@ static void draw_tree(st_t *s, us_canvas *c, const us_ctx *ctx, float A, float s
 		s->tex[i] = ex;
 		s->tey[i] = ey;
 		s->tea[i] = ang;
-		float wd = 0.0075f * g->w;
+		float wd = (c->crisp ? 0.024f : 0.009f) * g->w;
 		if (wd < 0.0011f)
 			wd = 0.0011f;
-		float bv = us_sat((ctx->crisp ? 0.45f : 0.36f) * dayv + 0.05f * (5 - g->depth));
+		float bv = us_sat((ctx->crisp ? 0.3f : 0.5f) * dayv + 0.05f * (5 - g->depth));
 		if (c->crisp)
 			oline(c, px, py, ex, ey, wd, bv, US_MAT_STEM);
 		else
 			wline(c, px, py, ex, ey, wd, bv, US_MAT_STEM);
 		if (winter > 0.4f && g->depth <= 3 && fabsf(cosf(ang)) > 0.5f) /* snow along the limbs */
 			wline(c, px, py - 0.002f, ex, ey - 0.002f, 0.0016f, 0.6f * winter * dayv, US_MAT_WATER);
+	}
+	if (c->crisp && leafk > 0.2f) {
+		/* pixel: a solid crown silhouette under the leaves, so the tree reads as one strong shape */
+		uint8_t cm = leaf_mat(autumn, 0.9f);
+		for (int i = 0; i < s->nts; i++) {
+			if (s->ts[i].depth < 3)
+				continue;
+			float rr = (0.008f + 0.006f * (5 - s->ts[i].depth)) * (0.4f + 0.6f * leafk) * H / 0.36f;
+			float cx = s->tex[i], cy = s->tey[i];
+			int r = (int)(rr * c->s + 0.5f), px = (int)(cx * c->s), py = (int)(cy * c->s);
+			for (int yy = -r; yy <= r; yy++)
+				for (int xx = -r; xx <= r; xx++)
+					if (xx * xx + yy * yy <= r * r + r)
+						oput(c, px + xx, py + yy, (0.24f + 0.04f * (yy < 0)) * dayv, cm);
+		}
 	}
 	float stream = sgn > 0 ? 0.25f : US_PI - 0.25f;
 	int torn = 0;
@@ -528,15 +592,15 @@ static void draw_tree(st_t *s, us_canvas *c, const us_ctx *ctx, float A, float s
 		float px = g->parent >= 0 ? s->tex[g->parent] : bx, py = g->parent >= 0 ? s->tey[g->parent] : by;
 		float x = px + (s->tex[l->seg] - px) * l->off, y = py + (s->tey[l->seg] - py) * l->off;
 		float lift = us_sat(0.25f + 1.2f * gust + 0.3f * fabsf(s->tbend));
-		float fl = us_noise2(l->ph, t * (0.8f + 3.0f * gust)) + 0.8f * s->senv * us_noise2(l->ph + 3.0f, t * 18.0f);
+		float fl = us_noise2(l->ph, t * (0.8f + 3.0f * gust)) + 1.6f * s->senv * us_noise2(l->ph + 3.0f, t * 18.0f);
 		/* rotate toward the downwind direction by the shortest way */
 		float da = stream - l->ang;
 		da -= US_TAU * floorf((da + US_PI) / US_TAU);
 		float la = l->ang + da * lift * 0.8f + fl * (0.3f + 0.6f * gust);
 		/* gusts flip the leaves: their pale undersides catch the light */
 		float sheen = us_sat(0.5f + fl * 0.8f) * lift;
-		float v = us_sat((0.42f + 0.45f * sheen) * dayv);
-		float len = 0.0125f * l->sz;
+		float v = us_sat((c->crisp ? 0.3f + 0.45f * sheen : 0.5f + 0.45f * sheen) * dayv);
+		float len = (c->crisp ? 0.016f : 0.0135f) * l->sz;
 		float hk = l->keep * 3.1f;
 		uint8_t m = leaf_mat(autumn, hk - floorf(hk));
 		if (c->crisp) {
@@ -600,7 +664,7 @@ static void draw_kite(st_t *s, us_canvas *c, const us_ctx *ctx, float A, float s
 	float ky = hy - kh + 0.012f * us_noise2(5.1f, t * (0.7f + s->gust));
 	if (kx < 0.03f) kx = 0.03f;
 	if (kx > A - 0.03f) kx = A - 0.03f;
-	float ks = (0.016f + 0.006f * s->klift) * (c->crisp ? 1.6f : 1.0f);
+	float ks = (0.021f + 0.008f * s->klift) * (c->crisp ? 1.4f : 1.0f);
 	float ca = cosf(s->ktilt), sa = sinf(s->ktilt);
 	/* diamond in kite space: top, right, bottom, left (long lower spine) */
 	static const float kp[8] = {0, -1.0f, 0.62f, -0.25f, 0, 1.45f, -0.62f, -0.25f};
@@ -673,16 +737,24 @@ static void draw_kite(st_t *s, us_canvas *c, const us_ctx *ctx, float A, float s
 	}
 }
 
-/* the trodden path's centre x at depth sc (only nearer than the tree); *hw = its half width */
-static float path_at(const st_t *s, float A, float sc, float *hw)
+/* the trodden path's centre x in layer k at depth d (it runs from the tree down the mid hill, then
+ * reappears over the near slope's ridge and winds to the bottom edge); -10 where there is none */
+static float path_at(const st_t *s, float A, int k, float d, float sc, float *hw)
 {
-	float st = row_s(TREE_ROW);
-	float f = us_sat((sc - st) / (1.0f - st));
 	float side = s->path_x0 > s->tree_u ? 1.0f : -1.0f;
-	float xt = s->tree_u * A + side * 0.035f, xb = s->path_x0 * A;
-	float xc = us_lerp(xt, xb, powf(f, 0.75f)) - side * 0.05f * sinf(f * US_PI) * (0.4f + f);
-	*hw = 0.006f + 0.12f * sc;
-	return xc;
+	float tx = s->tree_u * A;
+	*hw = 0.003f + 0.1f * sc;
+	if (k == 1) {
+		if (d < TREE_D + 0.04f)
+			return -10.0f;
+		float f = (d - TREE_D) / (1.0f - TREE_D);
+		return tx + side * (0.012f + 0.16f * f + 0.03f * sinf(f * US_PI));
+	}
+	if (k == 2) {
+		float xt = tx + side * 0.24f, xb = s->path_x0 * A;
+		return us_lerp(xt, xb, powf(d, 0.8f)) - side * 0.07f * sinf(d * US_PI);
+	}
+	return -10.0f;
 }
 
 /* reservoir of grass tips (seed heads, flowers) this frame, for snare flurries and hat glints */
@@ -806,14 +878,14 @@ static void spawn_drums(st_t *s, const us_ctx *ctx, int snapped, float sgn)
 		}
 	}
 	if (a->hat_hit && s->ntip > 0) {
-		int n = (int)((16.0f + 30.0f * us_sat(a->hat)) * (0.5f + dens));
+		int n = (int)((16.0f + 30.0f * us_sat(a->hat)) * (0.5f + dens) * (ctx->crisp ? 1.6f : 1.0f));
 		for (int k = 0; k < n && s->ngl < MAX_GLINT; k++) {
 			int j = (int)(us_rng_u32(r) % (uint32_t)s->ntip);
 			glint_t *g = &s->gl[s->ngl++];
 			g->x = s->tipx[j];
 			g->y = s->tipy[j];
 			g->life = 1.0f;
-			g->sz = 0.006f + 0.011f * fminf(fmodf(s->tips[j], 2.0f), 1.0f);
+			g->sz = 0.008f + 0.014f * fminf(fmodf(s->tips[j], 2.0f), 1.0f);
 		}
 	}
 }
@@ -856,7 +928,7 @@ static void draw_drums(st_t *s, us_canvas *c, const us_ctx *ctx, float sgn, floa
 			continue;
 		}
 		float l = g->life * g->life;
-		float v = us_sat(0.25f + 0.75f * l) * (0.75f + 0.25f * dayv);
+		float v = us_sat((0.25f + 0.75f * l) * (0.3f + 0.75f * dayv));
 		float L = g->sz * (0.4f + 0.6f * l);
 		if (c->crisp) {
 			int px = (int)(g->x * c->s), py = (int)(g->y * c->s);
@@ -905,6 +977,118 @@ static void draw_drums(st_t *s, us_canvas *c, const us_ctx *ctx, float sgn, floa
 	}
 }
 
+/* a windbreak of poplars along the crest of the far downs, all leaning with the gusts */
+static void draw_poplars(const st_t *s, us_canvas *c, const us_ctx *ctx, float A, float sgn, float dayv, float winter)
+{
+	float u0 = s->tree_u < 0.5f ? 0.56f : 0.06f;
+	for (int i = 0; i < 18; i++) {
+		uint32_t hsh = (uint32_t)i * 2246822519u + 5u;
+		float u = u0 + 0.38f * (i + 0.5f * ((hsh >> 9) & 1023) / 1023.0f) / 18.0f;
+		if (i >= 15) /* a few strays */
+			u = ((hsh >> 9) & 1023) / 1023.0f;
+		float x = u * A;
+		float gy = ridge(s, 0, x, A) + 0.004f;
+		float th = (0.03f + 0.03f * ((hsh >> 3) & 63) / 63.0f) * (ctx->crisp ? 1.25f : 1.0f);
+		/* they lean with the bass and bow, one after another, as each kick front passes */
+		float bow = s->kpulse * us_smooth(0.0f, 1.0f, 1.0f - fabsf(u - (sgn > 0 ? 1.0f - s->kpulse : s->kpulse)) * 2.5f);
+		float bendk = sgn * ((0.004f + 0.02f * s->gust) * (0.6f + 0.4f * us_noise2(u * 9.0f, (float)ctx->t * (0.8f + 2.0f * s->gust))) +
+				     0.014f * s->bass_s + 0.016f * bow);
+		float tx = x + bendk * th / 0.03f, ty = gy - th;
+		uint8_t tm = winter > 0.6f ? US_MAT_EARTH : US_MAT_LEAF;
+		if (ctx->crisp) {
+			float tv = 0.36f * dayv;
+			otri(c, x - th * 0.16f, gy, x + th * 0.16f, gy, tx, ty, tv, tm);
+			otri(c, x - th * 0.16f, gy, x + th * 0.16f, gy, (x + tx) * 0.5f, gy + th * 0.1f, tv, tm);
+		} else {
+			/* a narrow spindle crown */
+			float tv = 0.4f * dayv;
+			float mx = x + (tx - x) * 0.45f, my = gy - th * 0.45f;
+			wline(c, x - th * 0.06f, gy, mx - th * 0.13f, my, 0.001f, tv, tm);
+			wline(c, mx - th * 0.13f, my, tx, ty, 0.001f, tv, tm);
+			wline(c, x + th * 0.06f, gy, mx + th * 0.13f, my, 0.001f, tv, tm);
+			wline(c, mx + th * 0.13f, my, tx, ty, 0.001f, tv, tm);
+			wline(c, x, gy, (x + mx) * 0.5f, (gy + my) * 0.5f, 0.001f, tv * 0.6f, US_MAT_STEM);
+		}
+	}
+}
+
+/* ground fill parameters for this frame */
+typedef struct {
+	float ax, az, gstr, breeze, shk, light, lt, push, hat, cloud;
+	float base[NLAY], band[NLAY], crest[NLAY], hiv[NLAY];
+	uint8_t m[NLAY], mh[NLAY];
+} fillp_t;
+
+/* gust-band brightness down one column of layer k, from its ridge y0 to where the next layer covers it (y1):
+ * the breeze's rolling waves are lighter bands of bent grass, a kick front a bright travelling crest */
+static void band_col(const st_t *s, const fillp_t *fp, int k, float x, float A, float y0, float y1, float *out, int nd)
+{
+	for (int j = 0; j < nd; j++) {
+		float y = us_lerp(y0, y1, (float)j / (nd - 1));
+		float d = us_sat((y - y0) / lay_drop[k]);
+		float sc = us_lerp(lay_s0[k], lay_s1[k], d), Z = 1.0f / sc;
+		float X = (x - A * 0.5f) * Z;
+		float bend = band_at(s, X * 0.6f, Z * 0.6f, fp->ax, fp->az);
+		float fb = us_sat(fabsf(front_at(s, x / A, sc)));
+		float sh = 1.0f - fp->shk +
+			   fp->shk * us_smooth(-0.3f, 0.3f, us_noise2(X * 0.05f - fp->cloud * 2.0f * fp->ax, Z * 0.08f - fp->cloud * 2.0f * fp->az));
+		float g = us_smooth(0.25f, 0.9f, bend) * (0.35f + 0.9f * fp->breeze);
+		float v = (fp->base[k] + fp->band[k] * g) * sh * fp->light + fp->crest[k] * fb * fp->light +
+			  fp->push * fp->band[k] * 0.15f * fp->light;
+		if (k == 0)
+			v += fp->hat * fp->band[k] * (0.4f + g); /* hats: the far downs shimmer */
+		out[j] = v;
+	}
+}
+
+static void fill_layer(const st_t *s, us_canvas *c, const fillp_t *fp, int k, float A)
+{
+	int step = c->crisp ? 2 : 4;
+	float S = c->s;
+	enum { MAXND = 32 };
+	float a[MAXND], b[MAXND], ya0 = 0, ya1 = 0;
+	/* depth samples per column: dense on small pixel canvases (no facets), fewer in ink (smooth glow) */
+	static const int ndc[NLAY] = {8, 14, 22}, ndi[NLAY] = {8, 10, 14};
+	int nd = c->crisp ? ndc[k] : ndi[k];
+	for (int gx = 0; gx - step < c->w; gx += step) {
+		float x = (gx + 0.5f) / S;
+		float yb0 = ridge(s, k, x, A);
+		float yb1 = k < NLAY - 1 ? ridge(s, k + 1, x, A) + 2.0f / S : 1.0f + 1.0f / S;
+		if (yb1 < yb0 + 1.0f / S)
+			yb1 = yb0 + 1.0f / S;
+		band_col(s, fp, k, x, A, yb0, yb1, b, nd);
+		if (gx > 0)
+			for (int px = gx - step; px < gx && px < c->w; px++) {
+				float t = (float)(px - (gx - step)) / step;
+				float y0 = us_lerp(ya0, yb0, t), y1 = us_lerp(ya1, yb1, t);
+				int py0 = (int)floorf(y0 * S + 0.5f), py1 = (int)(y1 * S);
+				if (py0 < 0)
+					py0 = 0;
+				if (py1 > c->h - 1)
+					py1 = c->h - 1;
+				float inv = (nd - 1) / ((y1 - y0) * S);
+				for (int py = py0; py <= py1; py++) {
+					float f = (py + 0.5f - y0 * S) * inv;
+					if (f < 0)
+						f = 0;
+					if (f > nd - 1.001f)
+						f = nd - 1.001f;
+					int j = (int)f;
+					f -= j;
+					float v = us_lerp(us_lerp(a[j], a[j + 1], f), us_lerp(b[j], b[j + 1], f), t);
+					if (py == py0 && c->crisp) /* each layer's crest catches the light: a rim against the layer behind */
+						v += 0.14f;
+					size_t ii = (size_t)py * c->w + px;
+					c->ink[ii] = (uint8_t)(us_sat(v) * 255.0f + 0.5f);
+					c->mat[ii] = v > fp->hiv[k] ? fp->mh[k] : fp->m[k];
+				}
+			}
+		memcpy(a, b, sizeof(float) * nd);
+		ya0 = yb0;
+		ya1 = yb1;
+	}
+}
+
 static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 {
 	st_t *s = sp;
@@ -935,14 +1119,14 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 	s->breeze = us_approach(s->breeze, tb, tb > s->breeze ? 1.2f : 2.5f, rdt);
 	s->gust = s->breeze; /* the kite, birds, clouds and leaves all ride the steady wind */
 	/* louder passages bring the light out over the field; quiet ones sink into shade */
-	float tl = us_sat(0.12f + 0.95f * a->level + 0.2f * s->swell_s);
-	s->light = us_approach(s->light, tl, tl > s->light ? 0.25f : 0.6f, rdt);
+	float tl = us_sat(0.06f + 0.86f * a->level + 0.08f * s->swell_s);
+	s->light = us_approach(s->light, tl, tl > s->light ? 0.15f : 0.4f, rdt);
 	float tdir = a->active > 0.2f ? (a->centroid - 0.5f) * 1.6f : 0.35f * us_noise2((float)ctx->t * 0.02f, 1.3f);
 	s->dir = us_approach(s->dir, us_clampf(tdir, -0.9f, 0.9f), 6.0f, rdt);
 	s->swell = us_approach(s->swell, us_sat(a->bass * 0.7f + a->sub * 0.4f), 1.2f, rdt);
 	float ax = cosf(s->dir), az = sinf(s->dir); /* ax > 0: blowing left -> right */
 	float gstr = 0.07f + 0.3f * s->breeze + 0.1f * winter;
-	s->flow += dt * (0.08f + 0.3f * s->breeze);
+	s->flow += dt * (0.045f + 0.1f * s->breeze);
 	s->cloud_t += dt * (0.015f + 0.05f * s->breeze);
 	float sgn = ax >= 0 ? 1.0f : -1.0f;
 
@@ -981,10 +1165,10 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 			}
 		}
 		front_t *f = &s->fr[slot];
-		f->amp = (sg > 0 ? 1.0f : 0.6f) * ks * (0.75f + 0.25f * s->breeze);
+		f->amp = (sg > 0 ? 1.2f : 0.72f) * ks * (0.75f + 0.25f * s->breeze);
 		f->sgn = sg * sgn;
 		f->pos = us_randr(r, -0.05f, 0.1f);
-		f->speed = us_randr(r, 3.6f, 4.4f);
+		f->speed = us_randr(r, 4.8f, 5.6f);
 		f->width = us_randr(r, 0.09f, 0.13f);
 	}
 	for (int i = 0; i < MAX_FRONTS; i++) {
@@ -992,13 +1176,13 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 		if (f->amp <= 0.002f)
 			continue;
 		f->pos += f->speed * rdt;
-		f->amp *= expf(-rdt * 4.0f);
+		f->amp *= expf(-rdt * 5.0f);
 		if (f->pos > 1.6f)
 			f->amp = 0;
 	}
 	/* snare -> a sharp flurry: stalks shiver, seeds and petals are torn off, leaves snap, birds startle */
 	int snapped = 0;
-	s->senv = us_approach(s->senv, 0.0f, 0.1f, rdt);
+	s->senv = us_approach(s->senv, 0.0f, 0.07f, rdt);
 	if (a->snare_hit && ctx->t - s->last_onset_t > 0.08f) {
 		snapped = 1;
 		s->last_onset_t = (float)ctx->t;
@@ -1010,12 +1194,12 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 		s->henv = fmaxf(s->henv, 0.6f + 0.4f * us_sat(a->hat));
 
 	float dayv = 0.8f + 0.2f * us_smooth(0.0f, 0.6f, day);
-	float lightk = 0.45f + 0.75f * s->light; /* how lit the field is (loudness) */
+	float lightk = 0.5f + 0.75f * s->light; /* how lit the field is (loudness) */
 
 	/* ---- the tree's spring: pushed by the local wind (fronts included), overshoots and rebounds ---- */
 	float tear = 0;
 	{
-		float sc = row_s(TREE_ROW), Z = 1.0f / sc;
+		float sc = us_lerp(lay_s0[1], lay_s1[1], TREE_D), Z = 1.0f / sc;
 		float X = (s->tree_u * A - A * 0.5f) * Z;
 		float bend = wind_at(s, X * 0.25f, Z * 0.25f, ax, az);
 		float fb = front_at(s, s->tree_u, sc) * sgn;
@@ -1028,6 +1212,17 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 			tear = dt * (force - 0.3f) * 0.12f * (0.3f + 2.5f * autumn) * (1.0f - winter);
 		if (snapped) /* a sharp hit snaps a few leaves off at once */
 			tear += (0.008f + 0.01f * a->snare) * (0.4f + autumn) * (1.0f - winter);
+	}
+
+	/* ---- pixel styles by day: banded pale sky first (ink keeps its black ground);
+	 *      the hills in front of it overwrite it ---- */
+	if (ctx->crisp && day > 0.2f) {
+		float f[2 * 6];
+		for (int j = 0; j < 6; j++)
+			f[2 * j] = f[2 * j + 1] = (0.08f + 0.3f * j / 5.0f) * us_smooth(0.2f, 0.7f, day);
+		int keep_blend = c->blend;
+		us_field(c, f, 2, 6, 1.0f, US_MAT_WATER, 0, 0, A, HZ);
+		c->blend = keep_blend;
 	}
 
 	/* ---- sky: sun / moon, cumulus ---- */
@@ -1202,7 +1397,7 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 					}
 				}
 				for (int i = 0; i < 96; i++)
-					wline(c, fp[2 * i], fp[2 * i + 1], fp[2 * i + 2], fp[2 * i + 3], 0.0011f, (0.2f + 0.06f * day) * dayv, US_MAT_WATER);
+					wline(c, fp[2 * i], fp[2 * i + 1], fp[2 * i + 2], fp[2 * i + 3], 0.0011f, (0.26f + 0.06f * day) * dayv, US_MAT_WATER);
 				/* engraver's hatching down the shaded flanks, slanting with the slope */
 				for (int i = 1; i < 95; i += 2) {
 					float sl = fp[2 * i + 3] - fp[2 * i - 1];
@@ -1219,108 +1414,28 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 			} else {
 				for (int i = 0; i < 96; i++) {
 					float x0 = fp[2 * i], y0 = fp[2 * i + 1], x1 = fp[2 * i + 2], y1 = fp[2 * i + 3];
-					us_tri(c, x0, y0, x1, y1, x0, HZ, 0.27f * dayv, US_MAT_BG);
-					us_tri(c, x1, y1, x1, HZ, x0, HZ, 0.27f * dayv, US_MAT_BG);
+					otri(c, x0, y0, x1, y1, x0, HZ, (day > 0.35f ? 0.22f : 0.5f) * dayv, day > 0.35f ? US_MAT_WATER : US_MAT_BG);
+					otri(c, x1, y1, x1, HZ, x0, HZ, (day > 0.35f ? 0.22f : 0.5f) * dayv, day > 0.35f ? US_MAT_WATER : US_MAT_BG);
 				}
 			}
 		}
-		/* distant treeline / hills on the horizon */
-		float pts[2 * 65];
-		for (int i = 0; i <= 64; i++) {
-			float u = i / 64.0f;
-			pts[2 * i] = u * A;
-			pts[2 * i + 1] = HZ - 0.012f - 0.018f * (0.5f + 0.5f * us_noise2(u * 5.0f, 8.0f)) - 0.006f * us_noise2(u * 31.0f, 2.0f);
-		}
-		us_polyline(c, pts, 65, 0.0013f, 0.32f * dayv, US_MAT_EARTH);
-		/* a windbreak of poplars along the far edge, all leaning with the gusts */
-		for (int i = 0; i < 26; i++) {
-			uint32_t hsh = (uint32_t)i * 2246822519u + 5u;
-			float u = ((hsh >> 9) & 1023) / 1023.0f;
-			float x = u * A;
-			float gy = HZ - 0.012f - 0.018f * (0.5f + 0.5f * us_noise2(u * 5.0f, 8.0f));
-			float th = 0.018f + 0.022f * ((hsh >> 3) & 63) / 63.0f;
-			/* they lean with the bass and bow, one after another, as each kick front passes */
-			float bow = s->kpulse * us_smooth(0.0f, 1.0f, 1.0f - fabsf(u - (sgn > 0 ? 1.0f - s->kpulse : s->kpulse)) * 2.5f);
-			float bendk = sgn * ((0.004f + 0.02f * s->gust) * (0.6f + 0.4f * us_noise2(u * 9.0f, (float)ctx->t * (0.8f + 2.0f * s->gust))) +
-					     0.014f * s->bass_s + 0.016f * bow);
-			float tx = x + bendk * th / 0.03f, ty = gy - th;
-			uint8_t tm = winter > 0.6f ? US_MAT_EARTH : US_MAT_LEAF;
-			float tv = 0.3f * dayv;
-			if (ctx->crisp) {
-				us_tri(c, x - th * 0.12f, gy, x + th * 0.12f, gy, tx, ty, tv + 0.05f, tm);
-			} else {
-				/* a narrow spindle crown */
-				float mx = x + (tx - x) * 0.45f, my = gy - th * 0.45f;
-				wline(c, x - th * 0.06f, gy, mx - th * 0.13f, my, 0.001f, tv, tm);
-				wline(c, mx - th * 0.13f, my, tx, ty, 0.001f, tv, tm);
-				wline(c, x + th * 0.06f, gy, mx + th * 0.13f, my, 0.001f, tv, tm);
-				wline(c, mx + th * 0.13f, my, tx, ty, 0.001f, tv, tm);
-			}
-		}
-		us_line(c, 0, HZ, A, HZ, 0.0012f, 0.28f * dayv, US_MAT_EARTH);
-		if (ctx->crisp)
-			for (int i = 0; i < 64; i++) {
-				float x0 = pts[2 * i], y0 = pts[2 * i + 1], x1 = pts[2 * i + 2], y1 = pts[2 * i + 3];
-				us_tri(c, x0, y0, x1, y1, x0, HZ, 0.2f * dayv, US_MAT_EARTH);
-				us_tri(c, x1, y1, x1, HZ, x0, HZ, 0.2f * dayv, US_MAT_EARTH);
-			}
 	}
 
-	/* ---- pixel styles by day: banded pale sky (ink keeps its black ground) ---- */
-	if (ctx->crisp && day > 0.2f) {
-		float f[2 * 6];
-		for (int j = 0; j < 6; j++)
-			f[2 * j] = f[2 * j + 1] = (0.08f + 0.3f * j / 5.0f) * us_smooth(0.2f, 0.7f, day);
-		int keep_blend = c->blend;
-		us_field(c, f, 2, 6, 1.0f, US_MAT_WATER, 0, 0, A, HZ);
-		c->blend = keep_blend;
-	}
-
-	/* ---- ground fill (pixel styles): dark meadow / snow, and the trodden path ---- */
-	if (ctx->crisp) {
-		float gv = (0.12f + 0.06f * winter) * dayv;
-		us_tri(c, 0, HZ, A, HZ, 0, 1.01f, gv, winter > 0.5f ? US_MAT_WATER : US_MAT_EARTH);
-		us_tri(c, A, HZ, A, 1.01f, 0, 1.01f, gv, winter > 0.5f ? US_MAT_WATER : US_MAT_EARTH);
-	}
-	{
-		/* the path: a pale strip of bare earth winding from the bottom edge up to the tree */
-		float px0 = 0, py0 = 0, pw0 = 0;
-		for (int i = 0; i <= 16; i++) {
-			float sc = row_s(TREE_ROW) + (1.0f - row_s(TREE_ROW)) * (i / 16.0f);
-			float hw, xc = path_at(s, A, sc, &hw);
-			float y = HZ + (1.03f - HZ) * sc;
-			if (i > 0) {
-				if (ctx->crisp) {
-					float pv = (0.2f + 0.06f * winter) * dayv;
-					us_tri(c, px0 - pw0 * 0.7f, py0, px0 + pw0 * 0.7f, py0, xc + hw * 0.7f, y, pv, US_MAT_EARTH);
-					us_tri(c, px0 - pw0 * 0.7f, py0, xc + hw * 0.7f, y, xc - hw * 0.7f, y, pv, US_MAT_EARTH);
-				} else {
-					/* engraved ruts: two fine converging lines */
-					float rv = 0.16f * dayv * lightk;
-					wline(c, px0 - pw0 * 0.3f, py0, xc - hw * 0.3f, y, 0.001f, rv, US_MAT_EARTH);
-					wline(c, px0 + pw0 * 0.3f, py0, xc + hw * 0.3f, y, 0.001f, rv, US_MAT_EARTH);
-				}
-			}
-			px0 = xc;
-			py0 = y;
-			pw0 = hw;
-		}
-	}
-
-	/* ---- grass ---- */
+	/* ---- the ground: three rolling layers, far to near. Each is filled (a solid grass colour in pixel,
+	 *      a faint glow in ink) with the gust bands rolling through it, then its blades are drawn. ---- */
 	float height = (0.30f + 0.95f * w->growth) * (1.0f - 0.45f * winter) * (1.0f + 0.08f * s->swell);
+	float heightC = (0.55f + 0.6f * w->growth) * (1.0f - 0.4f * winter) * (1.0f + 0.08f * s->swell);
 	float keep = (0.3f + 0.7f * dens) * (1.0f - 0.55f * winter);
-	int rows_on = MAX_ROWS;
 	float lean0 = 0.15f * winter; /* snow-bent */
 	float shake = 0;
 	float tt = (float)ctx->t;
-	float scT = row_s(TREE_ROW);
+	float shk = 0.3f * (1.0f - 0.7f * s->light); /* light burns the cloud shadows off; quiet deepens them */
 	s->ntip = 0;
 	s->tipseen = 0;
 	if (s->cache_A != A) { /* clumps and flower drifts are fixed on the ground: compute once per aspect */
 		s->cache_A = A;
 		for (int row = 0; row < MAX_ROWS; row++) {
-			float Z = 1.0f / row_s(row);
+			float Z = 1.0f / s->rsc[row] + 3.0f * s->rlay[row];
 			for (int k = s->row_start[row]; k < s->row_start[row + 1]; k++) {
 				blade_t *b = &s->bl[k];
 				float X = (b->u * A - A * 0.5f) * Z;
@@ -1329,171 +1444,275 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 			}
 		}
 	}
-	for (int row = 0; row < rows_on; row++) {
-		float sc = row_s(row);
-		float y = HZ + (1.03f - HZ) * sc;
-		float Z = 1.0f / sc;
-		int b0 = s->row_start[row], b1 = s->row_start[row + 1];
-		int nb = (int)((b1 - b0) * keep);
-		/* sub: a long, slow swell rolls through the field toward the viewer, lifting row after row */
-		float roll = sinf(Z * 0.9f + s->sub_ph * 2.4f);
-		float H = 0.36f * sc * height * (1.0f + 0.08f * s->sub_s * roll);
-		float shk = 0.42f * (1.0f - 0.6f * s->light); /* light burns the cloud shadows off; quiet deepens them */
-		float wid = ctx->crisp ? (sc > 0.55f ? 0.012f : 0.0f) : 0.001f + 0.0022f * sc;
-		/* aerial perspective: far rows faint, near rows full; the light follows the loudness */
-		float vrow = (ctx->crisp ? 0.3f + 0.65f * sqrtf(sc) : 0.3f + 0.8f * sqrtf(sc)) * dayv * lightk;
-		float hw = 0, xc = -10;
-		if (sc >= scT)
-			xc = path_at(s, A, sc, &hw);
-		float push = s->kimp * (0.1f + 0.22f * sc); /* the kick's pressure: the whole field ducks, near more */
-		float shiv = s->senv * (0.1f + 0.3f * sc); /* the snare's shiver */
-		float hatf = s->henv * (1.0f - sqrtf(sc));   /* hats glint along the far rows */
-		if (row == TREE_ROW)
-			draw_tree(s, c, ctx, A, sgn, s->gust, autumn, winter, dayv * lightk, tear);
-		/* pixel canvases cannot resolve every far blade: thin the farthest rows */
-		int kstep = ctx->crisp && sc < 0.1f ? 2 : 1;
-		for (int k = 0; k < nb; k += kstep) {
-			blade_t *b = &s->bl[b0 + k];
-			float x = b->u * A;
-			float X = (x - A * 0.5f) * Z;
-			float hmul = 1.0f;
-			if (xc > -5) { /* trodden path: bare in the middle, short and broken at its edges */
-				float e = hw * (0.75f + 0.5f * fmodf(b->ph * 3.3f, 1.0f));
-				float dx = fabsf(x - xc);
-				if (dx < e * 0.55f)
+	fillp_t fp;
+	fp.ax = ax;
+	fp.az = az;
+	fp.gstr = gstr;
+	fp.breeze = s->breeze;
+	fp.lt = s->light;
+	fp.shk = ctx->crisp ? shk * 0.5f : shk;
+	fp.light = dayv * lightk * (0.15f + 0.85f * lightk);
+	fp.push = s->kimp * (ctx->crisp ? 1.7f : 4.0f); /* ink: the whole field brightens under the gust; pixel: gently, so it never flashes */
+	fp.hat = s->henv;
+	fp.cloud = s->cloud_t;
+	{
+		/* aerial perspective: the far downs hazy and pale, the near slope deep; the season sets the colours */
+		static const float cb[NLAY] = {0.4f, 0.3f, 0.17f}, cbd[NLAY] = {0.18f, 0.32f, 0.42f}, ccr[NLAY] = {0.14f, 0.2f, 0.24f};
+		static const float ib[NLAY] = {0.08f, 0.065f, 0.045f}, ibd[NLAY] = {0.06f, 0.07f, 0.06f}, icr[NLAY] = {0.08f, 0.11f, 0.1f};
+		for (int k = 0; k < NLAY; k++) {
+			fp.base[k] = ctx->crisp ? cb[k] : ib[k];
+			fp.band[k] = ctx->crisp ? cbd[k] : ibd[k];
+			fp.crest[k] = ctx->crisp ? ccr[k] : icr[k];
+			fp.hiv[k] = ctx->crisp ? 0.6f : 0.2f;
+			if (winter > 0.5f) {
+				fp.m[k] = US_MAT_ACCENT;
+				fp.mh[k] = US_MAT_ACCENT;
+			} else if (autumn > 0.5f) {
+				fp.m[k] = k == 0 ? US_MAT_EARTH : US_MAT_LIGHT;
+				fp.mh[k] = k == 0 ? US_MAT_LIGHT : US_MAT_ACCENT;
+			} else {
+				fp.m[k] = k == 0 ? US_MAT_LEAF : US_MAT_STEM;
+				fp.mh[k] = US_MAT_LEAF;
+			}
+		}
+	}
+	int tree_done = 0, kite_done = 0;
+	for (int k = 0; k < NLAY; k++) {
+		if (k == 1)
+			draw_poplars(s, c, ctx, A, sgn, dayv * lightk, winter);
+		fill_layer(s, c, &fp, k, A);
+		if (!ctx->crisp) {
+			/* ink: the layer's skyline, a fine contour */
+			float rv = (0.3f + 0.08f * k) * dayv * lightk;
+			float px = 0, py = ridge(s, k, 0, A);
+			for (int i = 1; i <= 96; i++) {
+				float x = A * i / 96.0f, y = ridge(s, k, x, A);
+				wline(c, px, py, x, y, 0.0012f, rv, US_MAT_EARTH);
+				px = x;
+				py = y;
+			}
+		}
+		if (k >= 1) {
+			/* the path: a pale strip of bare earth (pixel), two engraved ruts (ink) */
+			float px0 = 0, py0 = 0, pw0 = 0;
+			int have = 0;
+			for (int i = 0; i <= 16; i++) {
+				float d = i / 16.0f, sc = us_lerp(lay_s0[k], lay_s1[k], d), hw;
+				float xc = path_at(s, A, k, d, sc, &hw);
+				if (xc < -5) {
+					have = 0;
 					continue;
-				if (dx < e * 1.8f)
-					hmul = 0.2f + 0.8f * us_smooth(e * 0.55f, e * 1.8f, dx);
-			}
-			/* clumps: taller stands and low hollows, so the field has structure */
-			hmul *= b->clump;
-			float bend = wind_at(s, X * 0.25f, Z * 0.25f, ax, az);
-			float fb = front_at(s, b->u, sc);
-			float flut = 0.018f * us_noise2(b->ph, tt * 0.9f);
-			if (shiv > 0.004f)
-				flut += shiv * us_noise2(b->ph * 1.7f, tt * 15.0f);
-			float persp = 0.35f + 0.65f * fabsf(ax) + 0.2f;
-			/* every blade has its own resting arch (most bow downwind, some the other way), so a still field
-			 * is still grass rather than rain */
-			float fr7 = fmodf(b->ph * 5.13f, 1.0f);
-			float rest = (fr7 < 0.72f ? 1.0f : -0.8f) * (0.1f + 0.28f * fmodf(b->ph * 2.71f, 1.0f));
-			float bb = ((lean0 + rest + gstr * bend + flut + push) * sgn + fb) * persp;
-			float h = H * b->h * hmul * (b->head ? 1.25f : 1.0f);
-			/* blowing toward/away from the viewer foreshortens the blades */
-			float fs = 1.0f - 0.35f * fabsf(az) * us_sat(bend);
-			float shadow = 1.0f - shk + shk * us_smooth(-0.3f, 0.3f, us_noise2(X * 0.05f - s->cloud_t * 2.0f * ax, Z * 0.08f - s->cloud_t * 2.0f * az));
-			/* bent blades catch the light: the breeze's waves are soft sheens, a kick front a bright band */
-			float sheen = 0.72f + 0.3f * bend * (0.3f + s->breeze) + 0.5f * us_sat(fabsf(fb)) + 0.5f * push;
-			if (b->tint == 1)
-				sheen += 0.9f * hatf;
-			float v = us_sat(vrow * shadow * sheen * (0.75f + 0.25f * b->h));
-			uint8_t m = US_MAT_LEAF;
-			if (autumn > 0.5f)
-				m = b->tint < 2 ? US_MAT_LIGHT : (b->tint == 2 ? US_MAT_EARTH : US_MAT_STEM); /* sun-gold, dry, straw */
-			else if (winter > 0.5f)
-				m = b->tint < 3 ? US_MAT_EARTH : US_MAT_STEM;
-			else if (summer > 0.5f && b->tint == 0)
-				m = US_MAT_STEM;
-			/* the crest of a gust front: bent blades flash their pale sides, a travelling sheen of light */
-			if (winter < 0.5f && autumn < 0.5f && b->tint == 1 && b->h > 0.86f && fabsf(fb) > 0.3f && sc > 0.08f)
-				m = US_MAT_LIGHT;
-			float pts[8];
-			float bx = us_clampf(bb * 0.9f, -1.6f, 1.6f);
-			for (int q = 0; q < 4; q++) {
-				float t = q / 3.0f;
-				pts[2 * q] = x + bx * h * t * t;
-				pts[2 * q + 1] = y - h * fs * t * (1.0f - 0.3f * fabsf(bx) * t);
-			}
-			blade(c, x, y, bx, h, fs, wid, v, m);
-			float tx = pts[6], ty = pts[7];
-			float force = gstr * bend + 0.5f * fabsf(fb);
-			if (winter > 0.4f && b->tint == 3) /* snow caught on the tips */
-				us_point(c, tx, ty, 0.0015f + 0.003f * sc, 0.6f * winter * dayv, US_MAT_WATER);
-			int flower = 0;
-			if (!b->head && b->tint == 3 && sc > 0.22f && winter < 0.5f) {
-				/* wildflowers grow in drifts, not evenly */
-				flower = fmodf(b->ph * 7.31f, 1.0f) < (0.03f + 0.75f * b->fpatch) * (0.6f + 0.6f * w->bloom);
-			}
-			if (flower) {
-				/* wildflowers among the grass: heads nod to the lower mids, then go to seed clocks in late summer */
-				float dx = pts[6] - pts[4], dy = pts[7] - pts[5];
-				float dl = sqrtf(dx * dx + dy * dy) + 1e-6f;
-				float nod = 0.35f * s->lowmid_s * us_noise2(b->ph * 3.1f, tt * 1.2f);
-				float rr = (0.005f + 0.008f * sc) * (0.6f + 0.4f * w->growth);
-				float fx = tx + (dx / dl + nod) * rr * 0.8f, fy = ty + dy / dl * rr * 0.8f;
-				float clock = us_smooth(0.6f, 1.2f, summer + autumn * 0.5f) * (1.0f - us_smooth(0.4f, 0.9f, autumn));
-				float fv = us_sat(v * 1.2f + 0.08f);
-				if (clock > 0.5f && fmodf(b->ph * 3.7f, 1.0f) < 0.6f) {
-					/* a dandelion clock: a ring of fluff that thins in the gusts */
-					int np = c->crisp ? 4 : 9;
-					for (int q = 0; q < np; q++) {
-						float an = US_TAU * q / np + b->ph;
-						float fq = fmodf(b->ph * 13.0f + q * 0.37f, 1.0f);
-						if (fq < force * 0.8f)
-							continue; /* this tuft has blown */
-						float px2 = fx + cosf(an) * rr, py2 = fy + sinf(an) * rr;
-						if (c->crisp)
-							us_put(c, (int)(px2 * c->s), (int)(py2 * c->s), fv * 0.8f, US_MAT_ACCENT);
-						else
-							wline(c, fx, fy, px2, py2, 0.0008f, fv * 0.45f, US_MAT_ACCENT);
-					}
-				} else if (c->crisp) {
-					us_disc(c, fx, fy, rr * 0.9f, fv, US_MAT_BLOOM);
-				} else {
-					/* five petals: little loops around a bright eye */
-					for (int q = 0; q < 5; q++) {
-						float an = US_TAU * q / 5 + b->ph + nod * 2.0f;
-						wline(c, fx, fy, fx + cosf(an) * rr, fy + sinf(an) * rr * 0.7f, 0.0016f + 0.001f * sc, fv * 0.8f, US_MAT_BLOOM);
-					}
-					us_point(c, fx, fy, 0.0011f + 0.001f * sc, us_sat(fv * 1.3f), US_MAT_LIGHT);
 				}
-				tip_add(s, fx, fy, sc + 2.0f); /* +2 marks a flower (petals fly) */
-			}
-			if (b->head && winter < 0.6f && sc > 0.12f) {
-				/* seed head: a short thick spike along the tip direction */
-				float dx = pts[6] - pts[4], dy = pts[7] - pts[5];
-				float dl = sqrtf(dx * dx + dy * dy) + 1e-6f;
-				float hl = (0.012f + 0.018f * (summer + autumn)) * sc * height;
-				float hx = tx + dx / dl * hl, hy = ty + dy / dl * hl;
-				uint8_t hm = spring > 0.5f ? US_MAT_LEAF : (autumn > 0.5f ? US_MAT_BLOOM : US_MAT_ACCENT);
-				float hv = us_sat(v * 1.25f + 0.1f);
-				if (ctx->crisp)
-					us_line(c, tx, ty, hx, hy, sc > 0.6f ? 0.0045f : 0.001f, hv, hm);
-				else {
-					/* ink: a slender spike with two fine awns */
-					wline(c, tx, ty, hx, hy, 0.0012f + 0.0016f * sc, hv, hm);
-					float nx = -dy / dl * hl * 0.35f, ny = dx / dl * hl * 0.35f;
-					float mx = (tx + hx) * 0.5f, my = (ty + hy) * 0.5f;
-					wline(c, mx, my, hx + nx, hy + ny, 0.0008f, hv * 0.6f, hm);
-					wline(c, mx, my, hx - nx, hy - ny, 0.0008f, hv * 0.6f, hm);
+				float y = ridge(s, k, xc, A) + d * lay_drop[k];
+				if (have) {
+					if (ctx->crisp) {
+						float pv = (0.52f + 0.06f * winter) * dayv * lightk;
+						otri(c, px0 - pw0 * 0.45f, py0, px0 + pw0 * 0.45f, py0, xc + hw * 0.45f, y, pv, US_MAT_EARTH);
+						otri(c, px0 - pw0 * 0.45f, py0, xc + hw * 0.45f, y, xc - hw * 0.45f, y, pv, US_MAT_EARTH);
+					} else {
+						float rv = 0.2f * dayv * lightk;
+						wline(c, px0 - pw0 * 0.3f, py0, xc - hw * 0.3f, y, 0.001f, rv, US_MAT_EARTH);
+						wline(c, px0 + pw0 * 0.3f, py0, xc + hw * 0.3f, y, 0.001f, rv, US_MAT_EARTH);
+					}
 				}
-				tip_add(s, hx, hy, sc);
-				/* strong gusts shake seeds loose */
-				if (force > 0.35f && s->nsd < MAX_SEEDS &&
-				    us_rand(r) < dt * (force - 0.3f) * 2.0f * (0.4f + summer + autumn) * (0.5f + w->growth)) {
-					seed_t *q = &s->sd[s->nsd++];
-					q->x = hx;
-					q->y = hy;
-					q->vx = sgn * us_randr(r, 0.05f, 0.18f) * (0.5f + s->gust);
-					q->vy = -us_randr(r, 0.01f, 0.05f) * (0.3f + sc);
-					q->life = 1.0f;
-					q->ph = us_rand(r) * 10;
-					q->sz = 0.0008f + 0.0018f * sc;
-					shake += 1.0f;
+				have = 1;
+				px0 = xc;
+				py0 = y;
+				pw0 = hw;
+			}
+		}
+		int r0 = 0;
+		for (int q = 0; q < k; q++)
+			r0 += lay_rows[q];
+		for (int row = r0; row < r0 + lay_rows[k]; row++) {
+			float sc = s->rsc[row], d = s->rd[row];
+			if (k == 1 && !tree_done && d >= TREE_D) {
+				draw_tree(s, c, ctx, A, sgn, s->gust, autumn, winter, dayv * lightk, tear);
+				tree_done = 1;
+			}
+			if (k == 1 && !kite_done && d >= KITE_D) {
+				float kx = s->kite_u * A;
+				draw_kite(s, c, ctx, A, sgn, ridge(s, 1, kx, A) + KITE_D * lay_drop[1], us_lerp(lay_s0[1], lay_s1[1], KITE_D), dayv,
+					  winter);
+				kite_done = 1;
+			}
+			float Z = 1.0f / sc;
+			int b0 = s->row_start[row], b1 = s->row_start[row + 1];
+			int nb = (int)((b1 - b0) * keep);
+			/* sub: a long, slow swell rolls through the field toward the viewer, lifting row after row */
+			float roll = sinf(Z * 0.9f + s->sub_ph * 2.4f);
+			float H = (k == 0 ? 0.26f : 0.34f) * sc * (k == 2 ? heightC : height) * (1.0f + 0.08f * s->sub_s * roll);
+			float wid;
+			if (ctx->crisp)
+				wid = k == 2 && sc > 0.7f ? 0.011f : 0.0f;
+			else
+				wid = k == 0 ? 0.0009f : (k == 1 ? 0.0011f + 0.002f * sc : 0.0012f + 0.0022f * sc);
+			/* aerial perspective: far rows faint, near rows full; the light follows the loudness */
+			float vrow;
+			if (ctx->crisp)
+				vrow = k == 0 ? 0.0f : (k == 1 ? 0.5f : 0.42f + 0.25f * sc);
+			else
+				vrow = k == 0 ? 0.3f : (k == 1 ? 0.42f + 0.4f * sc : 0.5f + 0.3f * sc);
+			vrow *= dayv * lightk * (0.15f + 0.85f * lightk);
+			if (vrow <= 0)
+				continue;
+			float push = s->kimp * (0.1f + 0.22f * sc); /* the kick's pressure: the whole field ducks, near more */
+			float shiv = s->senv * (0.15f + 0.5f * sc); /* the snare's shiver */
+			float hatf = s->henv * (k == 0 ? 1.0f : 1.0f - sqrtf(sc)); /* hats glint along the far rows */
+			/* pixel canvases show the mid hill as colour with only a few strokes on it */
+			int kstep = ctx->crisp ? (k == 1 ? 3 : 2) : 1;
+			for (int q = (row * 7) % kstep; q < nb; q += kstep) {
+				blade_t *b = &s->bl[b0 + q];
+				float x = b->u * A;
+				float y = row_y(s, row, x, A);
+				float X = (x - A * 0.5f) * Z;
+				float hmul = 1.0f;
+				float hw, xc = path_at(s, A, k, d, sc, &hw);
+				if (xc > -5) { /* trodden path: bare in the middle, short and broken at its edges */
+					float e = hw * (0.75f + 0.5f * fmodf(b->ph * 3.3f, 1.0f));
+					float dx = fabsf(x - xc);
+					if (dx < e * 0.55f)
+						continue;
+					if (dx < e * 1.8f)
+						hmul = 0.2f + 0.8f * us_smooth(e * 0.55f, e * 1.8f, dx);
+				}
+				if (k == 1 && fabsf(x - s->tree_u * A) < 0.012f && d < 0.15f)
+					hmul *= 0.5f; /* keep the trunk's foot clear */
+				/* clumps: taller stands and low hollows, so the field has structure */
+				hmul *= b->clump;
+				float bend = wind_at(s, X * 0.25f, Z * 0.25f, ax, az);
+				float fb = front_at(s, b->u, sc);
+				float flut = 0.018f * us_noise2(b->ph, tt * 0.9f);
+				if (shiv > 0.004f)
+					flut += shiv * us_noise2(b->ph * 1.7f, tt * 15.0f);
+				float persp = 0.75f + 0.4f * fabsf(ax);
+				/* every blade has its own resting arch (most bow downwind, some the other way), so a still field
+				 * is still grass rather than rain */
+				float fr7 = fmodf(b->ph * 5.13f, 1.0f);
+				float rest = (fr7 < 0.72f ? 1.0f : -0.8f) * (0.1f + 0.28f * fmodf(b->ph * 2.71f, 1.0f));
+				float bb = ((lean0 + rest + gstr * bend + flut + push) * sgn + fb) * persp;
+				float h = H * b->h * hmul * (b->head ? 1.25f : 1.0f);
+				/* blowing toward/away from the viewer foreshortens the blades */
+				float fs = 1.0f - 0.15f * fabsf(az) * us_sat(bend);
+				float shadow = 1.0f - fp.shk + fp.shk * us_smooth(-0.3f, 0.3f, us_noise2(X * 0.05f - s->cloud_t * 2.0f * ax, Z * 0.08f - s->cloud_t * 2.0f * az));
+				/* bent blades catch the light: the breeze's waves are bright bands, a kick front a brighter crest */
+				float g = us_smooth(0.25f, 0.9f, band_at(s, X * 0.6f, Z * 0.6f, ax, az)) * (0.35f + 0.9f * s->breeze); /* the same bands as the ground under it */
+				float sheen = 0.66f + 0.4f * g + 0.35f * us_sat(fabsf(fb)) + 0.35f * push;
+				if (b->tint == 1)
+					sheen += (k == 0 ? 1.6f : 0.9f) * hatf;
+				float v = us_sat(vrow * shadow * sheen * (0.75f + 0.25f * b->h));
+				uint8_t m = US_MAT_LEAF;
+				if (autumn > 0.5f)
+					m = b->tint < 2 ? US_MAT_LIGHT : (b->tint == 2 ? US_MAT_EARTH : US_MAT_STEM); /* sun-gold, dry, straw */
+				else if (winter > 0.5f)
+					m = b->tint < 3 ? US_MAT_EARTH : US_MAT_STEM;
+				else if (summer > 0.5f && b->tint == 0)
+					m = US_MAT_STEM;
+				/* the crest of a gust: bent blades flash their pale undersides, a travelling sheen of silver */
+				if (winter < 0.5f && autumn < 0.5f && b->tint == 1 && b->h > 0.8f && (fabsf(fb) > 0.3f || g > 0.75f) && k > 0)
+					m = US_MAT_ACCENT;
+				float pts[8];
+				float bx = us_clampf(bb * 0.9f, -1.6f, 1.6f);
+				for (int qq = 0; qq < 4; qq++) {
+					float t = qq / 3.0f;
+					pts[2 * qq] = x + bx * h * t * t;
+					pts[2 * qq + 1] = y - h * fs * t * (1.0f - 0.3f * fabsf(bx) * t);
+				}
+				blade(c, x, y, bx, h, fs, wid, v, m);
+				float tx = pts[6], ty = pts[7];
+				float force = gstr * bend + 0.5f * fabsf(fb);
+				if (winter > 0.4f && b->tint == 3 && k > 0) /* snow caught on the tips */
+					us_point(c, tx, ty, 0.0015f + 0.003f * sc, 0.6f * winter * dayv, US_MAT_WATER);
+				if (k == 0) {
+					if (b->tint == 1 && (q & 3) == 0)
+						tip_add(s, tx, ty, sc); /* far tips glint on hats too */
+					continue;
+				}
+				int flower = 0;
+				if (!b->head && b->tint == 3 && sc > 0.15f && winter < 0.5f) {
+					/* wildflowers grow in drifts, not evenly */
+					flower = fmodf(b->ph * 7.31f, 1.0f) < (0.03f + 0.75f * b->fpatch) * (0.6f + 0.6f * w->bloom) * (k == 2 ? 0.6f : 1.0f);
+				}
+				if (flower) {
+					/* wildflowers among the grass: heads nod to the lower mids, then go to seed clocks in late summer */
+					float dx = pts[6] - pts[4], dy = pts[7] - pts[5];
+					float dl = sqrtf(dx * dx + dy * dy) + 1e-6f;
+					float nod = 0.35f * s->lowmid_s * us_noise2(b->ph * 3.1f, tt * 1.2f);
+					float rr = (0.005f + 0.008f * sc) * (0.6f + 0.4f * w->growth);
+					float fx = tx + (dx / dl + nod) * rr * 0.8f, fy = ty + dy / dl * rr * 0.8f;
+					float clock = us_smooth(0.6f, 1.2f, summer + autumn * 0.5f) * (1.0f - us_smooth(0.4f, 0.9f, autumn));
+					float fv = us_sat(v * 1.2f + 0.08f);
+					if (clock > 0.5f && fmodf(b->ph * 3.7f, 1.0f) < 0.6f) {
+						/* a dandelion clock: a ring of fluff that thins in the gusts */
+						int np = c->crisp ? 4 : 9;
+						for (int qq = 0; qq < np; qq++) {
+							float an = US_TAU * qq / np + b->ph;
+							float fq = fmodf(b->ph * 13.0f + qq * 0.37f, 1.0f);
+							if (fq < force * 0.8f)
+								continue; /* this tuft has blown */
+							float px2 = fx + cosf(an) * rr, py2 = fy + sinf(an) * rr;
+							if (c->crisp)
+								us_put(c, (int)(px2 * c->s), (int)(py2 * c->s), fv * 0.8f, US_MAT_ACCENT);
+							else
+								wline(c, fx, fy, px2, py2, 0.0008f, fv * 0.45f, US_MAT_ACCENT);
+						}
+					} else if (c->crisp) {
+						us_disc(c, fx, fy, rr * 0.9f, fv, US_MAT_BLOOM);
+					} else {
+						/* five petals: little loops around a bright eye */
+						for (int qq = 0; qq < 5; qq++) {
+							float an = US_TAU * qq / 5 + b->ph + nod * 2.0f;
+							wline(c, fx, fy, fx + cosf(an) * rr, fy + sinf(an) * rr * 0.7f, 0.0016f + 0.001f * sc, fv * 0.8f, US_MAT_BLOOM);
+						}
+						us_point(c, fx, fy, 0.0011f + 0.001f * sc, us_sat(fv * 1.3f), US_MAT_LIGHT);
+					}
+					tip_add(s, fx, fy, sc + 2.0f); /* +2 marks a flower (petals fly) */
+				}
+				if (b->head && winter < 0.6f) {
+					/* seed head: a spike along the tip direction; near ones carry a few paired spikelets */
+					float dx = pts[6] - pts[4], dy = pts[7] - pts[5];
+					float dl = sqrtf(dx * dx + dy * dy) + 1e-6f;
+					float hl = (0.012f + 0.018f * (summer + autumn)) * sc * (k == 2 ? heightC * 1.6f : height);
+					float hx = tx + dx / dl * hl, hy = ty + dy / dl * hl;
+					uint8_t hm = spring > 0.5f ? US_MAT_LEAF : (autumn > 0.5f ? US_MAT_BLOOM : US_MAT_ACCENT);
+					float hv = us_sat(v * 1.25f + 0.1f);
+					if (ctx->crisp)
+						us_line(c, tx, ty, hx, hy, sc > 0.6f ? 0.0075f : 0.001f, hv, hm);
+					else {
+						wline(c, tx, ty, hx, hy, 0.0012f + 0.0016f * sc, hv, hm);
+						float nx = -dy / dl * hl * 0.35f, ny = dx / dl * hl * 0.35f;
+						int na = k == 2 ? 3 : 1;
+						for (int qq = 1; qq <= na; qq++) {
+							float f = (float)qq / (na + 1);
+							float mx = us_lerp(tx, hx, f), my = us_lerp(ty, hy, f);
+							float ex = us_lerp(tx, hx, f + 0.45f), ey = us_lerp(ty, hy, f + 0.45f);
+							wline(c, mx, my, ex + nx, ey + ny, 0.0008f, hv * 0.6f, hm);
+							wline(c, mx, my, ex - nx, ey - ny, 0.0008f, hv * 0.6f, hm);
+						}
+					}
+					tip_add(s, hx, hy, sc);
+					/* strong gusts shake seeds loose */
+					if (force > 0.35f && s->nsd < MAX_SEEDS &&
+					    us_rand(r) < dt * (force - 0.3f) * 2.0f * (0.4f + summer + autumn) * (0.5f + w->growth) * (k == 2 ? 2.5f : 1.0f)) {
+						seed_t *qd = &s->sd[s->nsd++];
+						qd->x = hx;
+						qd->y = hy;
+						qd->vx = sgn * us_randr(r, 0.05f, 0.18f) * (0.5f + s->gust);
+						qd->vy = -us_randr(r, 0.01f, 0.05f) * (0.3f + sc);
+						qd->life = 1.0f;
+						qd->ph = us_rand(r) * 10;
+						qd->sz = 0.0008f + 0.0018f * sc;
+						shake += 1.0f;
+					}
 				}
 			}
 		}
 	}
 
-	{
-		float ksc = row_s(KITE_ROW);
-		draw_kite(s, c, ctx, A, sgn, HZ + (1.03f - HZ) * ksc, ksc, dayv, winter);
-	}
-
 	/* ---- the near layer: oat stalks framing the view; then the drums' answers on top ---- */
 	draw_fg(s, c, ctx, A, sgn, gstr, ax, az, height, dayv, lightk, winter, spring);
 	spawn_drums(s, ctx, snapped, sgn);
-	draw_drums(s, c, ctx, sgn, dayv);
+	draw_drums(s, c, ctx, sgn, dayv * (0.45f + 0.45f * lightk));
 
 	/* ---- seeds / pollen adrift ---- */
 	s->seed_acc += shake;
