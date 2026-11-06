@@ -245,7 +245,7 @@ void us_bloom(us_canvas *c, float amount, float *scratch)
 	}
 	/* spread each bright source's material over the area its glow will cover (separable argmax, r=4) */
 	{
-		const int R = 4;
+		const int R = bw > 200 ? 8 : 4; /* = the wide blur's full reach, so no glow is left the wrong colour at a hard edge */
 		for (int y = 0; y < bh; y++)
 			for (int x = 0; x < bw; x++) {
 				float best = -1;
