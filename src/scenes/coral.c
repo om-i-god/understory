@@ -5,20 +5,26 @@
  * brain coral (labyrinth), staghorn (branching fronds) or polyp mounds (dividing spots) — and the whole map
  * cycles slowly, so the reef keeps reorganising: spots split, mazes break into fronds, grazed patches die
  * back and are recolonised. Each species has its own material, so palettes show a multi-coloured reef.
- * Over it: a moving caustic web of sunlight (cellular light net), drifting plankton, schools of small
+ * The reef is drawn in relief, lit from a sun up-left: lit flanks and crests, dark sides, brain coral's meander
+ * groove carved down each ridge, pitted mounds; each colony wears one fine rim, bright on its sun side, and casts
+ * a shadow down-right across the sand channels; where there is neither sand nor coral the floor drops into deep
+ * water. Over it: a moving caustic web of sunlight (cellular light net), drifting plankton, schools of small
  * silver fish, and polyps on the coral that open and close with the music. Smaller lives reward a long look:
  * sea fans on the colonies, anemones on the open sand (one keeps a pair of clownfish), rippled sand between the
  * deep colonies, bubbles, and now and then a turtle passing over, casting its shadow on the reef.
  *
- * Audio: low-mids feed growth (feed rate + iterations/frame); bass/level open the polyps (a ripple runs
- *        across the reef on each kick); kicks release spawn bundles, make the fish schools dart, send the
- *        clownfish ducking into their anemone and land the turtle's power strokes; hi-hats make polyps flinch
- *        shut and re-open; snares/claps (a jump across the mid bands) release puffs of bubbles; bass + sub
- *        drive the groundswell that sways the fans and rocks the sand ripples (sub also stirs the sand); the
- *        mids (each anemone its own band) open the anemones; air makes the plankton sparkle; swell fills the
- *        sun shafts; centroid sets the water's clarity (far reef, sand); stereo width swings the current
- *        (plankton, bubbles, fan lean, ripple direction); onsets nudge the kill rate; level stirs the current
- *        and brightens the sunlight. In silence the swell, the anemones' breathing and the turtle go on.
+ * Audio: each drum has its own answer (from the analyser's kick / snare / hat detection):
+ *   kick  — a surge of current: the swell overhead makes the light net lurch and bend, fans and anemones sway,
+ *           plankton are swept along, the fish schools wheel as one, a polyp-opening ripple crosses the reef,
+ *           the turtle lands its power stroke;
+ *   snare — the reef spawns: every polyp flares wide and bright, a colony or two release a puff of spawn and a
+ *           cloud of bubbles rises; the clownfish dart into their anemone;
+ *   hats  — sunlight glints at a fresh scattering of the caustic net's junctions, plankton twinkle, polyps flinch.
+ *   Loudness is how much sunlight gets down (reef, rims, sand, net, plankton: louder = brighter, quiet = dim);
+ *   swell fills the sun shafts; low-mids feed growth (feed rate + iterations/frame); bass + sub drive the
+ *   groundswell (fans, sand ripples); the mids open the anemones (each its own band); air makes the plankton
+ *   sparkle; centroid sets the water's clarity; stereo width swings the current. In silence the swell, the
+ *   anemones' breathing and the turtle go on.
  * World: reads pollen + water_level (nutrients -> feed, growth speed), reef (initial coverage), daylight
  *        (sun vs moonlight caustics), flock + pollen (fish numbers); writes reef (follows coverage).
  */
@@ -69,7 +75,7 @@ static long prof_lines, prof_px, prof_l0, prof_p0;
 #define NRAY 7 /* sun shafts slanting down through the water column */
 #define MAX_FAN 6 /* sea fans on the colonies */
 #define MAX_AN 5  /* anemones on the open sand */
-#define MAX_BUB 40
+#define MAX_BUB 96
 #define RPW 128 /* sand-ripple lattice (normalized: always spans the canvas) */
 #define RPH 72
 #define MAX_RSEG 4000 /* cached ripple crest segments */
@@ -175,12 +181,25 @@ typedef struct {
 	float rip_patch[RPW * RPH], rip_warp[RPW * RPH];
 	float rseg[MAX_RSEG][4], rsegk[MAX_RSEG], rseg_A;
 	int nrseg;
-	float surge_ph, surge_amp, sub_env, mid_env, cent_env, duck, duck_to, kick_prev;
-	float bprev[US_NBANDS]; /* last frame's spectrum (for the mid-band flux) */
-	float hi_fast, hi_slow, hat_prev, cur_ang, rip_ang, rip_drift, bub_cd, bub_idle;
+	float surge_ph, surge_amp, sub_env, mid_env, cent_env, duck, duck_to;
+	float cur_ang, rip_ang, rip_drift, bub_cd, bub_idle;
 	int nfseg;
 	float fseg_A;
+	/* relief: the reef lit from the sun (up-left) — tone per RD cell + its material */
+	float fv[GW * GH];
+	uint8_t fm[GW * GH];
+	uint8_t flit[GW * GH]; /* sun-facing light factor per cell, 0..255 */
+	float sandm[GW * GH]; /* where the floor is sand (channels, patches) vs falling away into deep water */
+	float kick_s, snare_s, hat_s, swell_k; /* drum answers: current surge, spawning flash, caustic glints */
+	uint32_t glint_seed;
+	int relief_ok;
 } st_t;
+
+/* the sun is up-left: unit vector toward it (screen space, y down) */
+#define SUN_X (-0.6f)
+#define SUN_Y (-0.8f)
+#define SH_DX 3 /* coral's cast shadow: offset in RD cells (down-right, away from the sun) */
+#define SH_DY 4
 
 static void *create(uint32_t seed)
 {
@@ -419,9 +438,9 @@ static void init_scene(st_t *st, const us_ctx *ctx)
 			st->rmap[y * CW + x] = rr;
 		}
 	upsample_maps(st);
-	/* only a little growth now; the rest is spread over the first second (see frame) so opening the
+	/* only a little growth now; the rest is spread over the first ~2.5 s (see frame) so opening the
 	 * scene is one ordinary frame, and the reef visibly grows in while it fades up */
-	st->pre_total = (int)((260 + reef * 800.0f) / RD_H);
+	st->pre_total = (int)((1400 + reef * 500.0f) / RD_H);
 	for (int k = 0; k < 24; k++)
 		rd_iterate(st);
 	st->pre_left = st->pre_total - 24;
@@ -462,6 +481,13 @@ static void init_scene(st_t *st, const us_ctx *ctx)
 	}
 	st->caus_cell = 0.095f;
 	ripple_init(st);
+	/* the floor: sand channels and patches (lighter), the rest drops away into deep blue */
+	for (int y = 0; y < GH; y++)
+		for (int x = 0; x < GW; x++) {
+			float fx = (float)x / GW, fy = (float)y / GH;
+			float n = us_fbm2(fx * 3.1f + 21.0f, fy * 2.3f + 4.0f, 3);
+			st->sandm[y * GW + x] = us_smooth(-0.15f, 0.3f, n) * (0.8f + 0.2f * us_noise2(fx * 40.0f, fy * 30.0f));
+		}
 	for (int i = 0; i < MAX_FAN; i++)
 		place_fan(st, &st->fan[i]);
 	for (int i = 0; i < MAX_AN; i++)
@@ -577,17 +603,12 @@ static inline void ms_cell(us_canvas *c, float lv, float a, float b, float d, fl
 	}
 }
 
-/* marching squares on v; growth-front segments (v rising here) drawn brighter.
- * lv: the colony outline. In Ink each species has its own line character so they read apart even in one
- *     colour: staghorn + brain solid, polyp mounds dashed (stippled rims).
- * lv2 > 0 (Ink): in the same pass, the inner groove — brain coral only (its meanders become double-walled
- *     valleys), at brightness base2. */
-static void contours(st_t *st, us_canvas *c, float A, float lv, float base, float hot_gain, float wdt, int stride,
-		     float lv2, float base2)
+/* marching squares on v: the colony outline, one fine solid line. The rim is lit like the body — bright where it
+ * faces the sun, falling to a dim edge on the shadow side — and growth fronts (v rising here) glow a little. */
+static void contours(st_t *st, us_canvas *c, float A, float lv, float base, float hot_gain, float wdt, int stride)
 {
 	const float *V = st->v[st->cur];
 	float sx = A / GW, sy = 1.0f / GH;
-	float lo = lv, hi = lv2 > lv ? lv2 : lv;
 	for (int y = 0; y + stride < GH; y += stride) {
 		const float *Vr = V + y * GW, *Vd = Vr + stride * GW, *Pr = st->prev + y * GW;
 		const float *Pd = Pr + stride * GW;
@@ -595,43 +616,16 @@ static void contours(st_t *st, us_canvas *c, float A, float lv, float base, floa
 		for (int x = 0; x + stride < GW; x += stride) {
 			float a = Vr[x], b = Vr[x + stride], d = Vd[x], e = Vd[x + stride];
 			float mx = fmaxf(fmaxf(a, b), fmaxf(d, e)), mn = fminf(fminf(a, b), fminf(d, e));
-			if (mx <= lo || mn > hi)
+			if (mx <= lv || mn > lv)
 				continue; /* open water or solid flesh: no line crosses this cell (most of the grid) */
 			int sp = cell_species(st, x, y);
 			float x0 = (x + 0.5f) * sx, x1 = (x + stride + 0.5f) * sx;
-			uint8_t m = SPECIES_MAT[sp]; /* growth fronts: same hue, brighter end of its ramp */
-			if (!(!c->crisp && sp == 2 && (x + y) % 3 == 0)) { /* Ink mounds: dashed rim */
-				float g = (a - Pr[x]) + (e - Pd[x + stride]);
-				float val = base + (1.0f - base) * us_sat(g * hot_gain);
-				ms_cell(c, lv, a, b, d, e, x0, y0, x1, y1, wdt, val, m);
-			}
-			if (lv2 > 0.0f && sp == 1)
-				ms_cell(c, lv2, a, b, d, e, x0, y0, x1, y1, wdt, base2, m);
-		}
-	}
-}
-
-/* Ink: staghorn flesh is engraved with short diagonal hatching (and mounds get a stipple), so the three
- * species are distinguishable by line character alone in single-colour Ink */
-static void coral_texture(st_t *st, us_canvas *c, float A, float val)
-{
-	const float *V = st->v[st->cur];
-	float sx = A / GW, sy = 1.0f / GH;
-	float hl = 1.6f * sx;
-	for (int y = 1; y < GH - 1; y += 3) {
-		for (int x = 1 + (y / 3 & 1); x < GW - 1; x += 3) {
-			float v = V[y * GW + x];
-			if (v < 0.2f)
-				continue;
-			uint32_t h = hash2(x, y);
-			int sp = species_idx(st->rmap[(y * CH / GH) * CW + x * CW / GW], h);
-			float cx = (x + 0.5f) * sx, cy = (y + 0.5f) * sy;
-			float k = us_sat((v - 0.2f) * 8.0f);
-			if (sp == 0) {
-				wu_line(c, cx - hl, cy + hl, cx + hl, cy - hl, val * k, US_MAT_BLOOM);
-			} else if (sp == 2 && (h & 1) == 0) {
-				us_put(c, (int)(cx * c->s), (int)(cy * c->s), val * k, US_MAT_ACCENT);
-			}
+			/* outward normal = -gradient; facing the sun -> lit */
+			float gx = b + e - a - d, gy = d + e - a - b;
+			float face = -(gx * SUN_X + gy * SUN_Y) / (sqrtf(gx * gx + gy * gy) + 1e-6f);
+			float g = (a - Pr[x]) + (e - Pd[x + stride]);
+			float val = base * (0.3f + 0.7f * us_sat(0.5f + 0.6f * face)) + (1.0f - base) * us_sat(g * hot_gain);
+			ms_cell(c, lv, a, b, d, e, x0, y0, x1, y1, wdt, val, SPECIES_MAT[sp]);
 		}
 	}
 }
@@ -655,13 +649,17 @@ static void caustic_field(st_t *st, float A)
 	/* gentle wobble: surface waves bend the light (separable, so it's two small tables) */
 	float wobx[KH], woby[KW];
 	int kw = st->kw, kh = st->kh;
+	/* a kick is a swell passing overhead: the surface heaves and the whole light net lurches and bends */
+	float ks = st->kick_s;
 	for (int y = 0; y < kh; y++) {
 		float py = (y + 0.5f) / kh;
-		wobx[y] = 0.012f * sinf(py * 23.0f + t * 1.3f) + 0.006f * sinf(py * 51.0f - t * 2.1f);
+		wobx[y] = 0.012f * sinf(py * 23.0f + t * 1.3f) + 0.006f * sinf(py * 51.0f - t * 2.1f) +
+			  ks * (0.016f + 0.012f * sinf(py * 9.0f - t * 0.7f));
 	}
 	for (int x = 0; x < kw; x++) {
 		float px = (x + 0.5f) / kw * A;
-		woby[x] = 0.012f * sinf(px * 19.0f - t * 1.1f) + 0.006f * sinf(px * 47.0f + t * 1.7f);
+		woby[x] = 0.012f * sinf(px * 19.0f - t * 1.1f) + 0.006f * sinf(px * 47.0f + t * 1.7f) +
+			  ks * (0.012f * sinf(px * 7.0f + t * 0.9f));
 	}
 	float ics = 1.0f / cs;
 	/* sunlight patches: a coarse noise grid */
@@ -711,11 +709,16 @@ static void caustic_lines(st_t *st, us_canvas *c, float A, float val)
 			 * bisector maths, so cells that will not draw cost almost nothing */
 			int gx = (int)((x + 0.5f) * GW / kw), gy = (int)((y + 0.5f) * GH / kh);
 			int over = V[gy * GW + gx] > 0.12f;
-			if (over && !c->crisp)
-				continue; /* Ink: the coral's own engraving carries it (and the web there was only clutter) */
+			/* hats: the light glints at a scattering of the net's junctions (a new scattering each hat) */
+			int glint = st->hat_s > 0.03f && (hash2(x + (int)(st->glint_seed & 1023), y + (int)(st->glint_seed >> 10)) & 7) == 0;
 			float patch = st->patch[(y * PH / kh) * PW + x * PW / kw];
-			float vv = val * (over ? 0.3f : 1.0f) * patch * patch * 1.7f;
-			if (vv < (c->crisp ? 0.02f : 0.07f))
+			/* the coral shades the floor down-right of it (away from the sun) */
+			int sgx = gx - SH_DX < 0 ? 0 : gx - SH_DX, sgy = gy - SH_DY < 0 ? 0 : gy - SH_DY;
+			float shadow = over ? 1.0f : 1.0f - 0.7f * us_smooth(0.06f, 0.2f, V[sgy * GW + sgx]);
+			float vv = val * (over ? 0.3f : 1.0f) * patch * patch * 1.7f * shadow;
+			if (over && !c->crisp)
+				vv = 0; /* Ink: the coral's own relief carries it (and the web there was only clutter) */
+			if (vv < (c->crisp ? 0.02f : 0.07f) && !glint)
 				continue;
 			float gx0 = (x + 0.5f) * sx, gy0 = (y + 0.5f) * sy;
 			float cx[4] = {gx0, gx0 + sx, gx0 + sx, gx0}, cy[4] = {gy0, gy0, gy0 + sy, gy0 + sy};
@@ -739,6 +742,28 @@ static void caustic_lines(st_t *st, us_canvas *c, float A, float val)
 				vy[nv] = us_lerp(cy[e], cy[e1], tt);
 				nv++;
 			}
+			if (glint && nv > 0) {
+				float mx = 0, my = 0;
+				for (int k = 0; k < nv; k++)
+					mx += vx[k], my += vy[k];
+				mx /= nv, my /= nv;
+				float gv = us_sat(st->hat_s * (0.6f + 0.4f * patch) * shadow);
+				if (c->crisp) {
+					int px = (int)(mx * c->s), py = (int)(my * c->s);
+					us_put(c, px, py, gv, US_MAT_LIGHT);
+					us_put(c, px - 1, py, gv * 0.7f, US_MAT_LIGHT);
+					us_put(c, px + 1, py, gv * 0.7f, US_MAT_LIGHT);
+					us_put(c, px, py - 1, gv * 0.7f, US_MAT_LIGHT);
+					us_put(c, px, py + 1, gv * 0.7f, US_MAT_LIGHT);
+				} else {
+					float r = 0.007f * (0.5f + 0.5f * st->hat_s);
+					wu_line(c, mx - r, my, mx + r, my, gv, US_MAT_LIGHT);
+					wu_line(c, mx, my - r, mx, my + r, gv, US_MAT_LIGHT);
+					us_disc(c, mx, my, 0.0018f, gv, US_MAT_LIGHT);
+				}
+			}
+			if (vv < (c->crisp ? 0.02f : 0.07f))
+				continue;
 			if (c->crisp) {
 				for (int k = 0; k + 1 < nv; k++)
 					px_line(c, vx[k], vy[k], vx[k + 1], vy[k + 1], vv, US_MAT_WATER);
@@ -765,6 +790,125 @@ static void settle_mats(us_canvas *c, uint8_t ambient, unsigned frame)
 		uint8_t *restrict mat = c->mat + (size_t)y * w;
 		for (int i = 0; i < w; i++)
 			mat[i] = ink[i] < 20 ? ambient : mat[i];
+	}
+}
+
+/* sun-facing term of the reef's surface at RD cell (x, y): + on flanks facing the sun, - in their shadow */
+static inline float cell_lit(const float *V, int x, int y)
+{
+	int xl = x > 0 ? x - 1 : 0, xr = x < GW - 1 ? x + 1 : GW - 1, yu = y > 0 ? y - 1 : 0, yd = y < GH - 1 ? y + 1 : GH - 1;
+	float gx = V[y * GW + xr] - V[y * GW + xl], gy = V[yd * GW + x] - V[yu * GW + x];
+	return -(gx * SUN_X + gy * SUN_Y);
+}
+
+/* the reef in relief: each RD cell's tone, lit from the sun. Colonies get lit flanks and dark sides (the
+ * labyrinths and branches read as ridges and valleys); between them sand channels catch a little light, coral
+ * casts its shadow down-right onto them, and where there's neither the floor falls away into deep water. */
+static void relief(st_t *st, float sand_g, float deep_g)
+{
+	const float *V = st->v[st->cur];
+	for (int y = 0; y < GH; y++) {
+		int ys = y - SH_DY < 0 ? 0 : y - SH_DY;
+		const float *Rr = st->rmap + (y * CH / GH) * CW;
+		for (int x = 0; x < GW; x++) {
+			int i = y * GW + x;
+			float v = V[i];
+			float body = us_smooth(0.08f, 0.22f, v);
+			float tone;
+			uint8_t m;
+			float lf = us_sat(0.43f + 7.0f * cell_lit(V, x, y));
+			st->flit[i] = (uint8_t)(lf * 255.0f);
+			if (body > 0.02f) {
+				uint32_t h = hash2(x, y);
+				int sp = species_idx(Rr[x * CW / GW], h);
+				/* flank light + a crest highlight where the colony is thickest */
+				float crest = us_smooth(0.24f, 0.34f, v);
+				tone = body * (0.10f + 0.55f * lf * lf + 0.18f * crest);
+				/* surface character: brain coral has its meander groove down the ridge's spine; mounds are pitted
+				 * with polyp cups (mottled); staghorn stays smooth */
+				if (sp == 1)
+					tone *= 1.0f - 0.55f * crest;
+				else if (sp == 2)
+					tone *= 0.72f + 0.5f * ((h >> 9 & 255) / 255.0f) * body;
+				m = SPECIES_MAT[sp];
+			} else {
+				int xs = x - SH_DX < 0 ? 0 : x - SH_DX;
+				float shade = 1.0f - 0.75f * us_smooth(0.06f, 0.2f, V[ys * GW + xs]);
+				float sd = st->sandm[i];
+				if (sd > 0.25f)
+					tone = sd * sand_g * shade, m = US_MAT_EARTH;
+				else
+					tone = deep_g * (1.0f - sd) * shade, m = US_MAT_WATER;
+			}
+			st->fv[i] = tone;
+			st->fm[i] = m;
+		}
+	}
+}
+
+/* Ink: draw the relief bilinearly over the canvas in one pass. Each grid row is stretched to full width once
+ * (135 times a frame, not once per pixel row); a pixel row is then a branch-free blend of two such lines, which
+ * vectorises. */
+#define FILL_MAXW 4096
+static void fill_line(const st_t *st, int gy, int w, const int16_t *xi, const uint8_t *xt, float g, uint16_t *out,
+		      uint8_t *mo)
+{
+	const float *F = st->fv + gy * GW;
+	const uint8_t *M = st->fm + gy * GW;
+	for (int px = 0; px < w; px++) {
+		int x0 = xi[px], t = xt[px];
+		float v = F[x0] + (F[x0 + 1] - F[x0]) * (t * (1.0f / 256.0f));
+		out[px] = (uint16_t)(us_sat(v * g) * (255.0f * 128.0f));
+		mo[px] = M[x0 + (t >> 7)];
+	}
+}
+
+static void fill_row(const uint16_t *restrict a, const uint16_t *restrict b, const uint8_t *restrict ma, uint32_t t,
+		     uint8_t *restrict ink, uint8_t *restrict mt, int w)
+{
+	const uint32_t it = 256 - t;
+	for (int px = 0; px < w; px++) {
+		uint32_t v = (a[px] * it + b[px] * t) >> 15;
+		uint8_t old = ink[px], m = mt[px];
+		uint8_t mask = (uint8_t)-(uint8_t)(v > old); /* branch-free select, so the loop vectorises */
+		ink[px] = (uint8_t)(((uint8_t)v & mask) | (old & ~mask));
+		mt[px] = (uint8_t)((ma[px] & mask) | (m & ~mask));
+	}
+}
+
+static void ink_fill(st_t *st, us_canvas *c, float g)
+{
+	int16_t xi[FILL_MAXW];
+	uint8_t xt[FILL_MAXW];
+	uint16_t L[2][FILL_MAXW];
+	uint8_t LM[2][FILL_MAXW];
+	const int w = c->w < FILL_MAXW ? c->w : FILL_MAXW, h = c->h;
+	for (int px = 0; px < w; px++) {
+		float gx = (px + 0.5f) * GW / (float)w - 0.5f;
+		if (gx < 0) gx = 0;
+		if (gx > GW - 1.001f) gx = GW - 1.001f;
+		int x0 = (int)gx;
+		xi[px] = (int16_t)x0;
+		xt[px] = (uint8_t)((gx - x0) * 255.0f);
+	}
+	int have = -2; /* grid row held in L[0] (L[1] holds have + 1) */
+	for (int py = 0; py < h; py++) {
+		float gy = (py + 0.5f) * GH / (float)h - 0.5f;
+		if (gy < 0) gy = 0;
+		if (gy > GH - 1.001f) gy = GH - 1.001f;
+		int y0 = (int)gy;
+		if (y0 != have) {
+			if (y0 == have + 1) { /* roll: the lower line becomes the upper one */
+				memcpy(L[0], L[1], sizeof(uint16_t) * (size_t)w);
+				memcpy(LM[0], LM[1], (size_t)w);
+			} else {
+				fill_line(st, y0, w, xi, xt, g, L[0], LM[0]);
+			}
+			fill_line(st, y0 + 1, w, xi, xt, g, L[1], LM[1]);
+			have = y0;
+		}
+		const uint32_t t = (uint32_t)((gy - y0) * 256.0f);
+		fill_row(L[0], L[1], t < 128 ? LM[0] : LM[1], t, c->ink + (size_t)py * c->w, c->mat + (size_t)py * c->w, w);
 	}
 }
 
@@ -1210,7 +1354,7 @@ static void draw_turtle(st_t *st, us_canvas *c, float fade)
 /* pixel canvases: per-pixel reef body (species materials, banded rim/flesh/core) over a seabed with the far
  * reef dithered in. Each species has its own fill texture so Mono-pixel tells them apart too:
  * staghorn solid with a bright core, brain banded with a dark groove, polyp mounds checkered. */
-static void draw_pixel_body(st_t *st, us_canvas *c, float sw, float body_gain, float far_v)
+static void draw_pixel_body(st_t *st, us_canvas *c, float sw, float body_gain, float far_v, float fill_g)
 {
 	const float *V = st->v[st->cur], *D = st->dv[st->dcur];
 	float l0 = 0.14f - sw, l1 = 0.2f - sw, l2 = 0.3f - sw;
@@ -1227,10 +1371,13 @@ static void draw_pixel_body(st_t *st, us_canvas *c, float sw, float body_gain, f
 	for (int j = 0; j < c->h; j++) {
 		int gy = j * GH / c->h, ry = j * CH / c->h, dy = j * DH / c->h;
 		const float *Vr = V + gy * GW, *Dr = D + dy * DW, *Rr = st->rmap + ry * CW;
+		const float *Fr = st->fv + gy * GW;
+		const uint8_t *Mr = st->fm + gy * GW, *Lr = st->flit + gy * GW;
 		uint8_t *ink = c->ink + (size_t)j * c->w, *mat = c->mat + (size_t)j * c->w;
 		for (int i = 0; i < w; i++) {
 			int ci = w > MAXCOL ? (int)((int64_t)i * MAXCOL / w) : i;
-			float vv = Vr[cg[ci]];
+			int gx = cg[ci];
+			float vv = Vr[gx];
 			uint32_t h = hash2(i, j);
 			uint8_t b, m;
 			if (vv > l0) {
@@ -1240,11 +1387,13 @@ static void draw_pixel_body(st_t *st, us_canvas *c, float sw, float body_gain, f
 					b = b0 / 2; /* brain: the groove between the ridges */
 				else if (sp == 2 && vv <= l2 && ((i + j) & 1))
 					b = b0; /* mounds: checkered flesh */
+				/* lit from the sun: flanks facing it brighten, the far side falls into shadow (volume) */
+				b = (uint8_t)fminf(255.0f, b * (0.45f + 0.75f * (1.0f / 255.0f) * Lr[gx]));
 				m = SPECIES_MAT[sp];
 			} else if (bf && ((i | j) & 1) == 0 && Dr[cd[ci]] > 0.2f) {
 				b = bf, m = US_MAT_WATER; /* far reef, seen through the water */
-			} else if ((h >> 8) % 61 == 0) {
-				b = 33, m = US_MAT_EARTH; /* sand grains */
+			} else if (Mr[gx] == US_MAT_EARTH && Fr[gx] > 0.02f && ((h >> 8) & 3) != 0) {
+				b = (uint8_t)fminf(255.0f, Fr[gx] * fill_g * 520.0f), m = US_MAT_EARTH; /* sand channels (grainy), shaded by the coral */
 			} else {
 				continue;
 			}
@@ -1270,39 +1419,42 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 	st->low_env = us_approach(st->low_env, us_sat(a->lowmid * 0.8f + a->mid * 0.3f), 1.5f, rdt);
 	st->bass_env = us_approach(st->bass_env, us_sat(a->bass * 0.7f + a->kick * 0.7f), 0.1f, rdt);
 	st->hi_env = us_approach(st->hi_env, us_sat(a->high + 0.6f * a->air), 0.2f, rdt);
-	st->lvl_env = us_approach(st->lvl_env, us_sat(a->level * 1.2f), 0.6f, rdt);
+	/* loudness = how much sunlight gets down (fast enough to follow a crescendo, slow enough not to flicker) */
+	st->lvl_env = us_approach(st->lvl_env, us_sat(a->level), 0.35f, rdt);
+	st->swell_k = us_approach(st->swell_k, us_sat(0.5f * a->swell + 0.7f * a->level), 1.2f, rdt);
 	/* polyps: open with sustained bass/level (slow), close in silence */
 	st->open_env = us_approach(st->open_env, us_sat(0.15f + 0.55f * a->bass + 0.45f * a->level), 0.8f, rdt);
 	st->nudge = us_approach(st->nudge, 0.0f, 2.5f, rdt);
 	if (a->beat)
 		st->nudge = us_sat(st->nudge + 0.35f * a->onset);
-	/* a kick = the kick envelope jumping (hi-hat onsets ride on its decay tail and must not count) */
-	int kick_ev = a->kick > 0.35f && a->kick > st->kick_prev + 0.12f;
-	st->kick_prev = a->kick;
+	/* the three drums, each with its own answer:
+	 *   kick  -> a surge of current: the light net lurches, fans and anemones sway, the schools wheel as one
+	 *   snare -> the coral spawns: a puff of spawn and a cloud of bubbles; the clownfish dart into their anemone
+	 *   hats  -> sunlight glints at the caustic junctions, plankton twinkle, polyps flinch */
+	int kick_ev = a->kick_hit, snare_ev = a->snare_hit, hat_ev = a->hat_hit;
 	if (kick_ev) {
 		st->kick_wave = us_sat(0.4f + a->kick);
 		st->kick_wave_x = -0.1f;
+		st->kick_s = 1.0f;
 	}
-	/* hi-hats: the high band's fast envelope jumping over its slow one */
-	float hi = us_sat(a->high + 0.7f * a->air);
-	st->hi_fast = us_approach(st->hi_fast, hi, 0.02f, rdt);
-	st->hi_slow = us_approach(st->hi_slow, hi, 0.25f, rdt);
-	float hat = us_sat((st->hi_fast - st->hi_slow) * 4.0f);
-	int hat_ev = hat > 0.15f && st->hat_prev <= 0.15f;
-	/* snares / claps / plucks: a sudden rise across the mid bands (a kick barely moves them) */
-	float mflux = 0;
-	for (int k = 13; k < 25; k++) {
-		mflux += fmaxf(0.0f, a->bands[k] - st->bprev[k]);
-		st->bprev[k] = a->bands[k];
+	st->kick_s = us_approach(st->kick_s, 0.0f, 0.16f, rdt);
+	if (snare_ev)
+		st->snare_s = 1.0f;
+	st->snare_s = us_approach(st->snare_s, 0.0f, 0.18f, rdt);
+	if (hat_ev) {
+		st->hat_s = us_sat(0.75f + 0.5f * a->hat);
+		st->glint_seed = us_rng_u32(r);
 	}
+	st->hat_s = us_approach(st->hat_s, 0.0f, 0.07f, rdt);
+	float hat = st->hat_s;
 	/* sustained hats are smoothed into a steady high band: their busyness sets a per-polyp flinch rate (1/s) */
 	float flinch = 1.4f * us_sat((0.5f * (a->high + a->air) - 0.45f) * 2.5f) * a->active;
-	st->hat_prev = hat;
 	/* groundswell: a slow to-and-fro that bass and sub push harder (and that never stops, even in silence) */
 	st->sub_env = us_approach(st->sub_env, us_sat(a->sub * 1.1f), 0.4f, rdt);
 	st->surge_amp = us_approach(st->surge_amp, 0.3f + 0.9f * us_sat(0.7f * a->bass + 0.5f * a->sub), 0.7f, rdt);
 	st->surge_ph += dt * (0.95f + 0.7f * st->bass_env);
-	float surge = sinf(st->surge_ph) * st->surge_amp;
+	/* the kick's surge rides on the groundswell: a shove that eases back */
+	float surge = sinf(st->surge_ph) * st->surge_amp + 1.1f * st->kick_s;
 	/* melody: the anemones open with the mids (attack quick, release slow) */
 	st->mid_env = us_approach(st->mid_env, us_sat(a->mid * 1.1f), a->mid > st->mid_env ? 0.12f : 0.5f, rdt);
 	/* brightness of the sound = clarity of the water; stereo width swings the current */
@@ -1312,8 +1464,8 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 	st->rip_ang = us_approach(st->rip_ang, st->cur_ang, 12.0f, dt);
 	st->rip_drift += dt * 0.05f;
 	float cur_x = cosf(st->cur_ang), cur_y = sinf(st->cur_ang);
-	/* kicks: the clownfish duck into their anemone */
-	if (kick_ev)
+	/* snares: the clownfish dart into their anemone */
+	if (snare_ev)
 		st->duck_to = 1.0f;
 	st->duck_to = us_approach(st->duck_to, 0.0f, 0.25f, rdt);
 	st->duck = us_approach(st->duck, st->duck_to, 0.06f, rdt);
@@ -1375,10 +1527,10 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 	st->iter_acc -= (float)(int)st->iter_acc;
 	for (int k = 0; k < iters; k++)
 		rd_iterate(st);
-	/* opening: the rest of the pre-growth, spread over ~1 s (near) and ~2 s (far reef) */
+	/* opening: the rest of the pre-growth, spread over ~2.5 s (near) and ~2 s (far reef) */
 	st->intro_t += rdt;
 	if (st->pre_left > 0) {
-		int n = (st->pre_total + 29) / 30;
+		int n = (st->pre_total + 74) / 75;
 		if (n > st->pre_left)
 			n = st->pre_left;
 		for (int k = 0; k < n; k++)
@@ -1394,7 +1546,7 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 		for (int k = 0; k < n; k++)
 			far_iterate(st);
 	}
-	float fa = us_smooth(0.0f, 1.3f, st->intro_t), fd = us_smooth(0.6f, 2.4f, st->intro_t);
+	float fa = us_smooth(0.0f, 2.0f, st->intro_t), fd = us_smooth(0.6f, 2.6f, st->intro_t);
 	PROF(1);
 
 	/* growth-front memory (~0.7 s) */
@@ -1419,40 +1571,50 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 		st->seed_t = us_randr(r, 4.0f, 12.0f) * (st->cover < 0.05f ? 0.2f : 1.0f);
 	}
 
-	/* ---- spawning: kicks/bass release bundles from the living edge ---- */
-	if (a->beat && st->bass_env > 0.25f) {
-		int nb = 1 + (int)(st->bass_env * (2.0f + 5.0f * dens));
+	/* ---- spawning: each snare, a colony or two releases a puff of spawn bundles from its living edge ---- */
+	if (snare_ev) {
 		const float *V = st->v[st->cur];
-		for (int b = 0; b < nb && st->nsp < MAX_SP; b++) {
-			for (int tries = 0; tries < 12; tries++) {
+		for (int puff = 0; puff < 2; puff++) {
+			int nb = 4 + (int)(dens * 6.0f + 3.0f * st->lvl_env);
+			for (int tries = 0; tries < 24; tries++) {
 				int x = (int)(us_rand(r) * GW), y = (int)(us_rand(r) * GH);
 				float vv = V[y * GW + x];
-				if (vv > 0.12f && vv < 0.3f) {
+				if (vv < 0.12f || vv > 0.3f)
+					continue;
+				for (int b = 0; b < nb && st->nsp < MAX_SP; b++) {
 					spawn_t *q = &st->sp[st->nsp++];
-					q->x = (x + 0.5f) / GW;
-					q->y = (y + 0.5f) / GH;
+					q->x = (x + 0.5f + us_randn(r) * 1.2f) / GW;
+					q->y = (y + 0.5f + us_randn(r) * 1.2f) / GH;
+					q->x -= floorf(q->x);
+					q->y -= floorf(q->y);
 					float an = us_rand(r) * US_TAU;
-					float spd = us_randr(r, 0.01f, 0.04f) * (0.5f + st->bass_env);
+					float spd = us_randr(r, 0.03f, 0.08f);
 					q->vx = cosf(an) * spd / A;
-					q->vy = sinf(an) * spd - 0.01f;
-					q->life = us_randr(r, 6.0f, 16.0f);
+					q->vy = sinf(an) * spd - 0.015f;
+					q->life = us_randr(r, 3.0f, 7.0f);
 					q->age = 0;
-					break;
 				}
+				break;
 			}
 		}
 	}
 
 	/* ---- sunlight: caustic net (moonlight at night: dimmer, slower) ---- */
 	float day = 0.45f + 0.55f * w->daylight;
-	float light = fa * day * (0.26f + 0.22f * st->lvl_env + 0.12f * st->hi_env + 0.08f * a->onset);
+	/* loudness lets more sunlight down: louder = a brighter reef, quiet = dim water */
+	float lum = 0.3f + 0.85f * st->lvl_env;
+	float light = fa * day * (0.1f + 0.45f * st->lvl_env + 0.1f * st->hi_env);
 	st->ray_t += dt * (1.0f + 0.8f * st->lvl_env);
 	/* shafts: strongest in daylight, swelling with phrase-scale loudness, never flashing */
-	float rays = fa * (0.17f + 0.25f * w->daylight) * (0.5f + 0.9f * a->swell);
+	float rays = fa * (0.15f + 0.25f * w->daylight) * (0.3f + 1.1f * st->swell_k);
 	float clear = 0.65f + 0.7f * st->cent_env; /* water clarity */
 	st->kw = 64; /* the light net is background (rays, far reef and sand carry depth): a coarse lattice, exact edges */
 	st->kh = 36;
 	caustic_field(st, A);
+	/* the relief field changes as slowly as the reef: rebuilt every third frame (its brightness is applied when drawn) */
+	if (st->fcount % 3 == 1 || !st->relief_ok) /* off the map-refresh frames */
+		relief(st, 0.15f * clear, 0.05f), st->relief_ok = 1;
+	float fill_g = fa * day * lum * (1.0f + 0.15f * st->kick_s);
 	PROF(11);
 
 	/* ---- draw ---- */
@@ -1463,23 +1625,22 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 	PROF(9);
 	if (ctx->crisp) {
 		float sw = 0.05f * st->bass_env;
-		caustic_lines(st, c, A, us_sat(0.06f + light * 0.45f));
+		caustic_lines(st, c, A, us_sat(0.03f + light * 0.5f));
 		PROF(2);
-		draw_pixel_body(st, c, sw, (0.9f + 0.25f * st->bass_env) * fa, 0.17f * fd * clear);
-		sand_ripples(st, c, A, (0.16f + 0.2f * st->sub_env) * fd * clear, st->rip_drift + 0.9f * surge);
+		draw_pixel_body(st, c, sw, (0.1f + 1.0f * lum * lum + 0.15f * st->kick_s) * fa, 0.17f * fd * clear * lum, fill_g);
+		sand_ripples(st, c, A, (0.16f + 0.2f * st->sub_env) * fd * clear * lum, st->rip_drift + 0.9f * surge);
 		PROF(3);
-		contours(st, c, A, 0.14f - sw, (0.7f + 0.2f * st->bass_env) * fa, 35.0f, 0.003f, 2, 0.0f, 0.0f);
+		contours(st, c, A, 0.14f - sw, (0.2f + 0.65f * lum * lum) * fa, 35.0f, 0.003f, 2);
 	} else {
-		far_lines(st, c, A, 0.2f * fd * clear, (float)ctx->t);
+		ink_fill(st, c, fill_g);
 		PROF(12);
-		sand_ripples(st, c, A, (0.13f + 0.24f * st->sub_env) * fd * clear, st->rip_drift + 0.9f * surge);
+		far_lines(st, c, A, 0.2f * fd * clear * lum, (float)ctx->t);
+		sand_ripples(st, c, A, (0.13f + 0.24f * st->sub_env) * fd * clear * lum, st->rip_drift + 0.9f * surge);
 		PROF(2);
 		caustic_lines(st, c, A, us_sat(light));
 		PROF(3);
-		/* ink: topographic iso-lines — growth rings of the colony */
-		contours(st, c, A, 0.12f - 0.05f * st->bass_env, (0.66f + 0.2f * st->bass_env) * fa, 60.0f * fa, 0.0013f, 1,
-			 0.22f - 0.04f * st->bass_env, 0.34f * fa);
-		coral_texture(st, c, A, 0.3f * fa);
+		/* ink: one fine rim per colony, lit on the sun side */
+		contours(st, c, A, 0.12f - 0.04f * st->bass_env, (0.3f + 0.55f * lum) * fa, 60.0f * fa, 0.0013f, 1);
 	}
 
 	PROF(4);
@@ -1505,7 +1666,7 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 			float lean = 0.35f * sinf(st->cur_ang - f->ang);
 			float sway = surge * (1.0f + 0.25f * sinf(f->ph)) + 0.25f * sinf(f->ph * 1.7f) * (1.0f - 0.5f * st->surge_amp);
 			fan_branch(c, f->x * A, f->y, f->ang + lean, (ctx->crisp ? 0.04f : 0.034f) * f->size, 0, f->seed, sway,
-				   (ctx->crisp ? 0.9f : 0.62f) * f->alpha * fa);
+				   (ctx->crisp ? 0.9f : 0.62f) * f->alpha * fa * lum);
 		}
 	}
 	/* ---- anemones on the sand: tentacles pulse open with the melody (each one listens to its own band) ---- */
@@ -1533,7 +1694,7 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 			float reach = an->r * open, X = an->x * A, Y = an->y;
 			/* lean: the current, plus the surge rocking across it */
 			float lx = (cur_x * 0.22f - cur_y * 0.3f * surge) * reach, ly = (cur_y * 0.22f + cur_x * 0.3f * surge) * reach;
-			float v = (0.36f + 0.4f * an->glow) * an->alpha * fa;
+			float v = (0.36f + 0.4f * an->glow) * an->alpha * fa * lum;
 			int nt = ctx->crisp ? 10 : 18;
 			for (int k = 0; k < nt; k++) {
 				float ang = k * US_TAU / nt + 0.1f * sinf(an->ph * 0.5f + k * 1.7f);
@@ -1600,16 +1761,18 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 			float target = us_sat(st->open_env * (0.75f + 0.25f * sinf(p->ph)) + wave) * (1.0f - 0.9f * p->shy);
 			p->open = us_approach(p->open, target, target > p->open ? 0.12f : (p->shy > 0.3f ? 0.035f : 0.6f), rdt);
 			float o = p->open;
-			float rad = (0.004f + 0.009f * o) * p->size;
+			/* snares: the reef spawns — every polyp flares wide and bright as the puff goes up */
+			float sn = st->snare_s;
+			float rad = (0.004f + 0.009f * o) * p->size * (1.0f + 0.6f * sn);
 			/* closed polyps wear their coral's colour; open ones glow (the music lights the reef up) */
 			int sp = cell_species(st, (int)p->gx, (int)p->gy);
-			uint8_t pm = o > 0.6f ? US_MAT_LIGHT : SPECIES_MAT[sp];
+			uint8_t pm = o > 0.6f || sn > 0.35f ? US_MAT_LIGHT : SPECIES_MAT[sp];
 			if (ctx->crisp) {
 				/* 1 px closed, a plus when open */
-				us_put(c, (int)(x * c->s), (int)(y * c->s), (0.55f + 0.4f * o) * fa, US_MAT_LIGHT);
-				if (o > 0.45f) {
+				us_put(c, (int)(x * c->s), (int)(y * c->s), us_sat((0.55f + 0.4f * o) * lum + 0.5f * sn) * fa, US_MAT_LIGHT);
+				if (o > 0.45f || sn > 0.3f) {
 					int px = (int)(x * c->s), py = (int)(y * c->s);
-					float vv = (0.35f + 0.5f * o) * fa;
+					float vv = us_sat((0.35f + 0.5f * o) * lum + 0.6f * sn) * fa;
 					us_put(c, px - 1, py, vv, pm);
 					us_put(c, px + 1, py, vv, pm);
 					us_put(c, px, py - 1, vv, pm);
@@ -1618,7 +1781,7 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 			} else {
 				int nt = 6;
 				float rot = p->ph * 0.15f;
-				float vv = (0.4f + 0.55f * o) * fa;
+				float vv = us_sat((0.4f + 0.55f * o) * lum + 0.55f * sn) * fa;
 				for (int k = 0; k < nt; k++) {
 					float an = rot + k * (US_TAU / nt);
 					/* tentacles curl inward when closed */
@@ -1628,7 +1791,7 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 					wu_line(c, x, y, mx, my, vv * 0.8f, pm);
 					wu_line(c, mx, my, ex, ey, vv, pm);
 				}
-				us_put(c, (int)(x * c->s), (int)(y * c->s), (0.5f + 0.4f * o) * fa, US_MAT_LIGHT); /* the mouth */
+				us_put(c, (int)(x * c->s), (int)(y * c->s), us_sat((0.5f + 0.4f * o) * lum + 0.5f * sn) * fa, US_MAT_LIGHT); /* the mouth */
 			}
 		}
 	}
@@ -1650,15 +1813,19 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 		q->y -= floorf(q->y);
 		q->age += dt;
 		if (q->age >= q->life) {
-			seed_at(st, q->x * GW, q->y * GH, us_randr(r, 1.5f, 2.5f));
+			if (us_rand(r) < 0.3f) /* a few settle and found new colonies */
+				seed_at(st, q->x * GW, q->y * GH, us_randr(r, 1.5f, 2.5f));
 			*q = st->sp[--st->nsp];
 			continue;
 		}
-		float fade = us_sat(q->age * 2.0f) * us_sat((q->life - q->age) * 0.5f);
-		float v = (0.55f + 0.45f * st->bass_env) * fade;
-		us_disc(c, q->x * A, q->y, ctx->crisp ? 0.004f : 0.0028f, v, US_MAT_BLOOM);
+		/* released bright (the puff reads on the snare), then a soft pink bundle drifting up */
+		float fresh = us_sat(1.0f - q->age * 2.5f);
+		float fade = us_sat(q->age * 12.0f) * us_sat((q->life - q->age) * 0.5f);
+		float v = us_sat((0.5f + 0.2f * st->lvl_env + 0.5f * fresh) * fade);
+		float rad = (ctx->crisp ? 0.004f : 0.0026f) * (1.0f + 0.8f * fresh);
+		us_disc(c, q->x * A, q->y, rad, v, fresh > 0.5f ? US_MAT_LIGHT : US_MAT_BLOOM);
 		if (!ctx->crisp)
-			us_ring(c, q->x * A, q->y, 0.006f + 0.003f * st->bass_env, 0.0008f, 0.35f * v, US_MAT_BLOOM);
+			us_ring(c, q->x * A, q->y, 0.006f + 0.01f * (1.0f - fresh) * fresh * 4.0f, 0.0008f, 0.35f * v, US_MAT_BLOOM);
 		i++;
 	}
 
@@ -1673,13 +1840,17 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 			float fx = us_noise3(px * 1.4f, p->y * 1.4f, tt);
 			float fy = us_noise3(px * 1.4f + 31.7f, p->y * 1.4f, tt);
 			float spd = 0.012f + 0.03f * a->level;
-			p->x += (fx * spd + 0.006f * cur_x) * dt / A;
-			p->y += (fy * spd + 0.006f * cur_y) * dt;
+			float push = 0.006f + 0.05f * st->kick_s; /* the kick's surge carries them along */
+			p->x += (fx * spd + push * cur_x) * dt / A;
+			p->y += (fy * spd + push * cur_y) * dt;
 			p->x -= floorf(p->x);
 			p->y -= floorf(p->y);
 			p->ph += dt * (0.5f + 3.0f * sparkle);
 			float tw = 0.5f + 0.5f * sinf(p->ph + p->size * 9.0f);
-			float v = 0.18f + 0.22f * p->size + (0.25f + 0.35f * sparkle) * tw * tw * tw + 0.2f * a->kick * p->size;
+			/* hats: a scattering of them catch the light (a different few each hat) */
+			int gl = ((hash2(i, (int)(st->glint_seed & 0xffff)) & 3) == 0);
+			float v = (0.14f + 0.18f * p->size) * (0.3f + 0.9f * st->lvl_env) + (0.2f + 0.3f * sparkle) * tw * tw * tw +
+				  (gl ? 0.8f * hat : 0.0f);
 			us_point(c, p->x * A, p->y, (ctx->crisp ? 0.002f : 0.0011f) * (0.8f + 0.6f * p->size), us_sat(v) * fa,
 				 p->size > 0.85f ? US_MAT_LIGHT : US_MAT_WATER);
 		}
@@ -1788,23 +1959,24 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 	{
 		st->bub_cd -= rdt;
 		st->bub_idle -= dt;
-		int puff = 0;
-		if (mflux > 2.5f && !kick_ev && st->bub_cd <= 0)
-			puff = 2 + (int)fminf(mflux, 4.0f), st->bub_cd = 0.25f;
+		int puff = 0, cloud = 0;
+		if (snare_ev && st->bub_cd <= 0)
+			puff = 7 + (int)(5.0f * st->lvl_env), cloud = 1, st->bub_cd = 0.12f;
 		else if (st->bub_idle <= 0)
 			puff = 1, st->bub_idle = us_randr(r, 2.5f, 6.0f);
-		if (puff) {
-			/* source: a random anemone, else a random spot on the reef's edge */
+		/* a snare's cloud rises from two places at once: an anemone and a crevice in the reef */
+		for (int src = 0; src < 1 + cloud && puff; src++) {
 			float bx = us_rand(r), by = us_rand(r);
 			anem_t *an = &st->an[(int)(us_rand(r) * MAX_AN) % MAX_AN];
-			if (an->alive && an->alpha > 0.5f)
+			if (src == 0 && an->alive && an->alpha > 0.5f)
 				bx = an->x, by = an->y;
 			for (int k = 0; k < puff && st->nbub < MAX_BUB; k++) {
 				bub_t *b = &st->bub[st->nbub++];
-				b->x = bx * A + us_randr(r, -0.006f, 0.006f);
-				b->y = by + us_randr(r, -0.006f, 0.006f);
-				b->r = us_randr(r, 0.7f, 1.3f);
-				b->age = -k * 0.07f; /* a little stream, not all at once */
+				float sp = cloud ? 0.02f : 0.006f;
+				b->x = bx * A + us_randr(r, -sp, sp);
+				b->y = by + us_randr(r, -sp, sp);
+				b->r = cloud ? us_randr(r, 1.0f, 2.0f) : us_randr(r, 0.7f, 1.3f);
+				b->age = cloud ? -k * 0.012f : -k * 0.07f; /* a cloud bursts out; a lone stream trickles */
 				b->life = us_randr(r, 1.3f, 2.4f);
 				b->wob = us_rand(r) * US_TAU;
 			}
