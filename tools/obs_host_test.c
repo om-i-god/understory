@@ -130,8 +130,15 @@ int main(int argc, char **argv)
 
 	char bin[1024], data[1024];
 #ifdef _WIN32
+	/* libobs names a module after the text past the last '/', as OBS's own loader passes it */
 	snprintf(bin, sizeof(bin), "%s", plugin);
 	snprintf(data, sizeof(data), "%s", argc > 5 ? argv[5] : "data");
+	for (char *q = bin; *q; q++)
+		if (*q == '\\')
+			*q = '/';
+	for (char *q = data; *q; q++)
+		if (*q == '\\')
+			*q = '/';
 #else
 	snprintf(bin, sizeof(bin), "%s/Contents/MacOS/understory", plugin);
 	snprintf(data, sizeof(data), "%s/Contents/Resources", plugin);
