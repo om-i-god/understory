@@ -1119,8 +1119,20 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 					float x = (px + 0.5f) / c->s;
 					uint8_t m;
 					float v = plane_tone(st, ysh, ywt, wab, x, y, A, body_x, body_v, pl, &m);
-					if (v > 0.0f)
-						us_put(c, px, py, pix_fill(m == US_MAT_EARTH ? v * 24.0f : fmaxf(v * 13.0f, 1.05f), px, py), m);
+					if (v <= 0.0f)
+						continue;
+					float sh;
+					if (m == US_MAT_EARTH) {
+						/* dry sand is one solid shade; a moonlit strip along the water's edge is a shade
+						 * lighter and reaches farther up the beach as the music gets louder (a clean edge,
+						 * not a dither band across the beach) */
+						int col = px * NX / c->w;
+						float sd = (y - ysh[col]) / (1.02f - ysh[col]);
+						float edge = 0.04f + 0.75f * st->lvl_slow;
+						sh = 2.1f + 0.9f * us_smooth(edge + 0.012f, edge - 0.012f, sd);
+					} else
+						sh = fmaxf(v * 13.0f, 1.05f);
+					us_put(c, px, py, pix_fill(sh, px, py), m);
 				}
 			}
 		} else {
@@ -1279,33 +1291,42 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 			}
 		}
 	}
-	/* ---- sand: ripple dashes ---- */
+	/* ---- the dry sand: ripple contours, shells and pebbles, driftwood, a sand fence, footprints ---- */
 	{
-		/* ripple marks: long wavy ridges across the beach, parallel to the water, breaking up and rejoining;
-		 * moonlight catches the crests */
-		int rows = ctx->crisp ? 7 + (int)(dens * 4) : 10 + (int)(dens * 8);
-		const int NR = ctx->crisp ? 32 : 64;
+		/* ripple marks: a few long, gently undulating contours across the beach, parallel to the water and
+		 * spaced in perspective; moonlight catches them on the moon's side, they fade out at their ends */
+		int rows = ctx->crisp ? 5 + (int)(dens * 3) : 7 + (int)(dens * 5);
+		const int NR = ctx->crisp ? 40 : 96;
 		for (int k = 0; k < rows; k++) {
-			float f = (k + 0.5f) / rows;
-			float z = st->tide_s * powf(0.56f / st->tide_s, f) * 0.97f;
+			float f = (k + 0.6f) / rows;
+			float z = st->tide_s * 0.86f * powf(0.6f / (st->tide_s * 0.86f), f);
 			float y = proj_y(z);
-			if (y > 1.02f)
+			if (y > 1.0f)
 				continue;
 			float scale = KP / z;
+			/* each contour covers its own stretch of the beach */
+			float a0 = hash1(k * 0.37f + 0.2f) * 0.35f - 0.05f, a1 = a0 + 0.55f + 0.5f * hash1(k * 0.91f + 0.6f);
 			float px = 0, py = 0, pv = 0;
 			for (int i = 0; i <= NR; i++) {
-				float xf = (float)i / NR;
+				float xf = a0 + (a1 - a0) * i / NR;
+				if (xf < -0.02f || xf > 1.02f) {
+					pv = 0;
+					continue;
+				}
 				float X = (xf - 0.5f) * A / scale;
-				float s = us_noise2(X * 0.7f + 11.0f, z * 4.0f + k * 0.37f);
-				float x = xf * A, yy = y + 0.006f * scale * us_noise2(X * 1.6f, z * 5.0f + k);
-				float shine = body_x >= 0 ? body_v * expf(-((x - body_x) * (x - body_x)) / (0.09f * A * A)) : 0.0f;
-				float v = us_smooth(-0.15f, 0.35f, s) * (0.2f + 0.16f * s + 0.05f * day + 0.25f * shine) * (0.6f + 0.4f * scale);
-				if (i > 0 && (v > 0.03f || pv > 0.03f)) {
+				float x = xf * A;
+				float yy = y + 0.012f * scale * (0.8f * sinf(X * 0.9f + k * 2.1f) + 0.6f * us_noise2(X * 0.6f, k * 3.3f));
+				float u = (float)i / NR;
+				float ends = us_smooth(0.0f, 0.18f, u) * us_smooth(1.0f, 0.82f, u);
+				float shine = body_x >= 0 ? body_v * expf(-((x - body_x) * (x - body_x)) / (0.12f * A * A)) : 0.0f;
+				float v = ends * (0.24f + 0.1f * us_noise2(X * 0.5f + 3.0f, k) + 0.04f * day + 0.18f * shine) * (0.55f + 0.45f * scale) *
+					  (0.7f + 0.3f * lk);
+				if (i > 0 && (v > 0.02f || pv > 0.02f)) {
 					if (ctx->crisp) {
-						if (v > 0.12f)
-							us_line(c, px, py, x, yy, 0.001f, pix_step(1.6f + 4.0f * v, (int)(x * c->s), k), US_MAT_EARTH);
+						if (v > 0.1f)
+							us_line(c, px, py, x, yy, 0.001f, 0.62f, US_MAT_EARTH);
 					} else
-						wu_line(c, px, py, x, yy, 0.5f * (v + pv), shine > 0.35f && s > 0.3f ? US_MAT_LIGHT : US_MAT_EARTH);
+						wu_line(c, px, py, x, yy, 0.5f * (v + pv), shine > 0.45f ? US_MAT_LIGHT : US_MAT_EARTH);
 				}
 				px = x, py = yy, pv = v;
 			}
@@ -1341,31 +1362,136 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 				for (int k = -1; k <= 1; k++)
 					wu_line(c, x - rr * ca * 0.8f, y, x + rr * cosf(st->sh_a[i] + k * 0.5f) * 0.7f, y - rr * 0.3f + k * rr * 0.12f, v * 0.6f, m);
 		}
-		/* a driftwood log stranded above the tideline */
+		/* a bleached driftwood log stranded above the tideline: a slightly bent trunk, tapering, its cut
+		 * end showing rings, a broken branch stub, grain along its length; moonlit along the top */
 		{
 			float z = st->log_z, sc = KP / z;
-			float L = 0.42f * sc, th = 0.016f * sc;
+			float L = 0.5f * sc, th = 0.02f * sc;
 			float cx = st->log_x * A, cy = proj_y(z);
 			if (cy < 1.0f) {
-				float ca = cosf(st->log_a), sa = sinf(st->log_a) * 0.3f;
-				float ax = cx - ca * L * 0.5f, ay = cy - sa * L * 0.5f, bx = cx + ca * L * 0.5f, by = cy + sa * L * 0.5f;
-				float v = 0.36f + 0.12f * day;
-				if (ctx->crisp) {
-					us_line(c, ax, ay, bx, by, th * 1.6f, v * 0.8f, US_MAT_EARTH);
-				} else {
-					for (int k = -2; k <= 2; k++) { /* grain */
-						float o = k * th * 0.45f;
-						float s0 = 0.04f * (k & 1), s1 = 1.0f - 0.05f * ((k + 2) & 1);
-						wu_line(c, us_lerp(ax, bx, s0), us_lerp(ay, by, s0) + o, us_lerp(ax, bx, s1), us_lerp(ay, by, s1) + o,
-							k == -2 || k == 2 ? v : v * 0.45f, US_MAT_EARTH);
-					}
-					/* the root end */
-					for (int k = 0; k < 4; k++) {
-						float ra = US_PI + (k - 1.5f) * 0.55f;
-						wu_line(c, ax, ay, ax + cosf(ra) * th * 2.2f, ay + sinf(ra) * th * 1.6f, v * 0.8f, US_MAT_EARTH);
-					}
-					us_ring(c, bx, by, th * 0.9f, 0.001f, v, US_MAT_EARTH);
+				float ca = cosf(st->log_a), sa = sinf(st->log_a) * 0.25f;
+				float v = 0.42f + 0.12f * day;
+				enum { NL = 16 };
+				float tx[NL + 1], ty[NL + 1], by_[NL + 1];
+				for (int k = 0; k <= NL; k++) {
+					float u = (float)k / NL - 0.5f;
+					float bend = 0.06f * L * (1.0f - 4.0f * u * u);
+					float mx = cx + ca * L * u, my = cy + sa * L * u - bend;
+					float rr = th * (1.0f - 0.35f * (u + 0.5f)) * (1.0f + 0.08f * sinf(k * 1.7f));
+					tx[k] = mx, ty[k] = my - rr, by_[k] = my + rr * 0.8f;
 				}
+				if (ctx->crisp) {
+					for (int k = 0; k < NL; k++) {
+						us_line(c, tx[k], 0.5f * (ty[k] + by_[k]), tx[k + 1], 0.5f * (ty[k + 1] + by_[k + 1]), th * 1.5f, 0.4f, US_MAT_STEM);
+						us_line(c, tx[k], ty[k], tx[k + 1], ty[k + 1], 1.0f / c->s, 0.9f, US_MAT_ACCENT);
+					}
+				} else {
+					for (int k = 0; k < NL; k++) {
+						wu_line(c, tx[k], ty[k], tx[k + 1], ty[k + 1], v, US_MAT_ACCENT);
+						wu_line(c, tx[k], by_[k], tx[k + 1], by_[k + 1], v * 0.6f, US_MAT_STEM);
+						/* grain: two broken lines along the trunk */
+						for (int g = 1; g <= 2; g++)
+							if (((k + g) % 4) != 0)
+								wu_line(c, tx[k], us_lerp(ty[k], by_[k], g / 3.0f), tx[k + 1], us_lerp(ty[k + 1], by_[k + 1], g / 3.0f),
+									v * 0.3f, US_MAT_STEM);
+					}
+					/* the cut end: an ellipse with a crack inside */
+					float ex = tx[0], ey = 0.5f * (ty[0] + by_[0]), er = 0.5f * (by_[0] - ty[0]);
+					float qx = 0, qy = 0;
+					for (int k = 0; k <= 12; k++) {
+						float an = US_TAU * k / 12.0f;
+						float x = ex + cosf(an) * er * 0.45f, y = ey + sinf(an) * er;
+						if (k)
+							wu_line(c, qx, qy, x, y, v, US_MAT_ACCENT);
+						qx = x, qy = y;
+					}
+					wu_line(c, ex - er * 0.1f, ey - er * 0.4f, ex + er * 0.1f, ey + er * 0.4f, v * 0.5f, US_MAT_STEM);
+					/* a broken branch stub */
+					int kb = NL * 2 / 3;
+					wu_line(c, tx[kb], ty[kb], tx[kb] + ca * th * 1.2f, ty[kb] - th * 2.2f, v * 0.9f, US_MAT_ACCENT);
+					wu_line(c, tx[kb + 1], ty[kb + 1], tx[kb] + ca * th * 1.6f, ty[kb] - th * 2.0f, v * 0.7f, US_MAT_ACCENT);
+					/* its shadow edge on the sand */
+					wu_line(c, tx[2], by_[2] + th * 0.6f, tx[NL - 1], by_[NL - 1] + th * 0.6f, 0.1f, US_MAT_EARTH);
+				}
+			}
+		}
+		/* a line of footprints: someone walked down to the water, a little wandering, prints in pairs */
+		{
+			const int NF = 22;
+			float side = st->rk_side ? -1.0f : 1.0f; /* on the side away from the rock */
+			for (int k = 0; k < NF; k++) {
+				float u = (float)k / (NF - 1);
+				float z = us_lerp(0.58f, st->tide_s * 0.84f, u * u * 0.6f + u * 0.4f);
+				float sc = KP / z;
+				float xc = A * (0.5f - side * (0.1f + 0.12f * u) + 0.03f * sinf(u * 5.0f + st->log_a * 9.0f));
+				float lr = (k & 1) ? 1.0f : -1.0f;
+				float x = xc + lr * 0.012f * sc, y = proj_y(z);
+				if (y > 1.0f)
+					continue;
+				float rx = 0.008f * sc, ry = 0.004f * sc;
+				float v = (0.34f + 0.08f * day) * (0.6f + 0.4f * sc);
+				if (ctx->crisp) {
+					put_set(c, (int)(x * c->s), (int)(y * c->s), 0.17f, US_MAT_EARTH);
+					continue;
+				}
+				/* a hollow: its moonlit back rim, a faint front edge */
+				float qx = 0, qy = 0;
+				for (int q = 0; q <= 10; q++) {
+					float an = US_PI * (0.1f + 0.8f * q / 10.0f);
+					float px = x + cosf(an) * rx * 0.55f, py = y - sinf(an) * ry;
+					if (q)
+						wu_line(c, qx, qy, px, py, v, US_MAT_EARTH);
+					qx = px, qy = py;
+				}
+				wu_line(c, x - rx * 0.4f, y + ry * 0.4f, x + rx * 0.4f, y + ry * 0.4f, v * 0.5f, US_MAT_EARTH);
+			}
+		}
+		/* a sand fence over the dune in one foreground corner: leaning posts, half buried, two sagging wires
+		 * with slats hanging from them, running back into the beach */
+		{
+			int left = !st->rk_side;
+			const int NP = 7;
+			float qx = 0, qy = 0, rx_ = 0, ry_ = 0;
+			for (int k = 0; k < NP; k++) {
+				float u = (float)k / (NP - 1);
+				float z = us_lerp(0.62f, 0.95f, u);
+				float sc = KP / z;
+				float xf = left ? us_lerp(0.02f, 0.3f, u) : us_lerp(0.98f, 0.7f, u);
+				float x = xf * A, yb = proj_y(z) + 0.004f * sc * sinf(k * 2.3f);
+				float H = 0.11f * sc * (0.85f + 0.15f * sinf(k * 1.9f)), lean = 0.08f * H * sinf(k * 3.1f + 1.0f);
+				float xt = x + lean, yt = yb - H;
+				float v = 0.45f + 0.1f * day;
+				if (ctx->crisp) {
+					us_line(c, x, yb, xt, yt, 1.0f / c->s, 0.62f, US_MAT_STEM);
+				} else {
+					wu_line(c, x, yb, xt, yt, v, US_MAT_STEM);
+					wu_line(c, x + 0.0015f * sc, yb, xt + 0.0015f * sc, yt, v * 0.5f, US_MAT_STEM);
+					/* sand drifted against its foot */
+					wu_line(c, x - 0.012f * sc, yb + 0.002f, x + 0.012f * sc, yb - 0.003f * sc, v * 0.35f, US_MAT_EARTH);
+				}
+				if (k) {
+					/* two wires sagging between the posts, slats hanging from the upper one */
+					for (int wi = 0; wi < 2; wi++) {
+						float y0 = wi ? ry_ : qy, y1 = wi ? yb - H * 0.35f : yt + H * 0.08f;
+						float x0 = wi ? rx_ : qx, x1 = wi ? x + lean * 0.35f : xt;
+						float mx = 0.5f * (x0 + x1), my = 0.5f * (y0 + y1) + 0.012f * sc;
+						if (ctx->crisp) {
+							us_line(c, x0, y0, mx, my, 1.0f / c->s, 0.4f, US_MAT_STEM);
+							us_line(c, mx, my, x1, y1, 1.0f / c->s, 0.4f, US_MAT_STEM);
+						} else {
+							wu_line(c, x0, y0, mx, my, v * 0.55f, US_MAT_STEM);
+							wu_line(c, mx, my, x1, y1, v * 0.55f, US_MAT_STEM);
+						}
+					}
+					if (!ctx->crisp)
+						for (int sl = 1; sl < 4; sl++) {
+							float f = sl / 4.0f;
+							float sx = us_lerp(qx, xt, f), sy = us_lerp(qy, yt + H * 0.08f, f) + 0.012f * sc * 4.0f * f * (1.0f - f);
+							if (hash1(k * 1.7f + sl * 0.31f) < 0.75f)
+								wu_line(c, sx, sy, sx + 0.002f * sc, sy + H * 0.6f, v * 0.3f, US_MAT_STEM);
+						}
+				}
+				qx = xt, qy = yt + H * 0.08f, rx_ = x + lean * 0.35f, ry_ = yb - H * 0.35f;
 			}
 		}
 	}
@@ -1753,7 +1879,7 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 		}
 		/* the moon's (sun's) reflection on the wet sand: a soft column of fine engraved hatching */
 		if (body_x >= 0 && body_v > 0.05f) {
-			int hr = ctx->crisp ? 5 : 16;
+			int hr = ctx->crisp ? 5 : 11;
 			for (int k = 0; k < hr; k++) {
 				float f = (k + 0.5f) / hr;
 				float span = gwid * (1.0f + 1.5f * f) * 2.2f;
@@ -1763,13 +1889,16 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 				float px = 0, py = 0, pv = 0;
 				for (int i = c0; i < c1; i++) {
 					float xf = (i + 0.5f) / NX;
-					float zs = shore_z(st, xf), zw = st->wet_z[i];
+					/* the sand just above the water's edge is always damp: a strip that holds the moon
+					 * even between waves, longer and brighter while a run-up has left the beach wet */
+					float zs = shore_z(st, xf), zw = fminf(st->wet_z[i], zs * 0.9f);
 					float z = zs + (zw - zs) * f;
 					float x = xf * A, y = proj_y(z);
 					float dx = (x - body_x) / (span * 0.45f);
-					float shimmer = 0.7f + 0.3f * us_noise2(x * 25.0f + t * 0.8f, k * 1.9f);
-					float v = sqrtf(st->wet_a[i]) * body_v * expf(-dx * dx) * shimmer * (1.0f - 0.4f * f) * lk;
-					if (i > c0 && zw < zs - 0.002f && (v > 0.03f || pv > 0.03f)) {
+					float shimmer = 0.6f + 0.4f * us_noise2(x * 25.0f + t * 0.8f, k * 1.9f);
+					float wet = 0.55f + 0.45f * sqrtf(st->wet_a[i]);
+					float v = us_sat(2.2f * wet * (0.3f + body_v) * expf(-dx * dx) * shimmer * (1.0f - 0.5f * f) * (0.4f + 0.5f * lk));
+					if (i > c0 && (v > 0.03f || pv > 0.03f)) {
 						if (ctx->crisp)
 							us_line(c, px, py, x, y, 0.002f, fmaxf(v, pv), US_MAT_LIGHT);
 						else
