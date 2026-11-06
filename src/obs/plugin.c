@@ -3,8 +3,7 @@
 #include <graphics/graphics.h>
 #include <util/platform.h>
 #include <util/bmem.h>
-#include <util/threading.h>
-#include <pthread.h>
+#include "core/us_thread.h"
 #include <string.h>
 #include <stdio.h>
 #include <math.h>
@@ -12,6 +11,9 @@
 #include "core/us_scene.h"
 #include "core/us_math.h"
 #include "core/us_journey.h"
+
+/* from libobs util/threading.h (not included: on Windows it drags in w32-pthreads) */
+void os_set_thread_name(const char *name);
 
 OBS_DECLARE_MODULE()
 OBS_MODULE_USE_DEFAULT_LOCALE("understory", "en-US")
@@ -26,11 +28,11 @@ MODULE_EXPORT const char *obs_module_description(void)
 
 static char *g_world_path;
 static double g_last_save;
-static pthread_mutex_t g_world_mu = PTHREAD_MUTEX_INITIALIZER;
+static us_mutex g_world_mu = US_MUTEX_INIT;
 
 typedef struct us_src {
 	obs_source_t *self;
-	pthread_mutex_t mu;
+	us_mutex mu;
 	us_engine eng;
 	us_analyzer *an;
 
@@ -58,17 +60,17 @@ typedef struct us_src {
 	us_audio last_audio;
 
 	/* worker thread: simulation + raster + compose run here, never on OBS's video thread */
-	pthread_t thr;
+	us_thread thr;
 	int thr_ok;
-	pthread_mutex_t job_mu;
-	pthread_cond_t job_cv;
+	us_mutex job_mu;
+	us_cond job_cv;
 	float job_dt;
 	double job_clock;
 	int job, quit;
-	pthread_mutex_t audio_mu; /* guards audio_name / audio_weak */
+	us_mutex audio_mu; /* guards audio_name / audio_weak */
 
 	/* finished frame handed to the renderer */
-	pthread_mutex_t front_mu;
+	us_mutex front_mu;
 	uint8_t *front;
 	int front_w, front_h, front_crisp, fresh;
 } us_src;
@@ -122,9 +124,9 @@ static void world_save(void)
 {
 	if (!g_world_path)
 		return;
-	pthread_mutex_lock(&g_world_mu);
+	us_mutex_lock(&g_world_mu);
 	us_world_save(us_world_shared(), g_world_path);
-	pthread_mutex_unlock(&g_world_mu);
+	us_mutex_unlock(&g_world_mu);
 }
 
 /* ---------------------------------------------------------------- settings */
@@ -137,7 +139,7 @@ static const char *src_get_name(void *unused)
 
 static void apply_settings(us_src *s, obs_data_t *st)
 {
-	pthread_mutex_lock(&s->mu);
+	us_mutex_lock(&s->mu);
 	const char *scene = obs_data_get_string(st, "scene");
 	uint32_t seed = (uint32_t)obs_data_get_int(st, "seed");
 	/* only follow the dropdown when it actually changed, so hotkey / auto-cycle choices survive other edits */
@@ -181,7 +183,7 @@ static void apply_settings(us_src *s, obs_data_t *st)
 	s->scene_mode = (int)obs_data_get_int(st, "scene_mode");
 
 	const char *aname = obs_data_get_string(st, "audio_source");
-	pthread_mutex_lock(&s->audio_mu);
+	us_mutex_lock(&s->audio_mu);
 	int rehook = !s->audio_name || strcmp(s->audio_name, aname) != 0 || !s->audio_weak;
 	if (rehook) {
 		bfree(s->audio_name);
@@ -189,8 +191,8 @@ static void apply_settings(us_src *s, obs_data_t *st)
 		hook_audio(s);
 		us_analyzer_reset(s->an);
 	}
-	pthread_mutex_unlock(&s->audio_mu);
-	pthread_mutex_unlock(&s->mu);
+	us_mutex_unlock(&s->audio_mu);
+	us_mutex_unlock(&s->mu);
 }
 
 static void src_update(void *data, obs_data_t *settings) { apply_settings(data, settings); }
@@ -242,13 +244,13 @@ static bool reset_world_clicked(obs_properties_t *props, obs_property_t *p, void
 	(void)props;
 	(void)p;
 	us_src *s = data;
-	pthread_mutex_lock(&g_world_mu);
+	us_mutex_lock(&g_world_mu);
 	us_world_init(us_world_shared());
-	pthread_mutex_unlock(&g_world_mu);
+	us_mutex_unlock(&g_world_mu);
 	if (s) {
-		pthread_mutex_lock(&s->mu);
+		us_mutex_lock(&s->mu);
 		us_world_init(&s->eng.private_world);
-		pthread_mutex_unlock(&s->mu);
+		us_mutex_unlock(&s->mu);
 	}
 	world_save();
 	return false;
@@ -365,11 +367,11 @@ static obs_properties_t *src_properties(void *data)
 
 static void step_scene(us_src *s, int dir)
 {
-	pthread_mutex_lock(&s->mu);
+	us_mutex_lock(&s->mu);
 	s->scene_idx = (s->scene_idx + dir + us_scene_count) % us_scene_count;
 	us_engine_set_scene(&s->eng, us_scene_list[s->scene_idx]->id, s->eng.seed);
 	s->cycle_timer = 0;
-	pthread_mutex_unlock(&s->mu);
+	us_mutex_unlock(&s->mu);
 }
 
 static void hk_next(void *data, obs_hotkey_id id, obs_hotkey_t *hk, bool pressed)
@@ -409,11 +411,11 @@ static void *src_create(obs_data_t *settings, obs_source_t *source)
 {
 	us_src *s = bzalloc(sizeof(*s));
 	s->self = source;
-	pthread_mutex_init(&s->mu, NULL);
-	pthread_mutex_init(&s->job_mu, NULL);
-	pthread_cond_init(&s->job_cv, NULL);
-	pthread_mutex_init(&s->audio_mu, NULL);
-	pthread_mutex_init(&s->front_mu, NULL);
+	us_mutex_init(&s->mu);
+	us_mutex_init(&s->job_mu);
+	us_cond_init(&s->job_cv);
+	us_mutex_init(&s->audio_mu);
+	us_mutex_init(&s->front_mu);
 	us_engine_init(&s->eng);
 	s->an = us_analyzer_create();
 	s->sensitivity = s->bass_gain = s->mid_gain = s->high_gain = 1.0f;
@@ -433,22 +435,22 @@ static void *src_create(obs_data_t *settings, obs_source_t *source)
 	s->hk_style = obs_hotkey_register_source(source, "understory.style", T_("Hotkey.Style"), hk_style, s);
 
 	apply_settings(s, settings);
-	s->thr_ok = pthread_create(&s->thr, NULL, worker_main, s) == 0;
+	s->thr_ok = us_thread_create(&s->thr, worker_main, s);
 	return s;
 }
 
 static void src_destroy(void *data)
 {
 	us_src *s = data;
-	pthread_mutex_lock(&s->audio_mu);
+	us_mutex_lock(&s->audio_mu);
 	unhook_audio(s);
-	pthread_mutex_unlock(&s->audio_mu);
+	us_mutex_unlock(&s->audio_mu);
 	if (s->thr_ok) {
-		pthread_mutex_lock(&s->job_mu);
+		us_mutex_lock(&s->job_mu);
 		s->quit = 1;
-		pthread_cond_signal(&s->job_cv);
-		pthread_mutex_unlock(&s->job_mu);
-		pthread_join(s->thr, NULL);
+		us_cond_signal(&s->job_cv);
+		us_mutex_unlock(&s->job_mu);
+		us_thread_join(s->thr);
 	}
 	obs_enter_graphics();
 	if (s->tex)
@@ -461,11 +463,11 @@ static void src_destroy(void *data)
 	bfree(s->audio_name);
 	bfree(s->applied_scene_setting);
 	bfree(s->front);
-	pthread_mutex_destroy(&s->mu);
-	pthread_mutex_destroy(&s->job_mu);
-	pthread_cond_destroy(&s->job_cv);
-	pthread_mutex_destroy(&s->audio_mu);
-	pthread_mutex_destroy(&s->front_mu);
+	us_mutex_destroy(&s->mu);
+	us_mutex_destroy(&s->job_mu);
+	us_cond_destroy(&s->job_cv);
+	us_mutex_destroy(&s->audio_mu);
+	us_mutex_destroy(&s->front_mu);
 	bfree(s);
 	world_save();
 }
@@ -476,7 +478,7 @@ static uint32_t src_height(void *data) { return (uint32_t)((us_src *)data)->out_
 /* one simulation step on the worker thread */
 static void step(us_src *s, float seconds, double clock)
 {
-	pthread_mutex_lock(&s->mu);
+	us_mutex_lock(&s->mu);
 	us_analyzer_update(s->an, seconds, s->sensitivity, s->bass_gain, s->mid_gain, s->high_gain, &s->last_audio);
 
 	float per_scene = fmaxf(s->auto_cycle_min, 0.25f) * 60.0f;
@@ -488,26 +490,26 @@ static void step(us_src *s, float seconds, double clock)
 			us_engine_set_scene(&s->eng, us_scene_list[s->scene_idx]->id, s->eng.seed);
 		}
 	} else if (s->scene_mode == 2) {
-		pthread_mutex_lock(&g_world_mu);
+		us_mutex_lock(&g_world_mu);
 		int nx = us_journey_step(&s->journey, &s->last_audio, us_engine_world(&s->eng), seconds, s->scene_idx,
 					 per_scene, per_scene * 4.0f);
-		pthread_mutex_unlock(&g_world_mu);
+		us_mutex_unlock(&g_world_mu);
 		if (nx >= 0) {
 			s->scene_idx = nx;
 			us_engine_set_scene(&s->eng, us_scene_list[nx]->id, s->eng.seed);
 		}
 	}
-	pthread_mutex_lock(&g_world_mu);
+	us_mutex_lock(&g_world_mu);
 	us_engine_frame(&s->eng, &s->last_audio, seconds, clock);
 	int save = clock - g_last_save > WORLD_SAVE_INTERVAL;
 	if (save)
 		g_last_save = clock;
-	pthread_mutex_unlock(&g_world_mu);
+	us_mutex_unlock(&g_world_mu);
 
 	/* hand the finished frame to the renderer */
 	int cw = s->eng.canvas.w, ch = s->eng.canvas.h;
 	if (s->eng.rgba && cw > 0 && ch > 0) {
-		pthread_mutex_lock(&s->front_mu);
+		us_mutex_lock(&s->front_mu);
 		if (s->front_w != cw || s->front_h != ch || !s->front) {
 			bfree(s->front);
 			s->front = bmalloc((size_t)cw * ch * 4);
@@ -517,9 +519,9 @@ static void step(us_src *s, float seconds, double clock)
 		memcpy(s->front, s->eng.rgba, (size_t)cw * ch * 4);
 		s->front_crisp = s->eng.canvas.crisp;
 		s->fresh = 1;
-		pthread_mutex_unlock(&s->front_mu);
+		us_mutex_unlock(&s->front_mu);
 	}
-	pthread_mutex_unlock(&s->mu);
+	us_mutex_unlock(&s->mu);
 
 	if (save)
 		world_save();
@@ -530,18 +532,18 @@ static void *worker_main(void *data)
 	us_src *s = data;
 	os_set_thread_name("understory");
 	for (;;) {
-		pthread_mutex_lock(&s->job_mu);
+		us_mutex_lock(&s->job_mu);
 		while (!s->job && !s->quit)
-			pthread_cond_wait(&s->job_cv, &s->job_mu);
+			us_cond_wait(&s->job_cv, &s->job_mu);
 		if (s->quit) {
-			pthread_mutex_unlock(&s->job_mu);
+			us_mutex_unlock(&s->job_mu);
 			break;
 		}
 		float dt = s->job_dt;
 		double clock = s->job_clock;
 		s->job = 0;
 		s->job_dt = 0;
-		pthread_mutex_unlock(&s->job_mu);
+		us_mutex_unlock(&s->job_mu);
 		step(s, dt, clock);
 	}
 	return NULL;
@@ -557,14 +559,14 @@ static void src_tick(void *data, float seconds)
 
 	/* audio source may appear after us (scene collection load order) or be recreated */
 	s->rehook_timer += seconds;
-	if (s->rehook_timer > 2.0 && pthread_mutex_trylock(&s->audio_mu) == 0) {
+	if (s->rehook_timer > 2.0 && us_mutex_trylock(&s->audio_mu)) {
 		s->rehook_timer = 0;
 		obs_source_t *a = s->audio_weak ? obs_weak_source_get_source(s->audio_weak) : NULL;
 		if (!a)
 			hook_audio(s);
 		else
 			obs_source_release(a);
-		pthread_mutex_unlock(&s->audio_mu);
+		us_mutex_unlock(&s->audio_mu);
 	}
 
 	double clock = (double)obs_get_video_frame_time() * 1e-9;
@@ -572,22 +574,22 @@ static void src_tick(void *data, float seconds)
 		step(s, seconds, clock);
 		return;
 	}
-	pthread_mutex_lock(&s->job_mu);
+	us_mutex_lock(&s->job_mu);
 	s->job_dt = fminf(s->job_dt + seconds, 0.25f);
 	s->job_clock = clock;
 	s->job = 1;
-	pthread_cond_signal(&s->job_cv);
-	pthread_mutex_unlock(&s->job_mu);
+	us_cond_signal(&s->job_cv);
+	us_mutex_unlock(&s->job_mu);
 }
 
 static void src_render(void *data, gs_effect_t *unused)
 {
 	(void)unused;
 	us_src *s = data;
-	pthread_mutex_lock(&s->front_mu);
+	us_mutex_lock(&s->front_mu);
 	int cw = s->front_w, ch = s->front_h;
 	if (!s->front || cw <= 0) {
-		pthread_mutex_unlock(&s->front_mu);
+		us_mutex_unlock(&s->front_mu);
 		return;
 	}
 	if (!s->tex || s->tex_w != cw || s->tex_h != ch) {
@@ -603,7 +605,7 @@ static void src_render(void *data, gs_effect_t *unused)
 		s->fresh = 0;
 	}
 	int crisp = s->front_crisp;
-	pthread_mutex_unlock(&s->front_mu);
+	us_mutex_unlock(&s->front_mu);
 	if (!s->tex)
 		return;
 

@@ -127,8 +127,13 @@ int us_world_save(const us_world *w, const char *path)
 #undef W
 	fprintf(f, "\n}\n");
 	int ok = fclose(f) == 0;
-	if (ok)
+	if (ok) {
+#ifdef _WIN32
+		/* rename() will not replace an existing file on Windows */
+		remove(path);
+#endif
 		ok = rename(tmp, path) == 0;
+	}
 	return ok;
 }
 

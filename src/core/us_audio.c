@@ -1,6 +1,6 @@
 #include "us_audio.h"
 #include "us_math.h"
-#include <pthread.h>
+#include "us_thread.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -8,7 +8,7 @@
 #define RING 16384 /* power of two */
 
 struct us_analyzer {
-	pthread_mutex_t mu;
+	us_mutex mu;
 	float ringM[RING], ringS[RING];
 	uint64_t wpos;     /* total samples written */
 	uint64_t consumed; /* wpos at last update */
@@ -34,7 +34,7 @@ us_analyzer *us_analyzer_create(void)
 	us_analyzer *an = calloc(1, sizeof(*an));
 	if (!an)
 		return NULL;
-	pthread_mutex_init(&an->mu, NULL);
+	us_mutex_init(&an->mu);
 	for (int i = 0; i < FFT_N; i++)
 		an->win[i] = 0.5f - 0.5f * cosf(US_TAU * i / (FFT_N - 1));
 	us_analyzer_reset(an);
@@ -43,12 +43,12 @@ us_analyzer *us_analyzer_create(void)
 
 void us_analyzer_reset(us_analyzer *an)
 {
-	pthread_mutex_lock(&an->mu);
+	us_mutex_lock(&an->mu);
 	memset(an->ringM, 0, sizeof(an->ringM));
 	memset(an->ringS, 0, sizeof(an->ringS));
 	an->wpos = an->consumed = 0;
 	an->rate = 48000;
-	pthread_mutex_unlock(&an->mu);
+	us_mutex_unlock(&an->mu);
 	memset(an->prevlog, 0, sizeof(an->prevlog));
 	for (int i = 0; i < 6 + US_NBANDS; i++) {
 		an->lo[i] = -9.0f;
@@ -67,7 +67,7 @@ void us_analyzer_destroy(us_analyzer *an)
 {
 	if (!an)
 		return;
-	pthread_mutex_destroy(&an->mu);
+	us_mutex_destroy(&an->mu);
 	free(an);
 }
 
@@ -75,7 +75,7 @@ void us_analyzer_push(us_analyzer *an, const float *L, const float *R, int frame
 {
 	if (!an || !L || frames <= 0)
 		return;
-	pthread_mutex_lock(&an->mu);
+	us_mutex_lock(&an->mu);
 	an->rate = rate > 0 ? rate : 48000;
 	for (int i = 0; i < frames; i++) {
 		float l = L[i], r = R ? R[i] : l;
@@ -84,7 +84,7 @@ void us_analyzer_push(us_analyzer *an, const float *L, const float *R, int frame
 		an->ringS[p] = 0.5f * (l - r);
 		an->wpos++;
 	}
-	pthread_mutex_unlock(&an->mu);
+	us_mutex_unlock(&an->mu);
 }
 
 static void fft(float *re, float *im, int n)
@@ -156,7 +156,7 @@ void us_analyzer_update(us_analyzer *an, float dt, float sens, float bass_gain, 
 	int rate;
 	uint64_t fresh;
 
-	pthread_mutex_lock(&an->mu);
+	us_mutex_lock(&an->mu);
 	rate = an->rate;
 	fresh = an->wpos - an->consumed;
 	an->consumed = an->wpos;
@@ -173,7 +173,7 @@ void us_analyzer_update(us_analyzer *an, float dt, float sens, float bass_gain, 
 		mid_e += m * m;
 		side_e += s * s;
 	}
-	pthread_mutex_unlock(&an->mu);
+	us_mutex_unlock(&an->mu);
 
 	us_audio *st = &an->st;
 	int have_audio = fresh > 0 && mid_e > 1e-9f;
