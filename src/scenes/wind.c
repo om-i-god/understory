@@ -15,6 +15,13 @@
  * A hazy far range and a windbreak of poplars bending with the gusts sit on the horizon; gust crests
  * flash the blades' pale sides (LIGHT); wisps of air end in a small curl (an eddy).
  * Silence: the prevailing breeze keeps slow waves rolling through.
+ * Detail: a figure flies a kite (tail with paper bows), swallows ride the gusts, a midge swarm (fireflies by
+ * night) hangs over the near grass, wildflowers / dandelion clocks dot the near rows, hatched hill flanks.
+ * Reactivity: kick -> gust front + tree shudder + poplars bowing in turn; other onsets -> leaves snap off,
+ * a swallow darts; bands[] -> per-row tip flutter (hats in the far rows); sub -> a long swell rolling
+ * toward the viewer; bass -> poplars lean; lowmid -> flowers nod; mid -> kite climbs, swallows rise;
+ * air -> kite tail + midges dance; swell -> burns off cloud shadows; width -> counter-gusts and wisps
+ * from the other flank; centroid -> wind direction.
  */
 #include "../core/us_scene.h"
 #include "../core/us_math.h"
@@ -24,7 +31,11 @@
 #define MAX_ROWS 34
 #define MAX_BLADES 3600
 #define MAX_SEEDS 700
-#define MAX_FRONTS 6
+#define MAX_FRONTS 8
+#define MAX_BIRD 6
+#define MAX_GNAT 28
+#define KITE_ROW 17
+#define NTAIL 14
 #define HZ 0.47f /* horizon */
 #define MAX_TSEG 96
 #define MAX_LEAF 420
@@ -47,7 +58,12 @@ typedef struct {
 
 typedef struct {
 	float pos, amp, speed, width; /* pos along the wind axis in world units */
+	float sgn;                    /* +1 downwind front, -1 a counter-gust from the other side (stereo width) */
 } front_t;
+
+typedef struct {
+	float x, y, vx, vy, ph, bank, alt; /* swallows riding the gusts */
+} bird_t;
 
 typedef struct {
 	int parent;
@@ -70,7 +86,7 @@ typedef struct {
 } cloud_t;
 
 typedef struct {
-	float x, y, age, life, len, amp, ph, sp;
+	float x, y, age, life, len, amp, ph, sp, dir;
 } wisp_t;
 
 typedef struct {
@@ -100,6 +116,19 @@ typedef struct {
 	float seed_acc;
 	float last_beat_t;
 	double t;
+	/* audio followers: each part of the music has its own carrier in the scene */
+	float bandv[US_NBANDS]; /* per-band envelopes -> per-row tip flutter (hats ride the far rows) */
+	float kick_prev, last_kick_t, kpulse; /* kicks -> gust fronts, tree shudder, poplars bowing */
+	float last_onset_t;   /* onsets -> leaves torn loose, swallows dart */
+	float sub_s, sub_ph;  /* sub -> a long ground swell rolling toward the viewer */
+	float bass_s, lowmid_s, mid_s, air_s, swell_s, width_s;
+	float counter;        /* alternates counter-gusts when the mix is wide */
+	/* kite flown by a small figure out in the field; mids lift it */
+	float kite_u, klift, ktilt, kvel;
+	float tail[2 * (NTAIL + 1)];
+	bird_t bd[MAX_BIRD];
+	float gnat_x;         /* swarm centre (fraction of width), drifting downwind */
+	float flower_seed;
 } st_t;
 
 static float row_s(int r)
@@ -178,6 +207,19 @@ static void *create(uint32_t seed)
 	}
 	s->dir = 0;
 	s->cloud_t = us_rand(r) * 50;
+	/* the kite flyer stands on the far side of the field from the tree */
+	s->kite_u = s->tree_u < 0.5f ? us_randr(r, 0.58f, 0.7f) : us_randr(r, 0.3f, 0.42f);
+	s->klift = 0.4f;
+	for (int i = 0; i < MAX_BIRD; i++) {
+		bird_t *b = &s->bd[i];
+		b->x = us_rand(r);
+		b->y = us_randr(r, HZ - 0.2f, HZ - 0.04f);
+		b->vx = us_randr(r, -0.1f, 0.1f);
+		b->ph = us_rand(r) * US_TAU;
+		b->alt = us_rand(r);
+	}
+	s->gnat_x = us_rand(r);
+	s->last_kick_t = s->last_onset_t = -10;
 	return s;
 }
 
@@ -250,7 +292,7 @@ static float wind_at(const st_t *s, float X, float Z, float ax, float az)
 			continue;
 		float d = (along - f->pos) / f->width;
 		if (d > -3.0f && d < 3.0f)
-			bend += f->amp * expf(-d * d) * (d < 0 ? 1.0f : 0.6f);
+			bend += f->sgn * f->amp * expf(-d * d) * (d * f->sgn < 0 ? 1.0f : 0.6f);
 	}
 	return bend;
 }
@@ -444,7 +486,7 @@ static void draw_tree(st_t *s, us_canvas *c, const us_ctx *ctx, float A, float s
 			otri(c, x, y, x + ddx * 0.5f + sinf(la) * wv, y + ddy * 0.5f - cosf(la) * wv, x + ddx, y + ddy, v, m);
 		} else
 			leafshape(c, x, y, la, len, len * (0.35f - 0.2f * sheen), v, m);
-		if (tear > 0 && s->ntb < MAX_TUMB && us_rand(&s->rng) < tear && torn < 2) {
+		if (tear > 0 && s->ntb < MAX_TUMB && us_rand(&s->rng) < tear && torn < (tear > 0.004f ? 5 : 2)) {
 			torn++;
 			tumb_t *q = &s->tb[s->ntb++];
 			q->x = x;
@@ -458,6 +500,116 @@ static void draw_tree(st_t *s, us_canvas *c, const us_ctx *ctx, float A, float s
 			q->life = 1.0f;
 			q->sz = len;
 			q->mat = m;
+		}
+	}
+}
+
+
+/* A small figure out in the field flies a kite. The melody (mids) lifts it, the air band sets its tail
+ * snaking, kicks make it lurch; in silence it sinks low and the tail hangs slack. */
+static void draw_kite(st_t *s, us_canvas *c, const us_ctx *ctx, float A, float sgn, float gy, float sc, float dayv, float winter)
+{
+	float t = (float)ctx->t, dt = ctx->dt;
+	float fx = s->kite_u * A, fh = 0.5f * sc;
+	float v = us_sat((c->crisp ? 0.55f : 0.62f) * dayv);
+	/* the flyer: head, body, legs braced against the pull, an arm up to the line */
+	float hx = fx + sgn * fh * 0.25f, hy = gy - fh * 0.78f;
+	/* drawn after the grass: the flyer stands waist-deep, so only the upper body is cut out of the blades */
+	if (c->crisp) {
+		oline(c, fx, gy - fh * 0.3f, fx + sgn * fh * 0.08f, gy - fh * 0.85f, 2.5f / c->s, v, US_MAT_ACCENT);
+		oline(c, fx + sgn * fh * 0.08f, gy - fh * 0.85f, hx, hy, 0.5f / c->s, v, US_MAT_ACCENT);
+		otri(c, fx + sgn * fh * 0.08f - fh * 0.12f, gy - fh * 0.88f, fx + sgn * fh * 0.08f + fh * 0.12f, gy - fh * 0.88f,
+		     fx + sgn * fh * 0.08f, gy - fh * 1.12f, v, US_MAT_ACCENT);
+	} else {
+		float sx = fx + sgn * fh * 0.06f, sy = gy - fh * 0.75f;
+		oline(c, fx, gy - fh * 0.42f, sx, sy, fh * 0.16f, 0.0f, US_MAT_BG);
+		oline(c, sx, sy - fh * 0.04f, sx + sgn * fh * 0.02f, sy - fh * 0.2f, fh * 0.2f, 0.0f, US_MAT_BG);
+		wline(c, fx - sgn * fh * 0.12f, gy, fx, gy - fh * 0.42f, 0.0013f, v, US_MAT_STEM);
+		wline(c, fx + sgn * fh * 0.1f, gy, fx, gy - fh * 0.42f, 0.0013f, v, US_MAT_STEM);
+		wline(c, fx, gy - fh * 0.42f, sx, sy, 0.0016f, v, US_MAT_STEM);
+		wring(c, sx + sgn * fh * 0.02f, sy - fh * 0.12f, fh * 0.09f, 0.0012f, v, US_MAT_STEM);
+		wline(c, sx, sy + fh * 0.04f, hx, hy, 0.0011f, v, US_MAT_STEM);
+	}
+	/* kite flight: lift eases toward the melody, a spring gives it a lurch on kicks */
+	float lt = us_sat(0.18f + 0.6f * s->mid_s + 0.3f * s->gust + 0.1f * ctx->w->wind) * (1.0f - 0.5f * winter);
+	s->klift = us_approach(s->klift, lt, lt > s->klift ? 1.2f : 3.0f, dt);
+	float tilt0 = sgn * (0.35f + 0.25f * s->gust) + (0.12f + 0.35f * s->gust) * us_noise2(7.7f, t * (0.6f + 1.6f * s->gust));
+	s->kvel += ((tilt0 - s->ktilt) * 18.0f - s->kvel * 2.6f) * dt + sgn * s->kpulse * 6.0f * dt;
+	s->ktilt += s->kvel * dt;
+	float kh = 0.06f + 0.3f * s->klift;
+	float kx = hx + sgn * (0.07f + 0.12f * s->gust + 0.08f * (1.0f - s->klift)) + 0.015f * us_noise2(3.3f, t * 0.5f);
+	float ky = hy - kh + 0.012f * us_noise2(5.1f, t * (0.7f + s->gust));
+	if (kx < 0.03f) kx = 0.03f;
+	if (kx > A - 0.03f) kx = A - 0.03f;
+	float ks = (0.016f + 0.006f * s->klift) * (c->crisp ? 1.6f : 1.0f);
+	float ca = cosf(s->ktilt), sa = sinf(s->ktilt);
+	/* diamond in kite space: top, right, bottom, left (long lower spine) */
+	static const float kp[8] = {0, -1.0f, 0.62f, -0.25f, 0, 1.45f, -0.62f, -0.25f};
+	float P[8];
+	for (int i = 0; i < 4; i++) {
+		float qx = kp[2 * i] * ks, qy = kp[2 * i + 1] * ks;
+		P[2 * i] = kx + qx * ca - qy * sa;
+		P[2 * i + 1] = ky + qx * sa + qy * ca;
+	}
+	float kv = us_sat(0.7f * dayv + 0.1f);
+	/* the line sags more when the kite is low and the wind slack */
+	float sag = 0.01f + 0.05f * (1.0f - s->klift);
+	float px = hx, py = hy;
+	for (int i = 1; i <= 14; i++) {
+		float f = i / 14.0f;
+		float x = us_lerp(hx, P[4], f), y = us_lerp(hy, P[5], f) + sag * 4.0f * f * (1.0f - f);
+		if (c->crisp)
+			us_line(c, px, py, x, y, 0.001f, 0.35f * dayv, US_MAT_STEM);
+		else
+			wline(c, px, py, x, y, 0.0008f, 0.28f * dayv, US_MAT_STEM);
+		px = x;
+		py = y;
+	}
+	if (c->crisp) {
+		us_tri(c, P[0], P[1], P[2], P[3], P[4], P[5], kv, US_MAT_BLOOM);
+		us_tri(c, P[0], P[1], P[4], P[5], P[6], P[7], kv * 0.75f, US_MAT_BLOOM);
+	} else {
+		for (int i = 0; i < 4; i++)
+			wline(c, P[2 * i], P[2 * i + 1], P[(2 * i + 2) & 7], P[(2 * i + 3) & 7], 0.0014f, kv, US_MAT_BLOOM);
+		wline(c, P[0], P[1], P[4], P[5], 0.001f, kv * 0.6f, US_MAT_BLOOM);
+		wline(c, P[2], P[3], P[6], P[7], 0.001f, kv * 0.6f, US_MAT_BLOOM);
+		/* panel hatching on the lee half */
+		for (int k = 1; k < 4; k++) {
+			float f = k / 4.0f;
+			wline(c, us_lerp(P[0], P[2], f), us_lerp(P[1], P[3], f), us_lerp(P[4], P[2], f), us_lerp(P[5], P[3], f), 0.0008f,
+			      kv * 0.3f, US_MAT_BLOOM);
+		}
+	}
+	/* the tail: each knot lags the one before it, a travelling wave whose speed/size follow the air band */
+	float seg = ks * 0.42f;
+	float dwx = sgn * (0.3f + 0.6f * s->klift), dwy = 1.0f - 0.6f * s->klift;
+	float dn = sqrtf(dwx * dwx + dwy * dwy);
+	dwx /= dn;
+	dwy /= dn;
+	float amp = ks * (0.15f + 0.9f * s->air_s), wf = 3.0f + 9.0f * s->air_s;
+	if (s->tail[0] == 0 && s->tail[1] == 0)
+		for (int k = 0; k <= NTAIL; k++) {
+			s->tail[2 * k] = P[4] + dwx * seg * k;
+			s->tail[2 * k + 1] = P[5] + dwy * seg * k;
+		}
+	s->tail[0] = P[4];
+	s->tail[1] = P[5];
+	for (int k = 1; k <= NTAIL; k++) {
+		float f = (float)k / NTAIL;
+		float wv = amp * f * sinf(k * 0.9f - t * wf);
+		float tx = P[4] + dwx * seg * k - dwy * wv, ty = P[5] + dwy * seg * k + dwx * wv;
+		s->tail[2 * k] = us_approach(s->tail[2 * k], tx, 0.03f + 0.012f * k, dt);
+		s->tail[2 * k + 1] = us_approach(s->tail[2 * k + 1], ty, 0.03f + 0.012f * k, dt);
+		float ax = s->tail[2 * k - 2], ay = s->tail[2 * k - 1], bx = s->tail[2 * k], by = s->tail[2 * k + 1];
+		float tv = kv * (1.0f - 0.5f * f);
+		if (c->crisp)
+			us_line(c, ax, ay, bx, by, 0.001f, tv, US_MAT_ACCENT);
+		else {
+			wline(c, ax, ay, bx, by, 0.0009f, tv, US_MAT_ACCENT);
+			if (k % 3 == 0) { /* paper bows tied along it */
+				float nx = -(by - ay), ny = bx - ax;
+				wline(c, bx - nx * 0.45f, by - ny * 0.45f, bx + nx * 0.45f, by + ny * 0.45f, 0.001f, tv * 0.8f, US_MAT_BLOOM);
+			}
 		}
 	}
 }
@@ -487,26 +639,72 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 	s->cloud_t += dt * (0.02f + 0.06f * s->gust);
 	float sgn = ax >= 0 ? 1.0f : -1.0f;
 
-	/* onsets -> a sudden gust front sweeps in from upwind */
-	if (a->beat && a->onset > 0.45f && ctx->t - s->last_beat_t > 0.8f) {
+	/* ---- audio followers (fast attack, eased release so nothing strobes) ---- */
+	for (int i = 0; i < US_NBANDS; i++) {
+		float bv = a->bands[i];
+		s->bandv[i] = us_approach(s->bandv[i], bv, bv > s->bandv[i] ? 0.04f : 0.35f, rdt);
+	}
+	s->sub_s = us_approach(s->sub_s, a->sub, a->sub > s->sub_s ? 0.25f : 1.2f, rdt);
+	s->bass_s = us_approach(s->bass_s, a->bass, a->bass > s->bass_s ? 0.15f : 0.6f, rdt);
+	s->lowmid_s = us_approach(s->lowmid_s, a->lowmid, 0.3f, rdt);
+	s->mid_s = us_approach(s->mid_s, a->mid, a->mid > s->mid_s ? 0.4f : 1.4f, rdt);
+	s->air_s = us_approach(s->air_s, a->air, a->air > s->air_s ? 0.05f : 0.3f, rdt);
+	s->swell_s = us_approach(s->swell_s, a->swell, 2.0f, rdt);
+	s->width_s = us_approach(s->width_s, a->width, 1.0f, rdt);
+	s->sub_ph += dt * (0.5f + 0.9f * s->sub_s);
+	s->kpulse = us_approach(s->kpulse, 0.0f, 0.35f, rdt);
+
+	/* kicks -> a gust front sweeps the field (a counter-gust from the other side when the mix is wide) */
+	int kicked = 0;
+	if (a->kick > 0.4f && a->kick > s->kick_prev + 0.2f && ctx->t - s->last_kick_t > 0.3f) {
+		kicked = 1;
+		s->last_kick_t = (float)ctx->t;
+		s->kpulse = us_sat(s->kpulse + 0.5f + 0.5f * a->kick);
+	} else if (a->beat && a->onset > 0.5f && ctx->t - s->last_kick_t > 1.6f && ctx->t - s->last_beat_t > 1.6f) {
+		kicked = 1; /* music without kicks still sends the odd front on big hits */
 		s->last_beat_t = (float)ctx->t;
-		for (int i = 0; i < MAX_FRONTS; i++)
+	}
+	s->kick_prev = a->kick;
+	if (kicked) {
+		float sg = 1.0f;
+		s->counter += s->width_s * 0.6f;
+		if (s->counter >= 1.0f) {
+			s->counter -= 1.0f;
+			sg = -1.0f;
+		}
+		int slot = -1;
+		float weakest = 9;
+		for (int i = 0; i < MAX_FRONTS; i++) {
 			if (s->fr[i].amp <= 0.001f) {
-				s->fr[i].amp = 0.35f + 0.65f * a->onset * (0.6f + 0.6f * s->gust);
-				s->fr[i].pos = -14.0f;
-				s->fr[i].speed = us_randr(r, 5.0f, 8.0f);
-				s->fr[i].width = us_randr(r, 1.4f, 2.6f);
+				slot = i;
 				break;
 			}
+			if (s->fr[i].amp < weakest) {
+				weakest = s->fr[i].amp;
+				slot = i;
+			}
+		}
+		front_t *f = &s->fr[slot];
+		f->amp = (sg > 0 ? 1.0f : 0.4f) * (0.3f + 0.55f * us_sat(fmaxf(a->kick, a->onset)) * (0.6f + 0.6f * s->gust));
+		f->sgn = sg;
+		f->pos = -14.0f * sg;
+		f->speed = us_randr(r, 7.0f, 10.0f);
+		f->width = us_randr(r, 1.2f, 2.2f);
 	}
 	for (int i = 0; i < MAX_FRONTS; i++) {
 		front_t *f = &s->fr[i];
 		if (f->amp <= 0.001f)
 			continue;
-		f->pos += f->speed * dt;
-		f->amp *= expf(-dt * 0.45f);
-		if (f->pos > 16.0f)
+		f->pos += f->sgn * f->speed * dt;
+		f->amp *= expf(-dt * 0.55f);
+		if (f->pos * f->sgn > 16.0f)
 			f->amp = 0;
+	}
+	/* onsets that are not kicks (snare, claps, plucks) -> tear leaves loose, swallows dart */
+	int snapped = 0;
+	if (a->beat && a->onset > 0.35f && !kicked && ctx->t - s->last_onset_t > 0.2f) {
+		snapped = 1;
+		s->last_onset_t = (float)ctx->t;
 	}
 
 	float dayv = 0.8f + 0.2f * us_smooth(0.0f, 0.6f, day);
@@ -519,10 +717,14 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 		float bend = wind_at(s, X * 0.25f, Z * 0.25f, ax, az);
 		float target = gstr * bend * (0.35f + 0.65f * fabsf(ax) + 0.2f) * 2.4f;
 		s->tvel += ((target - s->tbend) * 28.0f - s->tvel * 3.2f) * dt;
+		if (kicked) /* the whole tree shudders as the front hits it */
+			s->tvel += sgn * (0.6f + 0.8f * a->kick);
 		s->tbend += s->tvel * dt;
 		float force = gstr * bend;
 		if (force > 0.3f)
 			tear = dt * (force - 0.3f) * 0.12f * (0.3f + 2.5f * autumn) * (1.0f - winter);
+		if (snapped) /* a sharp hit snaps a few leaves off at once */
+			tear += (0.006f + 0.01f * a->onset) * (0.4f + autumn) * (1.0f - winter);
 	}
 
 	/* ---- sky: sun / moon, cumulus ---- */
@@ -697,6 +899,19 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 				}
 				for (int i = 0; i < 96; i++)
 					wline(c, fp[2 * i], fp[2 * i + 1], fp[2 * i + 2], fp[2 * i + 3], 0.0011f, (0.2f + 0.06f * day) * dayv, US_MAT_WATER);
+				/* engraver's hatching down the shaded flanks, slanting with the slope */
+				for (int i = 1; i < 95; i += 2) {
+					float sl = fp[2 * i + 3] - fp[2 * i - 1];
+					float shade = sl * (sgn > 0 ? 1.0f : -1.0f); /* the lee side, away from the low sun */
+					if (shade < 0.0005f)
+						continue;
+					float hl = us_clampf(shade * 9.0f, 0.004f, 0.022f) * (0.6f + 0.4f * us_noise2(i * 0.9f, 4.0f));
+					float x0 = fp[2 * i], y0 = fp[2 * i + 1] + 0.003f;
+					if (y0 + hl > HZ - 0.004f)
+						hl = HZ - 0.004f - y0;
+					if (hl > 0.002f)
+						wline(c, x0, y0, x0 - sl * 0.6f, y0 + hl, 0.001f, 0.15f * dayv, US_MAT_WATER);
+				}
 			} else {
 				for (int i = 0; i < 96; i++) {
 					float x0 = fp[2 * i], y0 = fp[2 * i + 1], x1 = fp[2 * i + 2], y1 = fp[2 * i + 3];
@@ -720,7 +935,10 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 			float x = u * A;
 			float gy = HZ - 0.012f - 0.018f * (0.5f + 0.5f * us_noise2(u * 5.0f, 8.0f));
 			float th = 0.018f + 0.022f * ((hsh >> 3) & 63) / 63.0f;
-			float bendk = sgn * (0.004f + 0.02f * s->gust) * (0.6f + 0.4f * us_noise2(u * 9.0f, (float)ctx->t * (0.8f + 2.0f * s->gust)));
+			/* they lean with the bass and bow, one after another, as each kick front passes */
+			float bow = s->kpulse * us_smooth(0.0f, 1.0f, 1.0f - fabsf(u - (sgn > 0 ? 1.0f - s->kpulse : s->kpulse)) * 2.5f);
+			float bendk = sgn * ((0.004f + 0.02f * s->gust) * (0.6f + 0.4f * us_noise2(u * 9.0f, (float)ctx->t * (0.8f + 2.0f * s->gust))) +
+					     0.014f * s->bass_s + 0.016f * bow);
 			float tx = x + bendk * th / 0.03f, ty = gy - th;
 			uint8_t tm = winter > 0.6f ? US_MAT_EARTH : US_MAT_LEAF;
 			float tv = 0.3f * dayv;
@@ -773,7 +991,14 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 		float Z = 1.0f / sc;
 		int b0 = s->row_start[row], b1 = s->row_start[row + 1];
 		int nb = (int)((b1 - b0) * keep);
-		float H = 0.42f * sc * height;
+		/* sub: a long, slow swell rolls through the field toward the viewer, lifting row after row */
+		float roll = sinf(Z * 0.9f + s->sub_ph * 2.4f);
+		float H = 0.42f * sc * height * (1.0f + 0.1f * s->sub_s * roll);
+		/* each depth row listens to its own band: far rows the air and hats, near rows the upper mids */
+		int band = 12 + (int)((1.0f - sqrtf(sc)) * (US_NBANDS - 13));
+		float bv = s->bandv[band];
+		float fla = 0.05f + 0.2f * bv * bv, flr = 1.5f + 3.0f * s->gust + 9.0f * bv;
+		float shk = 0.38f + 0.22f * s->swell_s; /* swell burns the cloud shadows off; quiet deepens them */
 		float wid = ctx->crisp ? (sc > 0.55f ? 0.012f : 0.0f) : 0.001f + 0.0022f * sc;
 		float vrow = (ctx->crisp ? 0.3f + 0.65f * sqrtf(sc) : 0.36f + 0.74f * sqrtf(sc)) * dayv;
 		if (row == TREE_ROW)
@@ -785,12 +1010,12 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 			float x = b->u * A;
 			float X = (x - A * 0.5f) * Z;
 			float bend = wind_at(s, X * 0.25f, Z * 0.25f, ax, az);
-			float flut = 0.08f * us_noise2(b->ph, (float)ctx->t * (1.5f + 3.0f * s->gust));
+			float flut = fla * us_noise2(b->ph, (float)ctx->t * flr);
 			float bb = (lean0 + gstr * bend + flut) * (ax >= 0 ? 1.0f : -1.0f) * (0.35f + 0.65f * fabsf(ax) + 0.2f);
 			float h = H * b->h * (b->head ? 1.25f : 1.0f);
 			/* blowing toward/away from the viewer foreshortens the blades */
 			float fs = 1.0f - 0.35f * fabsf(az) * us_sat(bend);
-			float shadow = 0.62f + 0.38f * us_smooth(-0.3f, 0.3f, us_noise2(X * 0.05f - s->cloud_t * 2.0f * ax, Z * 0.08f - s->cloud_t * 2.0f * az));
+			float shadow = 1.0f - shk + shk * us_smooth(-0.3f, 0.3f, us_noise2(X * 0.05f - s->cloud_t * 2.0f * ax, Z * 0.08f - s->cloud_t * 2.0f * az));
 			float sheen = 0.68f + 0.6f * us_sat(bend); /* bent blades catch the light: gust fronts read as sheen waves */
 			float v = us_sat(vrow * shadow * sheen * (0.75f + 0.25f * b->h));
 			uint8_t m = US_MAT_LEAF;
@@ -814,6 +1039,40 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 			float tx = pts[6], ty = pts[7];
 			if (winter > 0.4f && b->tint == 3) /* snow caught on the tips */
 				us_point(c, tx, ty, 0.0015f + 0.003f * sc, 0.6f * winter * dayv, US_MAT_WATER);
+			if (!b->head && b->tint == 3 && sc > 0.22f && winter < 0.5f && fmodf(b->ph * 7.31f, 1.0f) < 0.16f + 0.2f * w->bloom) {
+				/* wildflowers among the grass: heads nod to the lower mids, then go to seed clocks in late summer */
+				float dx = pts[6] - pts[4], dy = pts[7] - pts[5];
+				float dl = sqrtf(dx * dx + dy * dy) + 1e-6f;
+				float nod = 0.35f * s->lowmid_s * us_noise2(b->ph * 3.1f, (float)ctx->t * 2.2f);
+				float rr = (0.004f + 0.006f * sc) * (0.6f + 0.4f * w->growth);
+				float fx = tx + (dx / dl + nod) * rr * 0.8f, fy = ty + dy / dl * rr * 0.8f;
+				float clock = us_smooth(0.6f, 1.2f, summer + autumn * 0.5f) * (1.0f - us_smooth(0.4f, 0.9f, autumn));
+				float fv = us_sat(v * 1.2f + 0.08f);
+				if (clock > 0.5f && fmodf(b->ph * 3.7f, 1.0f) < 0.6f) {
+					/* a dandelion clock: a ring of fluff that thins in the gusts */
+					int np = c->crisp ? 4 : 9;
+					for (int q = 0; q < np; q++) {
+						float an = US_TAU * q / np + b->ph;
+						float fq = fmodf(b->ph * 13.0f + q * 0.37f, 1.0f);
+						if (fq < bend * gstr * 0.8f)
+							continue; /* this tuft has blown */
+						float px2 = fx + cosf(an) * rr, py2 = fy + sinf(an) * rr;
+						if (c->crisp)
+							us_put(c, (int)(px2 * c->s), (int)(py2 * c->s), fv * 0.8f, US_MAT_ACCENT);
+						else
+							wline(c, fx, fy, px2, py2, 0.0008f, fv * 0.45f, US_MAT_ACCENT);
+					}
+				} else if (c->crisp) {
+					us_disc(c, fx, fy, rr * 0.9f, fv, US_MAT_BLOOM);
+				} else {
+					/* five petals: little loops around a bright eye */
+					for (int q = 0; q < 5; q++) {
+						float an = US_TAU * q / 5 + b->ph + nod * 2.0f;
+						wline(c, fx, fy, fx + cosf(an) * rr, fy + sinf(an) * rr * 0.7f, 0.0016f + 0.001f * sc, fv * 0.8f, US_MAT_BLOOM);
+					}
+					us_point(c, fx, fy, 0.0011f + 0.001f * sc, us_sat(fv * 1.3f), US_MAT_LIGHT);
+				}
+			}
 			if (b->head && winter < 0.6f && sc > 0.12f) {
 				/* seed head: a short thick spike along the tip direction */
 				float dx = pts[6] - pts[4], dy = pts[7] - pts[5];
@@ -848,6 +1107,11 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 				}
 			}
 		}
+	}
+
+	{
+		float ksc = row_s(KITE_ROW);
+		draw_kite(s, c, ctx, A, sgn, HZ + (1.03f - HZ) * ksc, ksc, dayv, winter);
 	}
 
 	/* ---- seeds / pollen adrift ---- */
@@ -915,7 +1179,9 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 			q->ph = us_rand(r) * US_TAU;
 			q->sp = us_randr(r, 0.8f, 1.2f);
 			q->y = us_randr(r, HZ - 0.32f, HZ + 0.2f);
-			q->x = sgn > 0 ? us_randr(r, -0.2f, A * 0.7f) : us_randr(r, A * 0.3f, A + 0.2f);
+			/* a wide mix sends streamlines in from both flanks */
+			q->dir = us_rand(r) < 0.45f * s->width_s ? -sgn : sgn;
+			q->x = q->dir > 0 ? us_randr(r, -0.2f, A * 0.7f) : us_randr(r, A * 0.3f, A + 0.2f);
 		}
 		if (s->wisp_acc > 1.0f)
 			s->wisp_acc = 1.0f;
@@ -929,7 +1195,7 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 				continue;
 			}
 			float spd = (0.25f + 0.9f * s->gust) * q->sp;
-			q->x += sgn * spd * dt;
+			q->x += q->dir * spd * dt;
 			float env = sinf(US_PI * q->age / q->life);
 			/* the stroke grows out of nothing at the head, and ends in a small curl */
 			float L = q->len * us_sat(q->age * 2.0f / q->life + 0.2f);
@@ -938,7 +1204,7 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 			float vk = (ctx->crisp ? 0.5f : 0.5f) * dayv * env;
 			for (int k = 0; k <= NW; k++) {
 				float f = (float)k / NW;
-				float x = q->x - sgn * L * f;
+				float x = q->x - q->dir * L * f;
 				float y = q->y + q->amp * sinf(f * 5.0f + q->ph - q->age * 4.0f) * f + 0.004f * us_noise2(x * 3.0f, q->ph);
 				/* pixel: the streamline breaks into dashes that travel with it, like wind marks in a print */
 				int gap = 0;
@@ -956,16 +1222,97 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 				enum { NCURL = 12 };
 				for (int k = 1; k <= NCURL; k++) {
 					float f = (float)k / NCURL;
-					float a = US_PI * 0.5f - sgn * f * US_PI * 1.6f;
+					float a = US_PI * 0.5f - q->dir * f * US_PI * 1.6f;
 					float rr = R * (1.0f - 0.55f * f);
-					float x = cxr + sgn * cosf(a) * rr * 0.0f + cosf(a) * rr * sgn, y = cyr + sinf(a) * rr;
+					float x = cxr + q->dir * cosf(a) * rr * 0.0f + cosf(a) * rr * sgn, y = cyr + sinf(a) * rr;
 					(void)x;
-					x = cxr + sgn * cosf(a) * rr;
+					x = cxr + q->dir * cosf(a) * rr;
 					wline(c, ppx, ppy, x, y, ctx->crisp ? 0.004f : 0.0011f, vk * (1.0f - 0.6f * f), US_MAT_ACCENT);
 					ppx = x;
 					ppy = y;
 				}
 			}
+		}
+	}
+
+	/* ---- swallows riding the gusts: the melody (mids) lifts them, sharp hits make one dart and bank ---- */
+	{
+		int nb = 2 + (int)(4.0f * us_sat(0.25f + w->flock + 0.3f * s->mid_s));
+		if (nb > MAX_BIRD)
+			nb = MAX_BIRD;
+		float bvis = us_smooth(0.08f, 0.35f, day);
+		int dart = snapped ? (int)(us_rand(r) * nb) : -1;
+		for (int i = 0; i < MAX_BIRD; i++) {
+			bird_t *b = &s->bd[i];
+			float ty = HZ - 0.03f - (0.05f + 0.22f * s->mid_s) * (0.4f + 0.6f * b->alt) +
+				   0.05f * us_noise2(b->ph, (float)ctx->t * 0.25f);
+			float tvx = sgn * (0.06f + 0.22f * s->gust) * (0.7f + 0.6f * b->alt) + 0.12f * us_noise2(b->ph + 4.0f, (float)ctx->t * 0.3f);
+			b->vx += (tvx - b->vx) * dt * 1.5f;
+			b->vy += ((ty - b->y) * 2.0f - b->vy * 1.4f) * dt;
+			if (i == dart) {
+				b->vy -= 0.18f + 0.15f * a->onset;
+				b->vx += sgn * 0.2f;
+				b->bank = 1.0f;
+			}
+			b->bank = us_approach(b->bank, 0.0f, 0.45f, dt);
+			b->x += b->vx * dt / A;
+			b->y += b->vy * dt;
+			if (b->x > 1.08f) b->x -= 1.16f;
+			if (b->x < -0.08f) b->x += 1.16f;
+			if (b->y < 0.04f) { b->y = 0.04f; b->vy = 0; }
+			/* flap in bursts, glide between (faster beats when the melody is busy) */
+			float gl = us_noise2(b->ph * 2.3f, (float)ctx->t * 0.6f);
+			if (gl > -0.1f || b->bank > 0.2f)
+				b->ph += dt * (9.0f + 8.0f * s->mid_s);
+			if (i >= nb || bvis <= 0.01f)
+				continue;
+			float x = b->x * A, y = b->y;
+			float ws = (0.012f + 0.008f * b->alt) * (ctx->crisp ? 1.4f : 1.0f);
+			float fl = sinf(b->ph) * (gl > -0.1f || b->bank > 0.2f ? 1.0f : 0.15f);
+			float dirx = b->vx >= 0 ? 1.0f : -1.0f;
+			float tip = -fl * ws * 0.6f - b->bank * ws * 0.3f;
+			float v = 0.62f * bvis * dayv;
+			if (ctx->crisp) {
+				us_put(c, (int)(x * c->s), (int)(y * c->s), v, US_MAT_ACCENT);
+				us_line(c, x, y, x - ws * 0.8f, y + tip * 0.8f, 0.001f, v, US_MAT_ACCENT);
+				us_line(c, x, y, x + ws * 0.8f, y + tip * 0.8f, 0.001f, v, US_MAT_ACCENT);
+			} else {
+				/* swept wings with a bent wrist; a forked tail behind */
+				float ey = y + tip * 0.4f - ws * 0.12f;
+				wline(c, x, y, x - ws * 0.45f + dirx * ws * 0.1f, ey, 0.0013f, v, US_MAT_ACCENT);
+				wline(c, x - ws * 0.45f + dirx * ws * 0.1f, ey, x - ws + dirx * ws * 0.35f, y + tip, 0.001f, v, US_MAT_ACCENT);
+				wline(c, x, y, x + ws * 0.45f + dirx * ws * 0.1f, ey, 0.0013f, v, US_MAT_ACCENT);
+				wline(c, x + ws * 0.45f + dirx * ws * 0.1f, ey, x + ws + dirx * ws * 0.35f, y + tip, 0.001f, v, US_MAT_ACCENT);
+				wline(c, x, y, x - dirx * ws * 0.45f, y + ws * 0.12f, 0.0008f, v * 0.7f, US_MAT_ACCENT);
+				wline(c, x, y, x - dirx * ws * 0.45f, y - ws * 0.05f, 0.0008f, v * 0.7f, US_MAT_ACCENT);
+			}
+		}
+	}
+
+	/* ---- a loose swarm of midges over the near grass (fireflies by night); the air band sets them dancing.
+	 *      Quiet passages bring more of them out. ---- */
+	{
+		s->gnat_x += dt * sgn * (0.004f + 0.02f * s->gust) / A;
+		if (s->gnat_x > 1.15f) s->gnat_x -= 1.3f;
+		if (s->gnat_x < -0.15f) s->gnat_x += 1.3f;
+		float quiet = us_sat(w->calm + 0.6f * (1.0f - a->active) + 0.3f * w->insects);
+		int ng = 6 + (int)((MAX_GNAT - 6) * quiet);
+		float night = us_sat(1.0f - day * 2.5f);
+		float jit = 0.003f + 0.01f * s->air_s;
+		float gx = s->gnat_x * A, gy = 0.66f + 0.04f * us_noise2(s->gnat_x * 3.0f, 1.0f);
+		float tt = (float)ctx->t;
+		for (int i = 0; i < ng; i++) {
+			float fi = i * 1.618f;
+			float x = gx + 0.07f * us_noise2(fi, tt * 0.18f) + jit * us_noise2(fi + 30.0f, tt * (3.0f + 9.0f * s->air_s));
+			float y = gy + 0.045f * us_noise2(fi + 60.0f, tt * 0.2f) + jit * us_noise2(fi + 90.0f, tt * (3.0f + 9.0f * s->air_s));
+			if (night > 0.05f) {
+				float pulse = sinf(tt * (0.9f + 0.3f * fmodf(fi, 1.0f)) + fi * 2.3f);
+				pulse = pulse > 0 ? pulse * pulse * pulse : 0;
+				float fv = night * (0.15f + 0.85f * pulse);
+				us_point(c, x, y, c->crisp ? 0.003f : 0.0016f + 0.0018f * pulse, fv, US_MAT_LIGHT);
+			}
+			if (night < 0.95f && !ctx->crisp)
+				us_point(c, x, y, 0.0009f, 0.4f * (1.0f - night) * dayv, US_MAT_ACCENT);
 		}
 	}
 }
