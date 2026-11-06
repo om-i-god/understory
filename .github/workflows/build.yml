@@ -56,7 +56,7 @@ jobs:
       - name: Render every scene in every look (headless)
         shell: pwsh
         run: |
-          $scenes = "meadow","wind","river","rain","storm","pond","fireflies","mycelium","murmuration","tide","pollen","coral","aurora","abyss","dunes","snowfall"
+          $scenes = "meadow","wind","river","rain","storm","pond","fireflies","mycelium","murmuration","tide","pollen","coral","aurora","abyss","dunes","snowfall","valley"
           foreach ($s in $scenes) { foreach ($st in "ink","color","pixel","mono") {
             build\Release\us_render.exe --scene $s --style $st --synth --start 30 --seconds 2 --at 31 --size 640x360 --out out\$st
             if ($LASTEXITCODE -ne 0) { throw "us_render failed: $s $st" }
