@@ -14,6 +14,7 @@ extern const us_scene_vt us_scene_pollen;
 extern const us_scene_vt us_scene_coral;
 extern const us_scene_vt us_scene_aurora;
 extern const us_scene_vt us_scene_abyss;
+extern const us_scene_vt us_scene_dunes;
 
 const us_scene_vt *const us_scene_list[] = {
 	&us_scene_meadow,
@@ -30,5 +31,6 @@ const us_scene_vt *const us_scene_list[] = {
 	&us_scene_coral,
 	&us_scene_aurora,
 	&us_scene_abyss,
+	&us_scene_dunes,
 };
 const int us_scene_count = (int)(sizeof(us_scene_list) / sizeof(us_scene_list[0]));
