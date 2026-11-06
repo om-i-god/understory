@@ -1347,7 +1347,7 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 				float dx = x - moonx, dy = (y - moony) * 1.15f;
 				float dm = sqrtf(dx * dx + dy * dy);
 				float halo = moonv * (0.22f * expf(-dm / 0.06f) + 0.14f * expf(-dm / 0.2f)) * (cr ? 1.0f : 0.85f + 0.3f * cloud);
-				gs[j * SGW + i] = base + halo * (cr ? 1.2f : 1.0f);
+				gs[j * SGW + i] = base + halo * (cr ? 0.9f + 0.7f * s->lvl : 1.0f); /* pixel: the moon's halo widens with loudness */
 			}
 		}
 		static const uint8_t mats[1] = {US_MAT_WATER};
@@ -1366,7 +1366,7 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 
 	/* ---- far stands receding into mist; far flakes fall among them ---- */
 	{
-		static const float lv_i[NLAYER] = {0.2f, 0.15f, 0.1f, 0.055f}, lv_c[NLAYER] = {0.4f, 0.26f, 0.16f, 0.05f};
+		static const float lv_i[NLAYER] = {0.2f, 0.15f, 0.1f, 0.055f}, lv_c[NLAYER] = {0.42f, 0.34f, 0.04f, 0.05f};
 		static const float sv_i[NLAYER] = {0.26f, 0.3f, 0.36f, 0.46f}, sv_c[NLAYER] = {0.55f, 0.5f, 0.5f, 0.6f};
 		static const uint8_t lm[NLAYER] = {US_MAT_WATER, US_MAT_WATER, US_MAT_WATER, US_MAT_LEAF};
 		static const float mist_y[NLAYER] = {0.585f, 0.612f, 0.64f, 0.672f};
@@ -1378,13 +1378,48 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 				total++;
 			nshow = (int)(total * (0.55f + 0.45f * dens) + 0.5f);
 			float v = (cr ? lv_c[L] : lv_i[L]) * lift, sv = (cr ? sv_c[L] : sv_i[L]) * (0.85f + 0.15f * night);
+			/* pixel canvases: the two farthest stands are a few pixels tall, so draw each as one soft
+			 * silhouette band of small fir cones (a per-column skyline), not as hairline trees */
+			int band_sil = cr && L < 3;
+			int W = c->w < MAXCOL ? c->w : MAXCOL;
+			if (band_sil)
+				for (int px = 0; px < W; px++)
+					s->topS[px] = 1e9f;
 			for (int k = 0; k < total; k++) {
 				fir_t *f = &s->tr[ti + k];
 				/* thin by hash so the stand stays stable as density changes */
 				if ((int)(f->x * 977.0f + L * 31) % (total > 0 ? total : 1) >= nshow)
 					continue;
+				if (band_sil) {
+					float tx = f->x * A, wb = f->w * 1.15f + 1.0f / S, top = f->base - f->h;
+					int p0 = (int)floorf((tx - wb) * S), p1 = (int)ceilf((tx + wb) * S);
+					if (p0 < 0) p0 = 0;
+					if (p1 > W) p1 = W;
+					for (int px = p0; px < p1; px++) {
+						float u = fabsf((px + 0.5f) / S - tx) / wb;
+						float y = (top + f->h * 0.95f * u) * S;
+						if (y < s->topS[px])
+							s->topS[px] = y;
+					}
+					continue;
+				}
 				float sway = (0.006f * w->wind * sinf((float)ctx->t * 0.5f + f->ph) + 0.01f * s->gs) * (L + 1) / NLAYER;
-				fir_draw(c, f, A, sway, snowk * (L == 0 ? 0.6f : 1.0f), v, sv, lm[L], v * 0.9f, (L < 2 || (cr && L < 3)) ? US_MAT_WATER : US_MAT_ACCENT);
+				fir_draw(c, f, A, sway, snowk * (L == 0 ? 0.6f : 1.0f), v, sv, lm[L], cr ? 0.0f : v * 0.9f, (L < 2 || (cr && L < 3)) ? US_MAT_WATER : US_MAT_ACCENT);
+			}
+			if (band_sil) {
+				int iv = (int)(v * 255.0f);
+				int yb = (int)ceilf((L == 2 ? HORIZ + 0.012f : mist_y[L] + 0.02f) * S);
+				if (yb > c->h) yb = c->h;
+				for (int px = 0; px < W; px++) {
+					int y0 = (int)floorf(s->topS[px] + 0.5f);
+					if (s->topS[px] > 1e8f)
+						continue;
+					for (int py = y0 < 0 ? 0 : y0; py < yb; py++) {
+						size_t q = (size_t)py * c->w + px;
+						c->ink[q] = (uint8_t)iv;
+						c->mat[q] = US_MAT_WATER;
+					}
+				}
 			}
 			ti += total;
 			/* mist pooling at the feet of this stand (bands light the far mist along the valley) */
