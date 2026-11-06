@@ -2,17 +2,22 @@
  *
  * Four ranges stand one behind the other: pale far spires, the towering main massif, the cliff the
  * waterfall drops from (with a pavilion on its ledge) and the near cliffs (an old pine reaching out over
- * the valley on the left, a bamboo grove on the right bank). Each range is a graded wash that is darkest
+ * the valley on the left, a bamboo grove on the right bank). Every peak has its own stepped silhouette:
+ * flanks broken into shelves and risers (count, phase and sharpness per peak and side), a few leaning
+ * spires; each shelf edge juts as a lip with a cut shadow under it, axe-cut strokes run down the riser and
+ * small pines cling to some shelves. Each range is a graded wash that is darkest
  * at its crest and dissolves downward into mist, textured with streaky "hemp-fibre" strokes; crest lines,
  * texture strokes, moss dots and far pines are drawn on top as fine single-weight lines. The washes are
  * resolved painter-style in a low-res grid (nearer ranges cover farther ones), mist is mixed into the same
  * grid, then the grid is upsampled once onto the canvas. A thin waterfall feeds a river that winds through
- * the valley floor toward the viewer; red-crowned cranes stand in the shallows and cross the sky.
+ * the valley floor toward the viewer (it pours over a jutting rock lip, down a dark streaked cliff face between
+ * gorge walls, and boils up white in the plunge pool); red-crowned cranes stand in the shallows and cross the sky.
  * Audio: kick -> the waterfall surges (a bright slug of water races down, more strands, spray thrown up)
  *        and a wave of mist billows out along the valley floor from its foot, the bamboo is shoved over;
- *        snare -> cranes lift off the shallows / rise out of the mist with big wingbeats, the old pine
- *        shakes and loses a burst of needles, the bamboo leaves shiver; hats -> spray glints at the fall's
- *        foot, glitter down the river and dew on the bamboo tips, a different handful each frame of the
+ *        snare -> a gust down the valley: cranes lift off the shallows / rise out of the mist and the whole
+ *        flock flashes and beats its wings at once, the old pine shakes and loses a burst of needles, the
+ *        bamboo leaves shiver, the mist streams; hats -> spray glints at the fall's
+ *        foot, glitter down the river, dew on the bamboo tips and the pine pads, a different handful each frame of the
  *        tick; loudness -> the mist thins and lifts to reveal the far peaks, the light warms (sun halo,
  *        gold-lit crests); swell -> mist height; bands[] -> ripple marks down the river (far = highs, near =
  *        lows); width -> mist drift; sub -> rings on the plunge pool; lowmid -> the pavilion lantern;
@@ -47,6 +52,7 @@
 #define MAX_STAR 120
 #define NRIV 64      /* river centreline samples */
 #define MAX_FOLD 96
+#define MAX_LEDGE 200
 #define FOLD_N 45
 #define PINE_SEG 48
 #define PINE_PAD 14
@@ -136,6 +142,8 @@ typedef struct {
 	rip_t rp[MAX_RIP];
 	float star[MAX_STAR * 3];
 	float riv[NRIV * 3]; /* centre u, y, half-width (normalized height units) */
+	float ledge_u[MAX_LEDGE];
+	int ledge_l[MAX_LEDGE], ledge_d[MAX_LEDGE], nledge;
 	float fold_u[MAX_FOLD][FOLD_N], fold_y[MAX_FOLD][FOLD_N], fold_k[MAX_FOLD][FOLD_N]; /* k: ink weight, 0 = hidden */
 	int fold_l[MAX_FOLD], nfold;
 
@@ -159,7 +167,7 @@ typedef struct {
 	int hrow[2];
 
 	/* envelopes */
-	float lvl, surge, billow, kage, flash, glint, hat_seedf, shake, warm, sub_env, lm_env, air_env, drift, mistT, fallT;
+	float lvl, sflash, gust, surge, billow, kage, flash, glint, hat_seedf, shake, warm, sub_env, lm_env, air_env, drift, mistT, fallT;
 	float bsw, bvel; /* bamboo sway spring */
 	float bandv[US_NBANDS];
 	float snare_cool, kick_cool, land_t, cross_t, ring_t[3];
@@ -310,23 +318,25 @@ static float mist_at(const st_t *s, float x, float y, float A)
 
 /* each peak stands on its own foot; beyond its half-width the flank keeps falling, so ranges never end in
  * a flat baseline: {centre, half-width left, right, top y, foot y, roundness (smaller = steeper, blunter)} */
-static const peak_t P0[] = {{0.03f, 0.05f, 0.05f, 0.47f, 0.63f, 0.6f},  {0.11f, 0.045f, 0.04f, 0.40f, 0.63f, 0.5f},
-			    {0.19f, 0.04f, 0.05f, 0.44f, 0.63f, 0.55f}, {0.28f, 0.05f, 0.04f, 0.41f, 0.63f, 0.5f},
-			    {0.36f, 0.035f, 0.04f, 0.46f, 0.63f, 0.6f}, {0.62f, 0.04f, 0.045f, 0.33f, 0.63f, 0.5f},
-			    {0.70f, 0.035f, 0.04f, 0.38f, 0.63f, 0.55f}, {0.785f, 0.05f, 0.04f, 0.30f, 0.63f, 0.45f},
-			    {0.87f, 0.04f, 0.05f, 0.27f, 0.63f, 0.45f}, {0.955f, 0.05f, 0.05f, 0.36f, 0.63f, 0.55f}};
+static const peak_t P0[] = {{0.03f, 0.06f, 0.04f, 0.49f, 0.63f, 0.6f},  {0.11f, 0.02f, 0.05f, 0.38f, 0.63f, 0.4f},
+			    {0.19f, 0.05f, 0.06f, 0.47f, 0.63f, 0.7f},  {0.28f, 0.03f, 0.025f, 0.40f, 0.63f, 0.35f},
+			    {0.36f, 0.05f, 0.04f, 0.50f, 0.63f, 0.6f},  {0.62f, 0.025f, 0.05f, 0.32f, 0.63f, 0.4f},
+			    {0.70f, 0.05f, 0.03f, 0.41f, 0.63f, 0.6f},  {0.785f, 0.04f, 0.02f, 0.29f, 0.63f, 0.35f},
+			    {0.87f, 0.06f, 0.05f, 0.31f, 0.63f, 0.5f},  {0.955f, 0.03f, 0.06f, 0.36f, 0.63f, 0.45f}};
 static const peak_t P1[] = {{0.47f, 0.045f, 0.075f, 0.10f, 0.74f, 0.4f},  {0.402f, 0.03f, 0.042f, 0.25f, 0.74f, 0.38f},
 			    {0.552f, 0.026f, 0.05f, 0.215f, 0.74f, 0.45f}, {0.335f, 0.05f, 0.03f, 0.37f, 0.74f, 0.32f},
 			    {0.64f, 0.035f, 0.05f, 0.32f, 0.74f, 0.5f},    {0.235f, 0.06f, 0.035f, 0.46f, 0.74f, 0.28f},
 			    {0.12f, 0.07f, 0.05f, 0.5f, 0.74f, 0.6f},      {0.865f, 0.05f, 0.08f, 0.41f, 0.74f, 0.35f},
-			    {0.745f, 0.035f, 0.05f, 0.45f, 0.74f, 0.55f}};
+			    {0.745f, 0.035f, 0.05f, 0.45f, 0.74f, 0.55f},  {0.292f, 0.012f, 0.03f, 0.33f, 0.74f, 0.3f},
+			    {0.598f, 0.028f, 0.011f, 0.30f, 0.74f, 0.3f}};
 static const peak_t P2[] = {{0.785f, 0.115f, 0.24f, 0.37f, 0.80f, 0.3f}, {U_PAV, 0.026f, 0.03f, 0.655f, 0.765f, 0.5f},
 			    {0.19f, 0.06f, 0.045f, 0.61f, 0.80f, 0.5f}, {0.95f, 0.06f, 0.06f, 0.33f, 0.80f, 0.4f},
-			    {0.285f, 0.035f, 0.05f, 0.68f, 0.81f, 0.55f}};
+			    {0.285f, 0.035f, 0.05f, 0.68f, 0.81f, 0.55f}, {0.875f, 0.012f, 0.035f, 0.30f, 0.80f, 0.3f}};
 static const peak_t P3[] = {{0.0f, 0.1f, 0.165f, 0.40f, 1.02f, 0.42f}, {1.0f, 0.2f, 0.2f, 0.80f, 1.05f, 0.6f},
 			    {0.335f, 0.06f, 0.08f, 0.955f, 1.03f, 0.35f}};
-static const int NPK[NL] = {10, 9, 5, 3};
+static const int NPK[NL] = {10, 11, 6, 3};
 static const float ROUGH[NL] = {0.007f, 0.014f, 0.015f, 0.014f};
+static const float STEPAMT[NL] = {0.55f, 0.9f, 0.9f, 0.75f}; /* how strongly flanks break into ledges */
 static const float FADE[NL] = {0.07f, 0.15f, 0.17f, 0.45f};
 static const float LV[NL] = {0.19f, 0.34f, 0.42f, 0.5f}; /* wash strength at the crest */
 
@@ -345,6 +355,28 @@ static float peak_y(const peak_t *p, float u)
 	return p->foot + (t - 1.0f) * w * 2.5f;
 }
 
+/* flanks broken into ledges: t (0 crown .. 1 foot) is remapped onto a staircase -- long flat-ish shelves
+ * and steep risers -- with a count, phase and sharpness of its own for each peak and side */
+static float peak_y_crag(const peak_t *p, float u, int id, float amt)
+{
+	float d = u - p->c, w = d < 0 ? p->wl : p->wr;
+	float t = fabsf(d) / w;
+	if (t < 1.0f && amt > 0) {
+		float side = d < 0 ? 0.0f : 0.5f;
+		int n = 2 + (int)(hash1(id * 3 + 1, 2.0f + side) * 3.99f);
+		float ph = hash1(id * 3 + 2, 5.0f + side);
+		float sharp = 2.2f + 2.5f * hash1(id * 3, 7.0f + side);
+		float tt = t * n + ph, fl = floorf(tt), fr = tt - fl;
+		float t2 = (fl + powf(fr, sharp) - ph) / n;
+		if (t2 < 0)
+			t2 = 0;
+		t = us_lerp(t, t2, amt * us_smooth(0.1f, 0.3f, t));
+		float h = p->foot - p->top;
+		return p->foot - h * powf(1.0f - powf(t, 1.4f + 0.6f * (p->pw > 0.35f)), p->pw);
+	}
+	return peak_y(p, u);
+}
+
 static void build_ridges(st_t *s, float jit)
 {
 	for (int l = 0; l < NL; l++) {
@@ -353,7 +385,7 @@ static void build_ridges(st_t *s, float jit)
 			float u = i / (float)(RN - 1);
 			float y = 1.6f, top = 1.0f;
 			for (int k = 0; k < NPK[l]; k++) {
-				float py = peak_y(&P[k], u);
+				float py = peak_y_crag(&P[k], u, l * 16 + k, STEPAMT[l]);
 				if (py < y) {
 					y = py;
 					top = P[k].top;
@@ -381,6 +413,35 @@ static void build_ridges(st_t *s, float jit)
 					o = s->ridge[k][i];
 			s->occ[l][i] = o;
 		}
+}
+
+static void build_ledges(st_t *s)
+{
+	s->nledge = 0;
+	for (int l = 0; l < NL; l++) {
+		const float *r = s->ridge[l];
+		float du = 2.0f / (RN - 1);
+		for (int i = 4; i < RN - 5 && s->nledge < MAX_LEDGE; i++) {
+			if (r[i] > 0.93f)
+				continue;
+			float sl = (r[i + 1] - r[i - 1]) / du;
+			if (fabsf(sl) > 0.7f)
+				continue;
+			int dir = 0;
+			float sr = (r[i + 4] - r[i + 2]) / du, sL = (r[i - 2] - r[i - 4]) / du;
+			if (sr > 2.2f)
+				dir = 1; /* the riser drops away to the right */
+			else if (sL < -2.2f)
+				dir = -1;
+			if (!dir)
+				continue;
+			s->ledge_u[s->nledge] = i / (float)(RN - 1);
+			s->ledge_l[s->nledge] = l;
+			s->ledge_d[s->nledge] = dir;
+			s->nledge++;
+			i += 6;
+		}
+	}
 }
 
 static void build_folds(st_t *s)
@@ -498,11 +559,22 @@ static void build_grid(st_t *s, int gw, int gh, float A, int crisp)
 				float sn = us_smooth(0.035f, 0.004f, dy) * us_smooth(0.45f, 0.75f, tex + 0.15f * us_noise2(x * 60.0f, y * 60.0f));
 				s->snow[i] = sn * (L == 0 ? 0.8f : 1.0f);
 			}
-			/* the waterfall's dark channel down the cliff */
+			/* the cliff the waterfall falls down: a solid, streaked rock face from the lip to the pool,
+			 * with the wet channel itself cut darker so the water reads against it */
 			if (L == 2) {
 				float d = fabsf(x - U_FALL * A);
-				if (d < 0.012f && y < Y_POOL + 0.01f)
-					s->st[i] *= 0.25f + 0.75f * us_smooth(0.004f, 0.012f, d);
+				float lip = ridge_at(s, 2, U_FALL);
+				float fw = 0.035f + 0.022f * us_noise2(y * 14.0f, 3.0f) + 0.012f * us_noise2(y * 40.0f, 9.0f) +
+					   0.02f * us_sat((Y_POOL - y) / 0.25f);
+				if (d < fw + 0.02f && y < Y_POOL + 0.012f) {
+					float face = us_smooth(fw + 0.02f, fw - 0.01f, d) * us_smooth(Y_POOL + 0.012f, Y_POOL - 0.02f, y);
+					float streak = 0.7f + 0.45f * us_noise2(x * 90.0f, y * 6.0f);
+					float fv = LV[2] * (0.75f + 0.25f * expf(-dy / 0.05f)) * streak;
+					if (fv * face > s->st[i])
+						s->st[i] = us_lerp(s->st[i], fv, face);
+				}
+				if (d < 0.013f && y > lip - 0.01f && y < Y_POOL + 0.01f)
+					s->st[i] *= 0.2f + 0.8f * us_smooth(0.005f, 0.013f, d);
 			}
 		}
 	}
@@ -745,6 +817,7 @@ static void *create(uint32_t seed)
 	float jit = (seed % 97) * 0.37f;
 	build_ridges(s, jit);
 	build_folds(s);
+	build_ledges(s);
 	build_river(s);
 
 	/* texture strokes down the flanks of the three farther-but-one ranges */
@@ -934,8 +1007,14 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 	}
 	/* snare: cranes lift off, the pine shakes needles loose */
 	s->shake = us_approach(s->shake, 0.0f, 0.15f, rdt);
+	s->sflash = us_approach(s->sflash, 0.0f, 0.1f, rdt);
+	s->gust = us_approach(s->gust, 0.0f, 0.12f, rdt);
 	if (a->snare_hit && s->snare_cool <= 0) {
 		s->shake = 1.0f;
+		s->sflash = 1.0f;
+		s->gust = 1.0f; /* a gust down the valley: it tears the needles loose and streams the mist */
+		for (int i = 0; i < MAX_CRANE; i++) /* the whole flock beats its wings at once */
+			s->cr[i].ph += 1.7f;
 		s->snare_cool = 0.12f;
 		int nn = 56 + (int)(24 * snare);
 		for (int k = 0; k < nn; k++) {
@@ -1011,7 +1090,7 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 	lg[3] = G * 1.02f;
 
 	/* ---- mist: bands that drift and breathe; loudness thins and lifts them ---- */
-	s->mistT += dt * (0.025f + 0.05f * s->drift);
+	s->mistT += dt * (0.025f + 0.05f * s->drift) + rdt * 2.5f * s->gust;
 	/* the kick's mist wave: races out along the valley floor, then fades */
 	float bamp = s->billow * expf(-s->kage / 0.22f) * us_smooth(0.0f, 0.04f, s->kage + 0.01f);
 	float brad = 0.12f + 0.6f * (1.0f - expf(-s->kage / 0.1f));
@@ -1051,7 +1130,7 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 				if (bamp > 0.01f) {
 					float dx = (x - U_FALL * A) / brad;
 					float dy = (y - (Y_POOL + 0.005f)) / 0.04f;
-					m += 0.75f * bamp * expf(-dx * dx - dy * dy) * (0.5f + 0.6f * us_smooth(-0.3f, 0.5f, us_noise2(x * 4.0f, y * 12.0f + t)));
+					m += 1.0f * bamp * expf(-dx * dx - dy * dy) * (0.5f + 0.6f * us_smooth(-0.3f, 0.5f, us_noise2(x * 4.0f, y * 12.0f + t)));
 				}
 				s->mist[j * MW + i] = m;
 			}
@@ -1378,6 +1457,45 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 				wpoly(c, pts, 4, 0.0011f, 0.42f * k->v * lg[k->l] * mk * (0.8f + 0.1f * k->l), US_MAT_EARTH);
 			}
 		}
+		/* ledges: a jutting lip with the shadow under it, axe-cut strokes down the riser, a pine on some */
+		for (int i = 0; i < s->nledge; i++) {
+			int l = s->ledge_l[i], dir = s->ledge_d[i];
+			float u = s->ledge_u[i], y = ridge_at(s, l, u);
+			if (y > occ_at(s, l, u) - 0.004f)
+				continue;
+			float x = u * A, sc = l == 0 ? 0.5f : l == 1 ? 0.8f : 1.0f;
+			float mk = 1.0f - 0.9f * mist_at(s, x, y + 0.01f, A);
+			float v = CV[l] * lg[l] * mk;
+			if (v < 0.03f)
+				continue;
+			float hk = hash1(i, 13.0f), hk2 = hash1(i, 17.0f);
+			/* the lip juts a little past the riser; its underside is a dark cut back into the rock */
+			float lx = x + dir * 0.004f * sc;
+			stroke(c, x - dir * 0.006f * sc, y, lx, y + 0.002f * sc, crisp ? 0.001f : 0.0014f, us_sat(v * 1.05f), US_MAT_EARTH);
+			stroke(c, lx, y + 0.003f * sc, x - dir * (0.012f + 0.016f * hk) * sc, y + (0.006f + 0.004f * hk2) * sc, crisp ? 0.001f : 0.0013f,
+			       v * (crisp ? 0.9f : 0.8f), US_MAT_EARTH);
+			if (!crisp) {
+				int nc = 2 + (int)(3 * hk2 * (0.4f + 0.6f * dens));
+				for (int q = 0; q < nc; q++) {
+					float sx = x - dir * (0.002f + 0.006f * q) * sc, sy = y + 0.006f * sc;
+					float L = (0.018f + 0.03f * hash1(i * 7 + q, 3.0f)) * sc;
+					float ex = sx + dir * L * 0.25f, ey = sy + L;
+					if (ey > occ_at(s, l, ex / A) - 0.003f)
+						continue;
+					wline(c, sx, sy, ex, ey, 0.001f, v * 0.5f * (1.0f - 0.2f * q), US_MAT_EARTH);
+				}
+			}
+			if (l >= 1 && hk < 0.35f + 0.25f * dens) { /* a small pine clinging to the shelf */
+				float ph = (0.012f + 0.01f * hk2) * sc, px = x - dir * 0.005f * sc;
+				float pv = v * 1.05f * (1.0f + 0.15f * summer);
+				stroke(c, px, y, px + dir * ph * 0.25f, y - ph, 0.0011f, pv, US_MAT_STEM);
+				for (int q = 0; q < 3; q++) {
+					float py = y - ph * (0.4f + 0.25f * q), pw = ph * (0.5f - 0.12f * q);
+					float cx = px + dir * ph * 0.25f * (0.4f + 0.25f * q) + dir * pw * 0.35f;
+					stroke(c, cx - pw, py + pw * 0.12f, cx + pw, py, 0.0011f, pv, winter > 0.6f && q == 2 ? US_MAT_ACCENT : US_MAT_LEAF);
+				}
+			}
+		}
 		int nd = (int)(s->ndot * (0.35f + 0.65f * dens));
 		float dotm = autumn > 0.55f ? 0 : 1; /* autumn: some dots turn to maple red */
 		for (int i = 0; i < nd; i++) {
@@ -1430,7 +1548,7 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 			int np = 0;
 			for (int q = 0; q <= 24; q++) {
 				float f = q / 24.0f;
-				float y = yt + (yb - yt) * f;
+				float y = yt + (yb + 0.005f - yt) * f;
 				/* the water arcs out over the lip, then drops straight and spreads at the foot */
 				float x = xw + off * (1.0f + 1.6f * f * f) + 0.004f * (1.0f - f) * (1.0f - f) * 0.0f +
 					  0.0012f * sinf(f * 18.0f + hk * 6.0f + t * 2.0f);
@@ -1455,11 +1573,45 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 					q1 = q0 + 1;
 				if (q1 > 24)
 					q1 = 24;
-				float dv = us_sat(fv * 1.15f) * mk;
+				float dv = us_sat(fv * 1.15f + 0.6f * s->glint) * mk; /* hats: the falling water flashes */
 				if (crisp)
 					us_polyline(c, &pts[2 * q0], q1 - q0 + 1, 0.001f, dv, US_MAT_WATER);
 				else
 					wpoly(c, &pts[2 * q0], q1 - q0 + 1, 0.0013f, dv, US_MAT_WATER);
+			}
+		}
+		/* the rock lip the water pours over (jutting, with its shadow), and the gorge walls down to the pool */
+		{
+			float lv = 0.8f * G * (1.0f - 0.4f * mist_at(s, xw, yt, A));
+			float lp[] = {xw - 0.03f, yt + 0.012f, xw - 0.016f, yt + 0.002f, xw - 0.006f, yt - 0.003f, xw + 0.007f, yt - 0.002f,
+				      xw + 0.018f, yt + 0.001f, xw + 0.034f, yt + 0.01f};
+			if (crisp)
+				us_polyline(c, lp, 6, 0.001f, lv, US_MAT_EARTH);
+			else
+				wpoly(c, lp, 6, 0.0018f, lv, US_MAT_EARTH);
+			stroke(c, xw - 0.012f, yt + 0.005f, xw + 0.012f, yt + 0.006f, crisp ? 0.001f : 0.0014f, lv * 0.8f, US_MAT_EARTH);
+			for (int side = -1; side <= 1; side += 2) {
+				float px = 0, py = 0;
+				for (int q = 0; q <= 14; q++) {
+					float f = q / 14.0f, y = yt + 0.004f + (yb - yt - 0.004f) * f;
+					float x = xw + side * (0.009f + 0.008f * f + 0.003f * us_noise2(f * 9.0f, side * 3.0f)) +
+						  0.002f * us_noise2(f * 23.0f, side * 5.0f);
+					float mk = 1.0f - 0.7f * mist_at(s, x, y, A);
+					if (q)
+						stroke(c, px, py, x, y, crisp ? 0.001f : 0.0016f, lv * 0.85f * mk * (1.0f - 0.3f * f), US_MAT_EARTH);
+					/* short axe-cut strokes off the walls */
+					if (!crisp && (q & 1))
+						wline(c, x, y, x + side * 0.012f, y + 0.012f, 0.001f, lv * 0.4f * mk, US_MAT_EARTH);
+					px = x;
+					py = y;
+				}
+			}
+			/* the landing: white water boiling up in the pool */
+			for (int k = 0; k < 7; k++) {
+				float a = (k - 3) / 3.0f, hh = 0.006f + 0.006f * (1.0f - fabsf(a)) + 0.012f * s->surge;
+				float bx = xw + a * (half + 0.006f);
+				stroke(c, bx, yb + 0.004f, bx + a * 0.004f + 0.0015f * sinf(t * 7.0f + k), yb + 0.004f - hh, 0.0011f,
+				       us_sat(fv * 0.7f + 0.3f * s->surge), US_MAT_WATER);
 			}
 		}
 		/* kick: a bright slug of water races down the fall */
@@ -1505,15 +1657,15 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 		}
 		/* hats: spray glints around the foot */
 		if (s->glint > 0.02f) {
-			int ng = 20 + (int)(16 * dens);
+			int ng = 32 + (int)(20 * dens);
 			float gv = us_sat(s->glint * (0.7f + 0.3f * hat) * 1.2f);
 			for (int k = 0; k < ng; k++) {
 				float h1 = hash1(k, s->hat_seedf), h2 = hash1(k + 101, s->hat_seedf), h3 = hash1(k + 202, s->hat_seedf);
 				float gx = xw + (h1 - 0.5f) * 0.09f, gy = yb - 0.05f * h2 * h2 + 0.006f;
-				sparkle(c, gx, gy, (0.003f + 0.004f * h3) * (0.6f + 0.4f * gv), gv * (0.6f + 0.4f * h3), US_MAT_WATER);
+				sparkle(c, gx, gy, (0.004f + 0.006f * h3) * (0.6f + 0.4f * gv), gv * (0.7f + 0.3f * h3), US_MAT_WATER);
 			}
 			/* and the river glitters down its length */
-			int nrg = 20 + (int)(20 * dens + 12 * s->air_env);
+			int nrg = 36 + (int)(24 * dens + 14 * s->air_env);
 			for (int k = 0; k < nrg; k++) {
 				float h1 = hash1(k + 300, s->hat_seedf), h2 = hash1(k + 400, s->hat_seedf), h3 = hash1(k + 500, s->hat_seedf);
 				float u, y, hw;
@@ -1521,7 +1673,7 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 				float x = u * A + (h2 * 2.0f - 1.0f) * hw * 0.8f;
 				if (y > 0.995f || y > ridge_at(s, 3, x / A) - 0.002f)
 					continue;
-				sparkle(c, x, y, (0.0025f + 0.0035f * h3) * (0.5f + h1), gv * (0.55f + 0.45f * h3), US_MAT_WATER);
+				sparkle(c, x, y, (0.0035f + 0.005f * h3) * (0.5f + h1), gv * (0.7f + 0.3f * h3), US_MAT_WATER);
 			}
 		}
 		us_world_add(w, &w->moisture, 0.0015f * vol * (0.4f + s->surge), dt);
@@ -1677,6 +1829,19 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 			float mk = 1.0f - 0.85f * mist_at(s, x, y, A);
 			float v = (i == 0 ? 0.72f : 0.6f) * G;
 			draw_pine(c, p, A, v, i == 0 ? s->shake : s->shake * 0.3f, t, winter, mk, i);
+			/* hats: dew on the needle pads glints */
+			if (s->glint > 0.02f)
+				for (int k = 0; k < p->npad; k++) {
+					const float *pd = &p->pad[k * 3];
+					for (int q = 0; q < 3; q++) {
+						float h1 = hash1(k * 8 + q + i * 64, s->hat_seedf), h2 = hash1(k * 8 + q + i * 64 + 31, s->hat_seedf);
+						if (h1 > 0.6f)
+							continue;
+						float gx = p->u * A + p->flip * pd[0] * p->sc + (h2 - 0.5f) * 2.4f * pd[2] * p->sc;
+						float gy = p->y + pd[1] * p->sc - h1 * 0.6f * pd[2] * p->sc;
+						sparkle(c, gx, gy, 0.005f, us_sat(s->glint * (0.75f + 0.3f * hat)) * mk, US_MAT_LIGHT);
+					}
+				}
 		}
 	}
 
@@ -1744,7 +1909,8 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 				float bow = us_smooth(0.3f, 0.7f, 0.5f + 0.5f * sinf(k->t * 0.35f + k->ph * 3.0f)) * 0.9f;
 				float x = k->x * A;
 				float mk = 1.0f - 0.7f * mist_at(s, x, k->y - 0.02f, A);
-				draw_crane_stand(c, x, k->y, sz, k->ph, k->dir, 0.85f * G * (1.0f + 0.3f * s->warm), mk, bow);
+				draw_crane_stand(c, x, k->y, sz, k->ph, k->dir, us_sat(0.85f * G * (1.0f + 0.3f * s->warm) * (1.0f + 0.9f * s->sflash)), mk,
+						 bow * (1.0f - s->sflash)); /* snare: heads snap up */
 				/* reflection: a faint broken stroke below */
 				stroke(c, x - 0.006f, k->y + 0.004f, x + 0.006f, k->y + 0.004f, 0.001f, 0.25f * G * mk, US_MAT_WATER);
 				continue;
@@ -1781,7 +1947,7 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 			float x = k->x * A;
 			float mk = 1.0f - 0.4f * mist_at(s, x, k->y, A);
 			float persp = k->state == 4 ? 0.8f : 1.0f;
-			draw_crane_fly(c, x, k->y, sz * persp * 1.2f, k->ph, k->dir, (0.8f + 0.35f * k->kick) * G * (1.0f + 0.3f * s->warm),
+			draw_crane_fly(c, x, k->y, sz * persp * 1.2f, k->ph, k->dir, us_sat((0.8f + 0.35f * k->kick) * G * (1.0f + 0.3f * s->warm) * (1.0f + 0.9f * s->sflash)),
 				       mk);
 		}
 	}
@@ -1819,8 +1985,8 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 							lm = US_MAT_ACCENT;
 						petal(c, x, y, ang, ll, ll * 0.14f, v * (0.85f + 0.15f * summer), lm);
 						/* hats: dew glints at leaf tips */
-						if (s->glint > 0.02f && hash1(i * 64 + q * 8 + L, s->hat_seedf) < 0.22f + 0.25f * s->air_env)
-							sparkle(c, x + cosf(ang) * ll, y + sinf(ang) * ll, 0.0045f,
+						if (s->glint > 0.02f && hash1(i * 64 + q * 8 + L, s->hat_seedf) < 0.4f + 0.25f * s->air_env)
+							sparkle(c, x + cosf(ang) * ll, y + sinf(ang) * ll, 0.006f,
 								us_sat(s->glint * (0.75f + 0.3f * hat)), US_MAT_LIGHT);
 					}
 				}
