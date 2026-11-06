@@ -28,8 +28,14 @@ const us_scene_vt us_scene_<id> = {"<id>", "<Name>", <default trails 0..1>, crea
 
 - `ctx->dt` simulation dt (already × speed macro). `ctx->real_dt` wall dt (use for audio envelopes).
 - `ctx->a` (`us_audio`, already × reactivity): `sub bass lowmid mid high air level swell onset beat kick
-  centroid width silence active bands[32]` — see `core/us_audio.h`. `beat` is a 1-frame flag; `onset`/`kick`
-  are decaying envelopes. `swell` is phrase-scale loudness (~8 s).
+  snare hat kick_hit snare_hit hat_hit centroid width silence active bands[32]` — see `core/us_audio.h`.
+  `kick`/`snare`/`hat` are drum envelopes from separate detectors (notes and steady noise don't fire them);
+  `*_hit` and `beat` are 1-frame flags; `onset` is a broadband decaying envelope. `swell` is phrase-scale
+  loudness (~8 s). Regions and bands read low where the mix holds nothing.
+- Give kick, snare and hats each a distinct, visible answer, and make louder mean more light/life.
+  Check with `python3 tools/reactivity.py <scene>` (targets: kickX ≥ 2, snareX ≥ 1.8, hatX ≥ 1.4,
+  brightness correlating with loudness on the ambient and piano tracks, calm in the techno track's gap).
+  Keep the baseline motion low (dMed ~0.5–4): constant churn hides every reaction.
 - `ctx->p->density` (0..1, default 0.5): how much stuff. Must visibly change the scene and stay sane at 0 and 1.
 - `ctx->w` the shared world (`core/us_world.h`). READ fields freely. WRITE only via
   `us_world_add(w, &w->field, rate_per_second, ctx->dt)`. Respect the design table's read/write roles.

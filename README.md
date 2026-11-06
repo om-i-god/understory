@@ -5,30 +5,31 @@ Living, generative, nature-inspired visuals for OBS that listen to your music.
 ![All thirteen scenes, alternating Ink in colour and Pixel looks across the six palettes](docs/scenes.png)
 
 Understory adds a video source to OBS. Point it at any audio (Desktop Audio, a mic, a media source)
-and it grows a small world on screen: plants that bloom with the bass and sway in the highs, rivers
-that run faster when the mids push, rain that falls on the drum hits, storms that charge through long
-builds and break with lightning on the biggest hits. Nothing ever freezes — in silence the world keeps
-breathing.
+and it grows a small world on screen that plays along with your music. It hears the kick, the snare and
+the hi-hats separately, and each scene answers each one in its own way: the kick lands, the snare
+breaks, the hats glint. Loud passages fill the world with light and life, quiet ones let it dim and
+settle. Nothing ever freezes: in silence the world keeps breathing.
 
 ## Scenes
 
-| Scene | What the music does |
-|---|---|
-| Meadow | bass grows stems and opens flowers; a row of daisies each opens to its own frequency; kicks roll gusts and burst seed heads; hats send bees darting; the swell flares the sun |
-| Wind | kicks sweep gust fronts and bow the poplars one by one; each depth row of grass flutters to its own band; the melody lifts the kite and the swallows |
-| River | kicks make trout leap; reed clumps nod along the bank to the melody; highs bring dancing mayflies and rises; big hits startle the sheep; width fans the ducklings out |
-| Rain | kicks throw gusts and heavy eave drops; each puddle rings to its own band; hats splash off the fence posts; the swell warms the farmhouse windows |
-| Storm Front | long loud passages charge the clouds; the biggest hits release lightning; sub rolls thunder along the cloud base; kicks push gust fronts through the oak; highs hang virga |
-| Pond | every hit drops a ripple; kicks flick the koi; big hits make the frog leap; reeds and lotus each answer one band; width is the wind on the water |
-| Fireflies | six colonies each flash on their own part of the spectrum; quiet brings a few; dense music synchronises the swarm; kicks ring the pool and shiver the web |
-| Mycelium | bass lines spread the network; kicks send nutrient pulses and squash the caps; regions glow with the melody; hats make springtails leap; sub drives the mole |
-| Murmuration | melody steers the flock; kicks ripple density waves through it; hats shimmer the wingbeats; width splits it in two; big transients scatter it |
-| Tide | phrase-length swells roll waves in; kicks burst breakers on the rocks; mids shimmer the moon path; crabs scuttle to their own bands |
-| Pollen & Seeds | highs lift seeds, sub-bass turns slow vortices; hits release the clocks; each clock fluffs to its band; hoverflies dart on the melody |
-| Coral | low-mids feed a slowly creeping reaction-diffusion reef; kicks dart the fish; hats flinch the polyps; anemones open to the mids; snares puff bubbles |
-| Aurora | stereo width and shimmer ripple the curtains; bass surges their light; kicks run pulses along them; each stretch of curtain answers a band; hits throw shooting stars |
+| Scene | Kick | Snare | Hats | Loudness |
+|---|---|---|---|---|
+| Meadow | every stem bows together, flower heads swell | flowers twitch and burst pollen, the dandelion lets its seeds go | dew glints on the grass tips | opens the flowers, brightens the meadow |
+| Wind | a gust wave rolls across the field, the tree shudders | seeds and petals tear off, birds startle out of the grass | sparkle on the grass tips | sets the wind and burns off the cloud shadows |
+| River | light surges down the current, a trout may leap | splashes and rings, the ducks startle | sun glitter on the ripples | brightens the water; quiet leaves it dark and glassy |
+| Rain | a sheet of heavy rain sweeps the field, the puddles ring | spray crowns all over the meadow, the crow flaps, the frog leaps | the drizzle glints, drips fall from the wire | lightens and weighs down the sky, heavier rain |
+| Storm Front | the cloud decks drop and heave, the rain gusts | lightning inside the clouds; built-up storms fork to the ground | rain glints and splashes | gathers and lowers the clouds; quiet breaks them up |
+| Pond | a lily pad dips, a ring and a sweep of light cross the pond | the frog leaps with a splash, a dragonfly darts | sun glints, a water strider strokes | light on the water; quiet leaves it glassy |
+| Fireflies | a flash wave rolls through the swarm, which falls into step | a cluster bursts into sparks | far fireflies twinkle on the treeline | how many glow and how brightly |
+| Mycelium | the cords throb and nutrient pulses race out | the web shudders, mushrooms puff spores | growing tips glint, springtails hop | the whole network glows and grows |
+| Murmuration | the flock flinches inward and rebounds | the ribbon tears and birds peel off | wing glints along the edges | the flock grows broader and brighter |
+| Tide | a wave runs up the beach | spray bursts off the rocks, the lighthouse beam sweeps | the moon path glitters, foam fizzes | swell height and moonlight |
+| Pollen & Seeds | a puff strips a ring of seeds from a clock | a gust shatters another clock and curls the seed stream | seed tips glint | how many seeds are in the air, and the light |
+| Coral | a surge sways the reef, the fish wheel | the reef spawns, bubbles rise, the clownfish dart | glints dance across the caustic light | sunlight reaching down through the water |
+| Aurora | light pulses along the curtain folds | a corona flare, the curtains stretch and fold | rays flicker, stars glint | curtain height and brightness |
 
-In Ink looks the glow itself breathes with the music: kicks flare it, the phrase swell lifts it.
+Every scene also keeps its finer mappings (bass, melody, individual frequency bands, stereo width,
+the slow swell of a phrase). In Ink looks the glow itself breathes with the music.
 
 ### Follow the music
 
@@ -55,8 +56,8 @@ between OBS sessions; **Reset world** in the source settings starts fresh.
 - **Pixel** — low resolution, crisp pixels, six palettes (Moss, Dusk, Riverbed, Ember, Glacier, Lichen).
 - **Mono-pixel** — pixel resolution, one colour, sixteen brightness levels.
 
-**Bloom** adds a soft two-scale light around bright lines in Ink — fireflies get halos, aurora and
-lightning glow. **Tint** colours Ink and Mono-pixel; **Palette** colours Pixel and Ink in colour. **Paper** inverts to dark ink on a light ground.
+**Bloom** adds a soft two-scale light, in the colour of whatever is shining, around bright lines in
+Ink: fireflies get halos, aurora and lightning glow. **Tint** colours Ink and Mono-pixel; **Palette** colours Pixel and Ink in colour. **Paper** inverts to dark ink on a light ground.
 Style, tint and palette can change live without resetting the scene.
 
 ## Controls
@@ -65,7 +66,8 @@ Style, tint and palette can change live without resetting the scene.
 - **Look:** style, tint, palette, pixel size, ink resolution, bloom, faint-line lift, paper, output size.
 - **Nature:** density, speed, reactivity, trails, scene crossfade time, scene changes (stay / cycle in
   order / follow the music), minutes per scene, seed.
-- **Listening:** sensitivity, bass / mids / highs gain. The analyser auto-levels, so quiet and loud mixes both work.
+- **Listening:** sensitivity, bass / mids / highs gain. The analyser auto-levels, so quiet and loud
+  mixes both work; bass gain also scales the kick, mids the snare, highs the hats.
 - **World:** share the living world (on by default), world speed, reset world.
 - **Hotkeys** (Settings → Hotkeys): next scene, previous scene, cycle style.
 
@@ -130,4 +132,11 @@ US_BIG=1 ./build-obs/obs_host_test build-obs/understory.plugin out/host storm 5 
 
 `us_render` renders any scene with real audio (`ffmpeg -i song.wav -f f32le -ac 2 -ar 48000 song.f32`
 then `--audio song.f32`) or a built-in test track (`--journey 30` runs the follow-the-music director with a 30 s minimum), to frames you can turn into GIFs or video.
+
+To see how visibly a scene answers the music, make the test tracks once and run the reactivity report:
+
+```sh
+python3 tools/testaudio/gen_tracks.py out/tracks          # breakbeat, hip-hop, techno, ambient, piano (needs numpy)
+python3 tools/reactivity.py storm --tracks out/tracks     # picture change after each kick / snare / hat, brightness vs loudness
+```
 See `docs/design.md` for the architecture and `docs/scene-guide.md` for writing new scenes.
