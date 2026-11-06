@@ -85,6 +85,8 @@ typedef struct {
 	float fold_age[MAX_FOLD], fold_u[MAX_FOLD], fold_amp[MAX_FOLD];
 	int fold_c[MAX_FOLD], fold_i;
 	float lvl_env, rayT;
+	float snr; /* this frame's snare envelope (the pixel raster flares the pink fringe with it) */
+	float lvlk; /* pixel: loudness fills in the curtains' faint body (dither density grows with it) */
 	uint32_t hat_seed; /* each hat re-picks which rays flare */
 	/* per frame: the emission field (light + pinkness), the ray texture, the ridge per column */
 	float fld[GH * GW], pk[GH * GW];
@@ -209,11 +211,34 @@ static void deposit(st_t *s, float A, float x, float yb, float ln, float b, floa
 	}
 }
 
+/* Ordered dither for crisp canvases. Pixel shows 4 shades per material (plus ground), cut at ink ~17/69/128/191
+ * (at the default glow). A value between two shade centres picks the upper or lower shade by a 4x4 Bayer
+ * threshold, and is only nudged to that shade's edge -- so Pixel gets a true dithered fall-off while Mono
+ * (16 levels) keeps an almost smooth ramp with a faint grain. */
+static const uint8_t bayer4[16] = {0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5};
+static inline float bthr(int x, int y) { return (bayer4[(y & 3) * 4 + (x & 3)] + 0.5f) / 16.0f; }
+static int dith(float v, int x, int y)
+{
+	static const float lo[5] = {0, 17, 69, 128, 191}, ce[5] = {0, 40, 98, 159, 222};
+	v *= 255.0f;
+	if (v <= 0.5f)
+		return 0;
+	if (v >= 222.0f)
+		return v > 255.0f ? 255 : (int)v;
+	int k = v < 40 ? 0 : v < 98 ? 1 : v < 159 ? 2 : 3;
+	float f = (v - ce[k]) / (ce[k + 1] - ce[k]);
+	int st = k + (f > bthr(x, y));
+	float a = lo[st], b = st < 4 ? lo[st + 1] - 1.0f : 255.0f;
+	if (v < a) v = a;
+	if (v > b) v = b;
+	return (int)v;
+}
+
 /* Rasterise the emission field (bilinear) into the canvas with MAX blend, sky rows [py0, py1) mapped from
  * sky altitude ys(py) = ya + (py+0.5)/S * yk (yk = 1 for the sky, -2 for the mirrored lake), each row
  * shifted by xoff(py) px and scaled by rowv(py). Light is the field times the ray texture; colour is
  * green, or pink where the field says so. Columns whose sky point sits below the ridge are skipped. */
-static void raster(st_t *s, us_canvas *c, float A, int py0, int py1, float ya, float yk, float gain, int mirror, double t)
+static void raster(st_t *s, us_canvas *c, float A, int py0, int py1, float ya, float yk, float gain, int mirror, double t, int crisp)
 {
 	int GWr = s->gw, GHr = s->gh;
 	float S = c->s, cw = A / GWr, ch = SKY_Y / GHr;
@@ -238,7 +263,13 @@ static void raster(st_t *s, us_canvas *c, float A, int py0, int py1, float ya, f
 		float rv = gain, xo = 0.0f;
 		if (mirror) { /* the lake: rows wobble sideways and break into ripples, dimmer with depth */
 			float yy = (py + 0.5f) / S;
-			xo = S * (0.0045f * us_noise2(yy * 70.0f, (float)t * 0.6f) + 0.0018f * us_noise2(yy * 210.0f, (float)t * 1.4f));
+			if (crisp) { /* pixel: the reflection breaks into horizontal ripple strips with dark gaps */
+				float sn = us_noise2(yy * 95.0f, (float)t * 0.12f) + 0.35f * us_noise2(yy * 31.0f, (float)t * 0.06f + 4.0f);
+				if (sn < -0.28f)
+					continue;
+				rv *= 0.6f + 0.4f * us_sat(sn * 2.0f + 0.3f);
+			}
+			xo =S * (0.0045f * us_noise2(yy * 70.0f, (float)t * 0.6f) + 0.0018f * us_noise2(yy * 210.0f, (float)t * 1.4f));
 			rv *= (0.6f + 0.4f * us_sat(0.55f + 0.9f * us_noise2(yy * 130.0f, (float)t * 0.45f))) * (1.0f - 1.2f * (yy - SHORE));
 			if (rv <= 0.0f)
 				continue;
@@ -274,11 +305,23 @@ static void raster(st_t *s, us_canvas *c, float A, int py0, int py1, float ya, f
 				if ((unsigned)sx >= (unsigned)W || y > s->ridgeAt[sx] || V < 0.004f)
 					continue;
 				float v = V * (1.0f + (s->colR[sx] - 1.0f) * (0.75f + 0.5f * P));
-				int iv = (int)(v * 255.0f);
-				if (iv > 255) iv = 255;
+				int iv;
+				uint8_t m;
+				if (crisp) {
+					/* break the ripple strips into dashes on the water */
+					if (mirror && us_noise2(px * 0.09f + (float)t * 0.25f, py * 1.3f) < -0.42f)
+						continue;
+					/* lake: each strip one shade; sky: a deeper fall-off so the curtains fade up into the dark */
+					iv = mirror ? dith(v, 1, py) : dith(v * us_sat(0.2f + 1.1f * V) * (0.6f + 0.5f * v) * (1.0f + 2.1f * P * s->snr) + s->lvlk * V, px, py);
+					m = P > 0.3f + 0.5f * bthr(px + 1, py + 2) ? US_MAT_BLOOM : US_MAT_LEAF;
+				} else {
+					iv = (int)(v * 255.0f);
+					if (iv > 255) iv = 255;
+					m = P > 0.6f ? US_MAT_BLOOM : US_MAT_LEAF;
+				}
 				if (iv > ink[px]) {
 					ink[px] = (uint8_t)iv;
-					mat[px] = P > 0.6f ? US_MAT_BLOOM : US_MAT_LEAF;
+					mat[px] = m;
 				}
 			}
 		}
@@ -581,6 +624,7 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 	float day = w->daylight, storm = w->storm_charge;
 	float night = 1.0f - 0.6f * us_smooth(0.15f, 0.8f, day);
 	float kick = us_sat(a->kick), snare = us_sat(a->snare), hat = us_sat(a->hat);
+	s->snr = snare;
 
 	/* ---- envelopes ---- */
 	s->lvl_env = us_approach(s->lvl_env, us_sat(a->level), a->level > s->lvl_env ? 0.12f : 0.4f, rdt);
@@ -736,21 +780,22 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 
 	/* ---- the ray texture: fine vertical rays across the sky, drifting and shimmering ---- */
 	{
-		float base = ctx->crisp ? 0.8f : 0.62f;
+		float base = ctx->crisp ? 0.42f : 0.62f;
 		for (int px = 0; px < W; px++)
 			s->colR[px] = base;
 		int nray = (int)(160 + 360 * dens);
 		if (nray > MAX_RAYS)
 			nray = MAX_RAYS;
 		float hs = (float)(s->hat_seed & 0xffff);
-		float amp_k = ctx->crisp ? 0.3f : 1.1f;
+		float amp_k = ctx->crisp ? 0.95f : 1.1f;
 		for (int i = 0; i < nray; i++) {
 			float h1 = hash1(i, 1.3f), h2 = hash1(i + 5003, 1.3f), h3 = hash1(i + 9001, 1.3f);
-			float xr = h1 + s->rayT * 0.03f * (h2 - 0.5f) + 0.007f * sinf(s->rayT * (0.7f + h3) + h1 * 40.0f);
+			/* pixel: gentler sway, so rays step across whole pixels less often (less churn between the beats) */
+			float xr = h1 + s->rayT * (ctx->crisp ? 0.012f : 0.03f) * (h2 - 0.5f) + (ctx->crisp ? 0.0015f : 0.007f) * sinf(s->rayT * (0.7f + h3) + h1 * 40.0f);
 			xr -= floorf(xr);
 			float amp = (0.2f + 0.8f * h3 * h3) * (0.6f + 0.5f * us_noise2(i * 0.71f, s->flick_t));
 			if (hash1(i, hs) < 0.3f)
-				amp += 1.6f * hat;
+				amp += (ctx->crisp ? 1.75f : 1.6f) * hat;
 			amp *= amp_k;
 			float px = xr * W - 0.5f;
 			int ix = (int)floorf(px);
@@ -760,6 +805,13 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 			if (ix + 1 >= 0 && ix + 1 < W)
 				s->colR[ix + 1] += amp * fx;
 		}
+		/* pixel: few columns per ray, so group them into broader drifting streaks that read as rays */
+		if (ctx->crisp)
+			for (int px = 0; px < W; px++) {
+				float u = (px + 0.5f) / W;
+				float st = 0.5f + 0.5f * us_noise2(u * 55.0f + s->rayT * 0.012f, 3.3f) + 0.25f * us_noise2(u * 130.0f - s->rayT * 0.01f, 8.1f);
+				s->colR[px] *= 0.45f + 0.95f * us_sat(st);
+			}
 	}
 
 	/* ---- curtains: deposited into the emission field ---- */
@@ -849,7 +901,7 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 	/* ---- the quiet arc: a faint, homogeneous band low over the ridge, the aurora's resting form, breathing ---- */
 	{
 		int nq = 120;
-		float qb = 0.16f + 0.14f * quiet * (0.6f + 0.8f * breath) + 0.06f * a->swell;
+		float qb = 0.16f + (ctx->crisp ? 0.07f : 0.14f) * quiet * (0.6f + 0.8f * breath) + 0.06f * a->swell;
 		float qT = s->T * 0.35f;
 		for (int k = 0; k < nq; k++) {
 			float u = (k + 0.5f) / nq;
@@ -888,9 +940,33 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 
 	/* brightness: loudness lifts the whole sky; quiet sinks to a faint breathing glow; the kick flashes it */
 	float gain = strength * 1.25f * (0.42f + 1.0f * s->lvl_env + 0.1f * quiet * breath) * (1.0f + 0.35f * kick) * (0.95f + 0.2f * storm);
+	/* pixel's dithered fall-off compresses the light: let loudness and the kick push it harder there */
+	s->lvlk = 0.5f * strength * us_sat(a->level);
+	if (ctx->crisp)
+		gain *= (0.2f + 1.35f * s->lvl_env) * (1.0f + 0.95f * kick + 0.05f * snare);
 	for (int g = 0; g < 64; g++)
 		glow[g] *= gain * 1.6f;
-	raster(s, c, A, 0, (int)ceilf(SKY_Y * c->s), 0.0f, 1.0f, gain, 0, ctx->t);
+	raster(s, c, A, 0, (int)ceilf(SKY_Y * c->s), 0.0f, 1.0f, gain, 0, ctx->t, ctx->crisp);
+	/* pixel: a dithered airglow low over the ridge, under the curtains -- the sky's light scattered toward the
+	 * horizon, brighter as the music swells (its dot density grows evenly with loudness) */
+	if (ctx->crisp) {
+		float S = c->s, ag = strength * (0.01f + 0.11f * s->lvl_env + 0.1f * kick);
+		for (int px = 0; px < W; px++) {
+			float rg = s->ridgeAt[px], h = 0.24f;
+			int y0 = (int)((rg - h) * S), y1 = (int)(rg * S);
+			for (int py = y0 < 0 ? 0 : y0; py < y1 && py < c->h; py++) {
+				float d = rg - (py + 0.5f) / S; /* height above the ridge */
+				float f = 1.0f - us_smooth(0.0f, h, d);
+				float v = ag * f * f;
+				int iv = dith(v, px, py);
+				size_t ii = (size_t)py * c->w + px;
+				if (iv > c->ink[ii]) {
+					c->ink[ii] = (uint8_t)iv;
+					c->mat[ii] = US_MAT_LEAF;
+				}
+			}
+		}
+	}
 	/* the lower rim: a fine bright line along each curtain's base, where its light is sharpest */
 	for (int ci = 0; ci < MAX_CURT; ci++)
 		for (int k = 1; k < rimn[ci]; k++) {
@@ -910,7 +986,7 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 				rim(c, x0, y0, x1, y1, rv, US_MAT_LEAF);
 		}
 	/* reflection in the still lake: the same light, mirrored about the shore, rippled and dimmer */
-	raster(s, c, A, (int)(SHORE * c->s) + 2, c->h, 3.0f * SHORE + 0.01f, -2.0f, gain * (ctx->crisp ? 0.8f : 0.7f), 1, ctx->t);
+	raster(s, c, A, (int)(SHORE * c->s) + 2, c->h, 3.0f * SHORE + 0.01f, -2.0f, gain * (ctx->crisp ? 0.75f : 0.7f), 1, ctx->t, ctx->crisp);
 	c->blend = US_BLEND_MAX;
 
 	/* ---- pixel styles by day: banded pale-blue sky behind (MAX) the ghost aurora; ink stays black ---- */
@@ -958,7 +1034,8 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 				}
 			}
 		}
-		us_polyline(c, pts, 97, 0.0013f, mv, US_MAT_EARTH);
+		if (!ctx->crisp)
+			us_polyline(c, pts, 97, 0.0013f, mv, US_MAT_EARTH);
 		/* aurora light on the snowy crests */
 		for (int i = 0; i < 96; i++) {
 			float g = glow[(int)(i / 96.0f * 63.0f)] * strength;
@@ -967,13 +1044,33 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 				(ctx->crisp ? us_line : us_line)(c, pts[2 * i], pts[2 * i + 1] + (ctx->crisp ? 0.0f : 0.0025f), pts[2 * i + 2],
 							  pts[2 * i + 3] + (ctx->crisp ? 0.0f : 0.0025f), ctx->crisp ? 0.004f : 0.0011f, gv, US_MAT_LEAF);
 		}
-		if (ctx->crisp)
-			for (int i = 0; i < 96; i++) {
-				float x0 = pts[2 * i], y0 = pts[2 * i + 1], x1 = pts[2 * i + 2], y1 = pts[2 * i + 3];
-				us_tri(c, x0, y0, x1, y1, x0, SHORE, 0.14f + 0.3f * day, US_MAT_EARTH);
-				us_tri(c, x1, y1, x1, SHORE, x0, SHORE, 0.14f + 0.3f * day, US_MAT_EARTH);
+		if (ctx->crisp) {
+			/* pixel: a blue night range lit from above -- snow caps on the high peaks (dithered into the rock),
+			 * the rock fading by dither into darkness toward its feet behind the foothills */
+			/* (day terms gated: the dither would show every slow drift of the night's light) */
+			float dk = us_smooth(0.25f, 0.7f, day);
+			float S = c->s, body = 0.15f + 0.2f * dk, snowv = 0.5f + 0.15f * winter + 0.2f * dk;
+			for (int px = 0; px < W; px++) {
+				float u = (px + 0.5f) / S / A;
+				float r = s->ridgeAt[px] + 0.002f, hgt = 0.705f - r;
+				float g = us_sat(strength * s->lvl_env); /* the louder sky lights the snow */
+				float gul = fabsf(us_noise2(u * 70.0f, 7.7f)) + 0.5f * fabsf(us_noise2(u * 170.0f, 2.1f)); /* gullies hold snow lower */
+				float sd = us_sat((hgt - 0.01f) / 0.07f) * (0.01f + 0.065f * gul * gul);
+				int y0 = (int)ceilf(r * S), y1 = (int)(SHORE * S);
+				for (int py = y0 < 0 ? 0 : y0; py < y1 && py < c->h; py++) {
+					float d = (py + 0.5f) / S - r;
+					float bv = body * (1.0f - 0.2f * us_smooth(0.03f, 0.14f, d));
+					float sn = sd > 0.0f ? 1.0f - us_smooth(sd * 0.45f, sd, d) : 0.0f;
+					float v = bv + (snowv * (0.75f + 0.6f * g) - bv) * sn;
+					int iv = dith(v, px, py);
+					size_t ii = (size_t)py * c->w + px;
+					if (iv >= c->ink[ii]) {
+						c->ink[ii] = (uint8_t)iv;
+						c->mat[ii] = sn > 0.2f ? US_MAT_ACCENT : US_MAT_WATER;
+					}
+				}
 			}
-		else {
+		} else {
 			/* snow on the highest ridges: short hatch strokes down the flanks */
 			for (int i = 0; i < 96; i += 2) {
 				float u = i / 96.0f, y = pts[2 * i + 1];
@@ -1002,13 +1099,13 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 			int y0 = (int)ceilf(us_lerp(fp[2 * i + 1], fp[2 * i + 3], uu - i) * c->s) + 1, y1 = (int)(SHORE * c->s);
 			for (int py = y0 < 0 ? 0 : y0; py < y1 && py < c->h; py++) {
 				size_t ii = (size_t)py * c->w + px;
-				c->ink[ii] = ctx->crisp ? (uint8_t)(255 * (0.1f + 0.2f * day)) : 2;
+				c->ink[ii] = ctx->crisp ? (uint8_t)(255 * (0.09f + 0.2f * us_smooth(0.25f, 0.7f, day))) : 2;
 				c->mat[ii] = US_MAT_EARTH;
 			}
 		}
 		for (int i = 0; i < 64; i++) {
 			float g = us_sat(glow[(int)(i / 64.0f * 63.0f)] * strength * 0.2f);
-			wline_(c, ctx->crisp, fp[2 * i], fp[2 * i + 1], fp[2 * i + 2], fp[2 * i + 3], 0.24f + 0.1f * day + g, US_MAT_EARTH);
+			wline_(c, ctx->crisp, fp[2 * i], fp[2 * i + 1], fp[2 * i + 2], fp[2 * i + 3], (ctx->crisp ? 0.09f : 0.24f) + 0.1f * day + g, US_MAT_EARTH);
 		}
 	}
 
@@ -1016,7 +1113,46 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 	{
 		int nt = (int)(s->ntr * (0.35f + 0.65f * dens));
 		float tv = 0.30f + 0.25f * day;
-		for (int i = 0; i < s->ntr; i++) {
+		if (ctx->crisp) {
+			/* pixel: one solid dark stand -- pointed spruces with stepped bough tiers over a low undergrowth band,
+			 * and its dark reflection under the shore; drawn into a per-column top line, then filled */
+			float S = c->s;
+			int sy = (int)(SHORE * S);
+			float *top = s->colR; /* the ray texture is spent by now: reuse it as the treeline's top per column */
+			for (int px = 0; px < W; px++) {
+				float u = (px + 0.5f) / S / A;
+				top[px] = SHORE - 0.007f - 0.004f * (0.5f + 0.5f * us_noise2(u * 23.0f, 1.9f));
+			}
+			for (int i = 0; i < s->ntr; i++) {
+				spruce_t *t = &s->tr[i];
+				if ((int)(t->x * 997.0f) % s->ntr >= nt || fabsf(t->x - s->cab_x) * A < 0.03f)
+					continue;
+				/* row by row from the tip: a slender cone notched into bough tiers (each tier flares, then steps in) */
+				float tx = t->x * A * S, th = t->h * 1.6f * S, tw = t->w * 1.15f * S;
+				int r0 = (int)floorf((SHORE + 0.002f) * S - th), r1 = (int)(SHORE * S);
+				for (int py = r0 < 0 ? 0 : r0; py <= r1; py++) {
+					float tt = (py + 0.5f - ((SHORE + 0.002f) * S - th)) / th;
+					float tier = tt * 3.3f + 0.15f;
+					float hw = tw * tt * (0.62f + 0.38f * (tier - floorf(tier))) + 0.15f;
+					int x0 = (int)floorf(tx - hw + 0.5f), x1 = (int)floorf(tx + hw - 0.5f);
+					if (x1 < x0)
+						x1 = x0 = (int)floorf(tx);
+					for (int px = x0 < 0 ? 0 : x0; px <= x1 && px < W; px++)
+						if (py / S < top[px])
+							top[px] = py / S;
+				}
+			}
+			for (int px = 0; px < W; px++) {
+				int y0 = (int)floorf(top[px] * S + 0.01f);
+				int ry = sy + (int)((SHORE - top[px]) * 0.75f * S + 0.5f); /* the reflection, a little shortened */
+				for (int py = y0 < 0 ? 0 : y0; py <= ry && py < c->h; py++) {
+					size_t ii = (size_t)py * c->w + px;
+					c->ink[ii] = 0;
+					c->mat[ii] = US_MAT_BG;
+				}
+			}
+		}
+		for (int i = 0; i < (ctx->crisp ? 0 : s->ntr); i++) {
 			spruce_t *t = &s->tr[i];
 			/* keep the full stand ordering stable: skip by hash, not by index */
 			if ((int)(t->x * 997.0f) % s->ntr >= nt)
@@ -1027,7 +1163,7 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 			/* mirrored in the still water, dim and shortened */
 			spruce(c, ctx->crisp, t->x * A, SHORE + 0.004f, -t->h * 0.7f, t->w * 0.9f, tv * (ctx->crisp ? 0.5f : 0.32f));
 		}
-		us_line(c, 0, SHORE, A, SHORE, 0.0012f, 0.35f, US_MAT_EARTH);
+		us_line(c, 0, SHORE, A, SHORE, 0.0012f, ctx->crisp ? 0.1f : 0.35f, ctx->crisp ? US_MAT_WATER : US_MAT_EARTH);
 		cabin(s, ctx, c, day);
 		fox(s, ctx, c, day);
 		/* the far ridge, reflected and broken by slow ripples */
@@ -1049,7 +1185,7 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 			if (gv < 0.03f)
 				continue;
 			float x0 = g / 63.0f * A;
-			for (int k = 0; k < 3; k++) {
+			for (int k = 0; k < (ctx->crisp ? 2 : 3); k++) {
 				float y = SHORE + 0.02f + 0.022f * k + 0.003f * us_noise2(g * 0.7f, k + (float)ctx->t * 0.3f);
 				float off = 0.01f * us_noise2(g * 1.3f + k * 5.0f, (float)ctx->t * 0.4f);
 				float len = A / 63.0f * (0.5f + 0.4f * us_noise2(g * 2.1f, k * 3.0f + (float)ctx->t * 0.5f));
