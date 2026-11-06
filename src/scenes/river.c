@@ -172,6 +172,7 @@ typedef struct {
 	/* countryside, per bank (0 = far bank / top, 1 = near bank / bottom) */
 	int ncol[2];
 	float hx[2][MAX_COL + 1], hlean[2][MAX_COL + 1], hgap[2][MAX_COL + 1];
+	uint8_t hk[2][MAX_COL + 1]; /* 1: this boundary is a hedgerow */
 	float bd[2][MAX_COL][NBAND + 1][2]; /* band edges: d at the left / right hedge */
 	field_t fd[2][MAX_COL][NBAND];
 	sheep_t sh[MAX_SHEEP];
@@ -242,6 +243,7 @@ typedef struct {
 } st_t;
 
 static float fish_w(float l);
+static float hsh(float a, float b);
 
 static void *create(uint32_t seed)
 {
@@ -667,6 +669,7 @@ static void init_scene(st_t *st, const us_ctx *ctx)
 			st->hx[sd][n] = x;
 			st->hlean[sd][n] = us_randr(r, -0.18f, 0.18f);
 			st->hgap[sd][n] = us_randr(r, 0.08f, 0.5f);
+			st->hk[sd][n] = hsh(n * 5.7f + sd, st->seed_off) > 0.5f; /* about half the boundaries are hedged */
 			n++;
 			if (x > A0 + 0.05f)
 				break;
@@ -685,7 +688,7 @@ static void init_scene(st_t *st, const us_ctx *ctx)
 			for (int b = 0; b < NBAND; b++) {
 				field_t *f = &st->fd[sd][k][b];
 				float u = us_rand(r);
-				f->kind = u < 0.27f ? F_PLOUGH : u < 0.62f ? F_CROP : u < 0.82f ? F_MEADOW : F_PASTURE;
+				f->kind = u < 0.2f ? F_PLOUGH : u < 0.62f ? F_CROP : u < 0.82f ? F_MEADOW : F_PASTURE;
 				/* rows mostly along or across the field, sometimes on the slant */
 				float ar = us_rand(r);
 				f->ang = ar < 0.4f ? 0.0f : ar < 0.75f ? US_PI * 0.5f : us_randr(r, -0.9f, 0.9f);
@@ -697,7 +700,7 @@ static void init_scene(st_t *st, const us_ctx *ctx)
 				f->tone = us_randr(r, 0.78f, 1.25f);
 				u = us_rand(r);
 				/* most fields just meet; a few are hedged or fenced */
-				f->edge = u < 0.32f ? 1 : u < 0.45f ? 2 : 0;
+				f->edge = u < 0.24f ? 1 : u < 0.36f ? 2 : 0;
 			}
 		}
 	}
@@ -1207,33 +1210,29 @@ static void draw_land(us_canvas *c, st_t *st, const us_ctx *ctx, float wind, flo
 	float br = 0.0093f, bv = (crisp ? 0.8f : 0.36f) * (0.8f + 0.2f * lush);
 	if (crisp && snow > 0.5f)
 		bv = 0.8f; /* bare hedges must stand above the bright snowfield fill */
-	float step = 0.012f;
+	float step = 0.012f; /* fence posts */
 	for (int sd = 0; sd < 2; sd++) {
 		for (int k = 0; k <= st->ncol[sd]; k++) {
 			float hx = st->hx[sd][k];
 			if (hx < -0.05f || hx > st->A + 0.05f)
 				continue;
-			/* some boundaries are thick old hedges, some a line of hedgerow trees, some only a change of crop */
-			float kind = hsh(k * 5.7f + sd, st->seed_off);
-			if (kind < 0.3f)
+			/* the hedge itself is in the land fill; here only the odd taller tree standing in it */
+			if (!st->hk[sd][k])
 				continue;
-			int trees = kind > 0.82f;
-			float stp = trees ? 0.045f : step;
-			for (float d = D0 + 0.004f; d < 0.7f; d += stp) {
-				int j = (int)(d / stp);
+			for (float d = D0 + 0.03f; d < 0.7f; d += 0.055f) {
+				int j = (int)(d / 0.055f);
 				float hj = hsh(j + k * 17.0f, sd + 3.0f), hj2 = hsh(j * 1.9f + k, sd + 11.0f);
-				if (fabsf(d - st->hgap[sd][k]) < 0.022f)
+				if (hj < 0.78f)
 					continue;
-				/* an old hedge is gappy: runs of bushes, open stretches */
-				if (!trees && us_noise2(d * 7.0f, k * 3.1f + sd * 7.0f + st->seed_off) < -0.22f)
+				float dd = d + (hj2 - 0.5f) * 0.03f;
+				if (us_noise2(dd * 7.0f, (k * 7 + sd * 3 + 1) * 2.11f + 9.0f) <= -0.2f) /* not in a gap */
 					continue;
 				float x, y;
-				float jit = (hj2 - 0.5f) * (trees ? 0.012f : 0.0065f);
-				land_xy(st, sd, hx + st->hlean[sd][k] * d + jit, d + (hj - 0.5f) * stp * 0.4f, &x, &y);
+				land_xy(st, sd, hx + st->hlean[sd][k] * dd, dd, &x, &y);
 				if (y < -0.05f || y > 1.05f)
 					continue;
 				float sh = shade_at(st, x, y);
-				float rr = trees ? br * (2.0f + 1.4f * hj) : br * (0.7f + 0.75f * hj * hj2 + 0.3f * hj);
+				float rr = br * (1.9f + 1.0f * hj2);
 				float sx = 0.0015f * wind * lgrid(st, st->lgust, x, y);
 				bush(c, st, x + sx, y, rr, bv * sh, hedge_m, hj);
 				if (snow > 0.3f && !crisp)
@@ -1262,10 +1261,8 @@ static void draw_land(us_canvas *c, st_t *st, const us_ctx *ctx, float wind, flo
 						continue;
 					}
 					float sh = shade_at(st, x, y);
-					if (f->edge == 1) {
-						float hj = hsh(i + k * 7.0f, b + sd * 5.0f);
-						if (us_noise2(p * 6.0f, k * 2.3f + b * 5.1f + sd) > -0.2f)
-							bush(c, st, x, y, br * (0.7f + 0.5f * hj), bv * 0.9f * sh, hedge_m, hj);
+					if (f->edge == 1) { /* hedged: drawn in the land fill */
+						break;
 					} else if ((i & 1) == 0) {
 						/* post and wire */
 						us_point(c, x, y, crisp ? 0.001f : 0.0012f, 0.3f * sh, US_MAT_EARTH);
@@ -1453,6 +1450,9 @@ static void land_fill(us_canvas *c, st_t *st, const us_ctx *ctx)
 				/* rows: a hard stripe on the pixel grid, a soft ribbing in ink */
 				float rib = crisp ? (fr < 0.42f ? 1.0f : 0.0f) : (2.0f * fr - 1.0f) * (2.0f * fr - 1.0f);
 				int path = nearb && d < 0.4f && fabsf(x - bridge_path_x(st, d)) < 0.0032f;
+				/* neighbouring fields differ gently: a narrow tone range, and on the pixel grid every field sits
+				 * inside one palette step */
+				float tn = 1.0f + 0.45f * (f->tone - 1.0f);
 				if (snow > 0.5f) { /* snowfields: furrows show as a faint brighter ribbing */
 					v = (f->kind != F_MEADOW && f->kind != F_PASTURE ? 0.62f + 0.2f * rib : 0.62f) * (crisp ? 1.0f : 0.5f);
 					m = US_MAT_ACCENT;
@@ -1460,19 +1460,84 @@ static void land_fill(us_canvas *c, st_t *st, const us_ctx *ctx)
 					v = crisp ? 0.36f : 0.15f;
 					m = US_MAT_EARTH;
 				} else if (f->kind == F_PLOUGH) {
-					v = (crisp ? 0.22f + 0.07f * rib : 0.2f + 0.1f * rib) * f->tone * K;
-					m = US_MAT_EARTH;
+					/* brown furrows between green strips: a ploughed field reads as a texture, not a dark block */
+					v = crisp ? (rib > 0.5f ? 0.46f : 0.22f * tn) : (rib > 0.5f ? 0.36f * tn * K : 0.23f * tn * K);
+					m = rib < 0.5f ? US_MAT_LEAF : US_MAT_EARTH;
 				} else if (f->kind == F_CROP) {
-					v = (0.2f + 0.05f * rib) * f->tone * K;
-					m = ripe > 0.5f ? (crisp && rib < 0.5f ? US_MAT_EARTH : US_MAT_LIGHT) : US_MAT_LEAF;
+					v = crisp ? 0.22f * tn : (0.22f + 0.05f * rib) * tn * K;
+					m = ripe > 0.5f ? US_MAT_LIGHT : US_MAT_LEAF;
 					if (ripe > 0.5f && !crisp)
 						v *= 0.8f;
 				} else if (f->kind == F_MEADOW) {
-					v = 0.23f * f->tone * K;
+					v = crisp ? 0.23f * tn : 0.24f * tn * K;
 					m = US_MAT_LEAF;
 				} else {
-					v = 0.19f * f->tone * K;
-					m = crisp ? US_MAT_STEM : US_MAT_LEAF;
+					v = crisp ? 0.21f * tn : 0.21f * tn * K;
+					m = US_MAT_LEAF;
+				}
+				/* hedgerows: one soft, lumpy band along a boundary, lit on its upper-left edge, its shadow
+				 * falling on the field below-right; gaps here and there */
+				{
+					float hw0 = crisp ? 0.0125f : 0.0115f, best = 2.0f, sgn = 0, along = 0;
+					int hid = 0;
+					/* the hedges either side of this column (screen-horizontal offset) */
+					if (X < hw0 * 1.7f && st->hk[sd][k]) {
+						best = X / hw0;
+						sgn = 1.0f; /* the field lies to the right: the hedge's shadow side */
+						along = d;
+						hid = k * 7 + sd * 3 + 1;
+					}
+					if (xr - x < hw0 * 1.7f && st->hk[sd][k + 1] && (xr - x) / hw0 < best) {
+						best = (xr - x) / hw0;
+						sgn = -1.0f;
+						along = d;
+						hid = (k + 1) * 7 + sd * 3 + 1;
+					}
+					/* along the band edges: the near edge belongs to the band below, the far to this one */
+					float db = e[b + 1][0] + (e[b + 1][1] - e[b + 1][0]) * p;
+					float ys = sd ? 1.0f : -1.0f; /* d grows down the screen on the near bank */
+					if (b > 0 && st->fd[sd][k][b - 1].edge == 1 && Y < hw0 * 1.7f && Y / hw0 < best) {
+						best = Y / hw0;
+						sgn = ys; /* the field is further from the river than the hedge */
+						along = x * 1.3f;
+						hid = k * 11 + b * 5 + sd * 2 + 40;
+					}
+					if (b < NBAND - 1 && f->edge == 1 && db - d < hw0 * 1.7f && (db - d) / hw0 < best) {
+						best = (db - d) / hw0;
+						sgn = -ys;
+						along = x * 1.3f;
+						hid = k * 11 + (b + 1) * 5 + sd * 2 + 40;
+					}
+					if (best < 1.7f) {
+						float n1 = us_noise2(along * 55.0f, hid * 1.37f + st->seed_off);
+						float gap = us_noise2(along * 7.0f, hid * 2.11f + 9.0f);
+						float wl = 0.62f + 0.38f * n1 + 0.25f * us_noise2(along * 14.0f, hid + 3.0f); /* lumps + width */
+						if (gap > -0.3f && wl > 0.15f) {
+							float u = best / wl;
+							/* the side facing the sun (sgn < 0: lit side toward the field) */
+							float uu = u * (sgn > 0 ? 1.0f : -1.0f); /* -1 lit edge .. +1 shadow edge */
+							if (u < 1.0f) {
+								float dome = sqrtf(1.0f - u * u);
+								float lit = us_sat(0.45f + 0.5f * dome - 0.45f * uu);
+								float hv = (crisp ? 0.36f + 0.4f * lit : 0.08f + 0.17f * lit) * (0.85f + 0.3f * n1);
+								if (!crisp) {
+									uint32_t hh = (uint32_t)px * 0x9E3779B1u ^ (uint32_t)py * 0x85EBCA77u;
+									hh ^= hh >> 13;
+									hh *= 0x5bd1e995u;
+									hh ^= hh >> 15;
+									hv *= 0.82f + 0.36f * (float)(hh & 255) / 255.0f;
+								}
+								if (snow > 0.5f) { /* bare and dark against the snow */
+									hv = crisp ? 0.3f + 0.15f * lit : 0.08f + 0.1f * lit;
+									m = US_MAT_STEM;
+								} else
+									m = US_MAT_LEAF;
+								v = hv;
+							} else if (u < 1.6f && sgn > 0) {
+								v *= crisp ? 0.8f : 0.6f; /* its shadow on the field */
+							}
+						}
+					}
 				}
 			}
 			*ci = (uint8_t)(v * shf * 255.0f + 0.5f);
@@ -2323,7 +2388,7 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 	/* fewer, finer lines than a fill: the current reads as threads over the dark body of the water */
 	int want = 320 + (int)(dens * 1500.0f);
 	if (ctx->crisp) /* a 1px streak covers far more of a low-res canvas */
-		want = (450 + (int)(dens * 2300.0f)) * 11 / 20;
+		want = (450 + (int)(dens * 2300.0f)) * 9 / 20;
 	if (want > MAX_P)
 		want = MAX_P;
 	while (st->np < want) {
@@ -2363,7 +2428,9 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 		float l2 = us_sat(lat * lat);
 		float v;
 		if (ctx->crisp)
-			v = (0.16f + 0.3f * us_sat(sp) + 0.3f * energy + 0.35f * us_sat(foam) + 0.22f * sg + 0.42f * st->kglow + 0.12f * st->lvl_env) * fade;
+			/* on the coarse grid the current is a calm grain: speed barely changes a streak's step, the eddies'
+			 * white water and the drums still do */
+			v = (0.14f + 0.1f * us_sat(sp) + 0.1f * energy + 0.45f * us_sat(foam) + 0.22f * sg + 0.42f * st->kglow + 0.3f * st->lvl_env) * fade;
 		else /* the deep channel stays dark; the shallows, the surge and white water catch the light */
 			v = (0.08f + 0.11f * us_sat(sp) + 0.08f * energy + 0.16f * st->lvl_env + 0.4f * us_sat(foam) + 0.3f * sg +
 			     0.12f * st->kglow) *
