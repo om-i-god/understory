@@ -15,13 +15,19 @@
  * Small lives reward a long look: a mole in its tunnel with a grass-lined nest, springtails in the humus,
  * a ground beetle on the surface, root hairs on the fine roots, bioluminescent hyphal tips.
  *
- * Audio: bass (sustained) drives tip growth + branching; kicks launch bright nutrient pulses through the
- *        network, make the mushroom caps squash and spring back, and shake crumbs from the tunnel roof;
- *        sub-bass sets the mole digging; low-mids walk the beetle; hats make the springtails leap;
- *        air lets a spore haze drift from open gills and stirs the root hairs; highs sway the grass;
- *        onsets puff spores; the melody bands each warm their own region of the network, at a depth
- *        chosen by the spectral centroid (bright = shallow); every mushroom listens to its own band;
- *        the phrase swell gathers foxfire halos round the tips; stereo width spreads the spore cloud.
+ * Look: a hierarchy — the cords (threads with many descendants) are the structure, a second hairline wide;
+ *       the fine web between them is a faint texture (in Pixel it sinks into the soil's own colour); deeper
+ *       threads sink a little; the web leaves bare soil, and glow lives in packets travelling along the cords.
+ *
+ * Audio: kick = the cords throb and nutrient packets race out along them from two colonies' spores (gold),
+ *        caps squash, crumbs fall in the mole's tunnel; snare = the fine web shudders (pink) round a fruiting
+ *        body, every ripe cap jolts up and fires a puff of spores; hats = about half the growing tips glint
+ *        (a different half each hit) and the springtails leap; loudness = the whole web glows brighter and
+ *        grows faster (quiet sinks it to the cords and slow faint pulses); bass sustains growth + branching;
+ *        sub-bass sets the mole digging; low-mids walk the beetle; air lets a spore haze drift from open gills
+ *        and stirs the root hairs; highs sway the grass; the melody bands each warm their own region of the
+ *        network, at a depth chosen by the spectral centroid (bright = shallow); every mushroom listens to its
+ *        own band; the phrase swell gathers foxfire halos round the tips; stereo width spreads the spore cloud.
  *        In silence the tips breathe, faint pulses still travel, and the animals amble.
  * World: initial network size from `mycelium`; reads `moisture` (growth rate, fruiting); writes `mycelium`.
  */
@@ -79,10 +85,10 @@ static double prof_now(void)
 #define NCOL 12     /* melody regions across the network, one band each */
 
 #define STEP 0.0065f      /* hyphal segment length (normalized units)  */
-#define PULSE_V 0.6f      /* pulse speed along the network (units / s) */
-#define PULSE_W 0.035f    /* pulse half-width along the path           */
+#define PULSE_V 0.9f      /* pulse speed along the network (units / s) */
+#define PULSE_W 0.022f    /* pulse half-width along the path           */
 #define DIE_T 3.0f        /* seconds a senescent thread takes to fade  */
-#define CROWD 9          /* nodes per hash cell before a tip gives up (keeps the web open) */
+#define CROWD 7          /* nodes per hash cell before a tip gives up (keeps the web open) */
 
 typedef struct {
 	float x, y;    /* x in normalized units at aspect `ax` time of birth: stored as fraction of width */
@@ -100,7 +106,7 @@ typedef struct {
 } tip_t;
 
 typedef struct {
-	float t0, s;
+	float t0, s, fr; /* launch time, strength, fade rate (kicks spend themselves fast, idle pulses drift) */
 	int colony; /* each pulse fires one colony, so different parts of the web light in turn */
 } pulse_t;
 
@@ -128,7 +134,7 @@ typedef struct {
 } germ_t;
 
 typedef struct {
-	float x, y, vx, vy, life, ph;
+	float x, y, vx, vy, life, ph, b; /* b: extra brightness of a fresh puff, decays fast */
 } spore_t;
 
 typedef struct {
@@ -228,6 +234,9 @@ typedef struct {
 	float depth_w[GY];
 
 	float bass_env, sway_t, glow_env, prev_kick, frame_dt;
+	float lvl_env;            /* loudness: the whole network glows brighter */
+	float sn_x, sn_y;         /* snare: where the fine web last shuddered (units) */
+	unsigned hat_n, snare_n;  /* hit counters: pick which tips sparkle / which cap puffs */
 	float empty_t[RX * RY]; /* how long each soil region has been (nearly) empty */
 	float germ_cool;
 	germ_t germ[MAX_GERM];
@@ -791,12 +800,13 @@ static void init_scene(st_t *st, const us_ctx *ctx)
 
 	/* memory: a network that grew elsewhere (world mycelium) is already here when the scene opens */
 	float m = ctx->w->mycelium;
-	int cols = 2 + (int)(m * 4.0f);
+	int cols = 3 + (int)(m * 4.0f);
 	for (int i = 0; i < cols; i++)
 		new_colony(st, A);
-	int want = (int)(MAX_NODES * (0.04f + 0.6f * m));
+	/* a well-grown web where the world's mycelium is rich, a younger one where it is poor */
+	int want = (int)(MAX_NODES * (0.2f + 0.55f * ctx->p->density) * (0.9f + 0.1f * us_sat(m * 3.0f)));
 	float sdt = 1.0f / 30.0f;
-	for (int it = 0; it < 1500 && st->nalive < want; it++) {
+	for (int it = 0; it < 3000 && st->nalive < want; it++) {
 		st->t += sdt;
 		rebuild_hash(st);
 		grow(st, A, 0.05f, 0.06f, sdt);
@@ -1071,7 +1081,7 @@ static void draw_critters(st_t *st, const us_ctx *ctx, us_canvas *c, int kick_hi
 		if (!air) {
 			sp->ph += dt * (1.0f + 2.0f * us_rand(r));
 			sp->xf += sp->face * 0.003f * us_sat(sinf(sp->ph)) * dt / A;
-			int go = (hi_hit && us_rand(r) < 0.3f) || us_rand(r) < dt * (0.05f + 0.1f * quiet);
+			int go = (hi_hit && us_rand(r) < 0.5f) || us_rand(r) < dt * (0.05f + 0.1f * quiet);
 			if (go && sp->cool <= 0) {
 				if (us_rand(r) < 0.3f)
 					sp->face = -sp->face;
@@ -1515,13 +1525,14 @@ static float pulse_glow(const st_t *st, const node_t *n, float *head)
 		float d = n->d - st->dmin[n->colony];
 		float front = (st->t - p->t0) * PULSE_V;
 		float e = front - d;
-		if (e < -2.5f * PULSE_W || e > 6.0f * PULSE_W)
+		if (e < -2.0f * PULSE_W || e > 3.5f * PULSE_W)
 			continue;
-		/* sharp leading edge, softer tail */
-		float w = e < 0 ? PULSE_W * 0.6f : PULSE_W * 1.3f;
-		g += p->s * expf(-(e * e) / (w * w)) * expf(-front * 0.3f);
+		/* sharp leading edge, a short tail: a packet travelling, not a lit region */
+		float w = e < 0 ? PULSE_W * 0.5f : PULSE_W * 1.1f;
+		float fade = expf(-(st->t - p->t0) * p->fr);
+		g += p->s * expf(-(e * e) / (w * w)) * fade;
 		if (head && e >= 0 && e < STEP + PULSE_V * st->frame_dt * 1.3f)
-			*head = fmaxf(*head, p->s * expf(-front * 0.3f));
+			*head = fmaxf(*head, p->s * fade);
 	}
 	return g;
 }
@@ -1550,6 +1561,7 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 		st->lm_env = us_approach(st->lm_env, a->lowmid, 0.3f, rdt);
 		st->air_env = us_approach(st->air_env, a->air, 0.2f, rdt);
 		st->swell_g = us_approach(st->swell_g, a->swell, 1.0f, rdt);
+		st->lvl_env = us_approach(st->lvl_env, a->level, 0.6f, rdt);
 		st->cent_env = us_approach(st->cent_env, a->centroid, 0.8f, rdt);
 		st->width_env = us_approach(st->width_env, a->width, 0.6f, rdt);
 		float hb = 0.25f * (a->bands[26] + a->bands[27] + a->bands[28] + a->bands[29]);
@@ -1568,17 +1580,17 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 			st->depth_w[j] = expf(-q * q);
 		}
 	}
-	st->hi_cool -= ctx->real_dt;
-	int hi_hit = st->hi_fast - st->hi_slow > 0.04f && st->hi_fast > 0.25f && st->hi_cool <= 0;
+	/* hats: tips sparkle and springtails leap (the drum detector tells hats from notes and noise) */
+	int hi_hit = a->hat_hit;
 	if (hi_hit)
-		st->hi_cool = 0.1f;
+		st->hat_n++;
 
 	/* ---- growth ---- */
-	int target = (int)(MAX_NODES * (0.35f + 0.6f * dens));
+	int target = (int)(MAX_NODES * (0.2f + 0.55f * dens)); /* a web with room in it: empty soil reads as soil */
 	if (target > MAX_NODES - 200)
 		target = MAX_NODES - 200;
 	rebuild_hash(st);
-	float spd = (0.006f + 0.05f * st->bass_env + 0.02f * a->level) * (0.5f + moist);
+	float spd = (0.006f + 0.05f * st->bass_env + 0.03f * st->lvl_env) * (0.5f + moist);
 	float bp = (0.035f + 0.04f * dens) * (0.7f + 0.8f * st->bass_env);
 	grow(st, A, spd, bp, dt);
 	senesce(st, target, dt);
@@ -1615,7 +1627,7 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 			}
 		}
 		st->germ_cool -= dt * (0.6f + 1.2f * st->bass_env);
-		if (best >= 0 && bt > 1.5f && st->germ_cool <= 0) {
+		if (best >= 0 && bt > 9.0f && st->germ_cool <= 0) { /* bare soil may stay bare for a while */
 			int rx = best % RX, ry = best / RX;
 			float xf = (rx + us_randr(r, 0.2f, 0.8f)) / RX;
 			float yy = Y0 + (ry + us_randr(r, 0.2f, 0.8f)) * ((Y1 - Y0) / RY);
@@ -1632,25 +1644,44 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 	/* ---- pulses: kicks launch nutrient waves from every spore ---- */
 	st->pulse_cool -= ctx->real_dt;
 	st->idle_pulse_t -= dt;
-	/* kick hit = the kick envelope jumping (a->beat follows broadband onsets, not every kick) */
-	int kick_hit = a->kick > st->prev_kick + 0.2f && a->kick > 0.3f;
-	st->prev_kick = a->kick;
+	int kick_hit = a->kick_hit;
 	if (kick_hit && st->pulse_cool <= 0 && st->npulses < MAX_PULSES) {
 		int c0 = pick_colony(st);
-		st->pulse[st->npulses++] = (pulse_t){st->t, us_sat(0.7f + 0.6f * a->kick), c0};
+		st->pulse[st->npulses++] = (pulse_t){st->t, 1.0f, 2.8f, c0};
 		/* a second colony answers (kicks light the web in two places) */
 		int c1 = pick_colony(st);
-		if (c1 != c0 && st->npulses < MAX_PULSES && us_rand(r) < 0.45f)
-			st->pulse[st->npulses++] = (pulse_t){st->t, us_sat(0.6f + 0.5f * a->kick), c1};
-		st->pulse_cool = 0.18f;
+		if (c1 != c0 && st->npulses < MAX_PULSES)
+			st->pulse[st->npulses++] = (pulse_t){st->t, 0.85f, 2.8f, c1};
+		st->pulse_cool = 0.12f;
 	} else if (st->idle_pulse_t <= 0 && st->npulses < MAX_PULSES) {
 		/* in quiet the network still breathes: slow faint pulses */
-		st->pulse[st->npulses++] = (pulse_t){st->t, 0.4f, pick_colony(st)};
+		st->pulse[st->npulses++] = (pulse_t){st->t, 0.5f, 0.5f, pick_colony(st)};
 		st->idle_pulse_t = us_randr(r, 3.0f, 7.0f);
 	}
 	if (kick_hit) {
 		st->idle_pulse_t = us_randr(r, 3.0f, 7.0f);
 		st->bob_v -= 9.0f * us_sat(0.5f + 0.5f * a->kick);
+	}
+	/* snare: the fine web shudders round one fruiting body (or a random stretch of web), and it puffs */
+	if (a->snare_hit) {
+		st->snare_n++;
+		int pickm = -1, nm = 0;
+		for (int m = 0; m < MAX_MUSH; m++)
+			if (st->mush[m].alive && st->mush[m].g > 0.5f && us_rand(r) * (float)(++nm) < 1.0f)
+				pickm = m;
+		if (pickm >= 0) {
+			st->sn_x = st->mush[pickm].x * A;
+			st->sn_y = soil_y(st->mush[pickm].x) + 0.05f;
+		} else {
+			for (int tries = 0; tries < 16; tries++) {
+				const node_t *n = &st->nd[(int)(us_rand(r) * MAX_NODES)];
+				if (n->alive && n->die <= 0) {
+					st->sn_x = n->x * A, st->sn_y = n->y;
+					break;
+				}
+			}
+		}
+		st->bob_v += 6.0f * us_sat(0.5f + 0.5f * a->snare); /* the caps jolt up */
 	}
 	/* the caps' wobble: a damped spring (~3.5 Hz) knocked by each kick, gone in ~0.4 s */
 	for (int k = 0; k < 2; k++) {
@@ -1659,7 +1690,7 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 		st->bob_x += st->bob_v * h;
 	}
 	for (int k = 0; k < st->npulses;) {
-		if ((st->t - st->pulse[k].t0) * PULSE_V > 3.0f) {
+		if ((st->t - st->pulse[k].t0) * st->pulse[k].fr > 3.5f) {
 			st->pulse[k] = st->pulse[--st->npulses];
 			continue;
 		}
@@ -1679,6 +1710,9 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 		for (int k = 0; k < 256; k++)
 			st->dmin_next[k] = 1e9f;
 		float t = st->t;
+		float lgain = 0.36f + 1.0f * st->lvl_env * sqrtf(st->lvl_env); /* louder = the whole web glows brighter */
+		float kthrob = 0.55f * us_sat(a->kick * 1.2f); /* kick envelope: cords throb */
+		float snv = (ctx->crisp ? 0.95f : 0.75f) * us_sat(a->snare * 1.3f);
 		for (int i = 0; i < MAX_NODES; i++) {
 			node_t *n = &st->nd[i];
 			if (!n->alive)
@@ -1692,14 +1726,27 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 			}
 			node_t *q = &st->nd[p];
 			float age = t - n->born;
-			float youth = expf(-age * 0.25f);
-			float cord = us_sat(log2f(1.0f + n->mass) / 9.0f);
-			float v = 0.3f + 0.2f * cord + 0.4f * youth;
+			float youth = expf(-age * 0.5f);
+			/* hierarchy: the cords (threads many descendants hang from) are the structure; the fine web is
+			 * a faint texture between them; deeper threads sink a little (depth) */
+			float cord = us_sat(log2f(1.0f + n->mass) / 8.0f);
+			float c2 = cord * cord;
+			float v = (0.1f + 0.62f * c2 + 0.3f * youth) * (1.0f - 0.3f * us_sat((n->y - 0.4f) * 2.0f)) * lgain;
 			if (n->die > 0)
 				v *= us_sat(1.0f - (t - n->die) / DIE_T);
 			float head;
-			float g = pulse_glow(st, n, &head);
-			v += 0.45f * g;
+			float g = pulse_glow(st, n, &head) * (0.3f + 0.7f * cord); /* nutrients ride the cords */
+			v += 0.6f * g;
+			v += kthrob * c2; /* kick: the cords throb */
+			float sn = 0.0f;
+			if (snv > 0.01f) { /* snare: the fine web shudders round the fruit */
+				float dx = n->x * A - st->sn_x, dy = n->y - st->sn_y;
+				float d2 = dx * dx + dy * dy;
+				if (d2 < 0.12f) {
+					sn = snv * (1.0f - 0.6f * cord) * expf(-d2 * 22.0f);
+					v += sn;
+				}
+			}
 			{ /* melody: the region's own band warms it, at the depth the centroid picks */
 				float fx = n->x * (NCOL - 1);
 				int ci = (int)fx;
@@ -1707,33 +1754,34 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 				float mel = us_lerp(st->colenv[ci], st->colenv[ci + 1], fx - ci);
 				int gj = (int)(n->y * GY);
 				mel *= st->depth_w[gj < 0 ? 0 : (gj >= GY ? GY - 1 : gj)];
-				v += 0.4f * mel * mel * (0.6f + 0.4f * cord);
+				v += 0.3f * mel * mel * (0.3f + 0.7f * cord);
 			}
-			/* pale threads; pulses light them gold (pixel styles keep the thread's own ramp: a LIGHT mat
-			 * would linger through the trails) */
-			uint8_t m = g > 0.5f && !ctx->crisp ? US_MAT_LIGHT : US_MAT_ACCENT;
-			if (ctx->crisp && v < 0.45f)
-				m = US_MAT_STEM; /* pixel: older threads sink into a darker ramp, fresh ones stay pale */
+			/* pale threads; pulses light them gold, the snare shudder pink (pixel styles keep the thread's
+			 * own ramp for the pulse body: a LIGHT mat would linger through the trails) */
+			uint8_t m = sn > 0.25f ? US_MAT_BLOOM : g > 0.6f && !ctx->crisp ? US_MAT_LIGHT : US_MAT_ACCENT;
+			if (ctx->crisp && m == US_MAT_ACCENT && v < 0.42f)
+				m = cord < 0.55f ? US_MAT_EARTH : US_MAT_STEM; /* pixel: the fine web sinks into the soil, cords stay pale */
 			float x0 = q->x * A, y0 = q->y, x1 = n->x * A, y1 = n->y;
-			if (head > 0.12f) {
-				/* the nutrient packet itself: a bright bead racing along the thread (trails make it a comet) */
-				float hv = us_sat(0.6f + 0.5f * head);
+			if (head > 0.12f && cord > 0.4f) {
+				/* the nutrient packet itself: a bright bead racing out along the cords (trails make it a comet);
+				 * the fine web only warms as it passes */
+				float hv = us_sat((0.5f + 0.5f * head) * (0.6f + 0.4f * cord));
 				if (ctx->crisp)
 					px_line(c, x0, y0, x1, y1, hv, US_MAT_LIGHT);
 				else
-					us_line(c, x0, y0, x1, y1, 0.0016f + 0.002f * cord, hv, US_MAT_LIGHT);
+					us_line(c, x0, y0, x1, y1, 0.0012f + 0.0018f * cord, hv, US_MAT_LIGHT);
 				continue;
 			}
+			v = us_sat(v);
 			if (ctx->crisp) {
 				px_line(c, x0, y0, x1, y1, v, m);
 			} else {
-				float vv = us_sat(v * (1.0f + 0.3f * cord));
-				wu_line(c, x0, y0, x1, y1, vv, m);
-				if (cord > 0.6f) { /* thick cords: a second hairline a pixel across */
+				wu_line(c, x0, y0, x1, y1, v, m);
+				if (cord > 0.55f) { /* cords: a second hairline a pixel across */
 					float dx = x1 - x0, dy = y1 - y0, l = sqrtf(dx * dx + dy * dy) + 1e-6f;
-					float o = (cord - 0.45f) * 2.2f / c->s;
+					float o = fminf((cord - 0.4f) * 2.0f, 1.0f) / c->s;
 					float ox = -dy / l * o, oy = dx / l * o;
-					wu_line(c, x0 + ox, y0 + oy, x1 + ox, y1 + oy, vv * 0.85f, m);
+					wu_line(c, x0 + ox, y0 + oy, x1 + ox, y1 + oy, v * 0.8f, m);
 				}
 			}
 		}
@@ -1744,7 +1792,7 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 			if (!na->alive || !nb->alive || na->born > l->t || nb->born > l->t)
 				continue;
 			float g = fmaxf(pulse_glow(st, na, NULL), pulse_glow(st, nb, NULL));
-			float v = 0.3f + 0.5f * g;
+			float v = (0.14f + 0.6f * g) * lgain;
 			if (na->die > 0 || nb->die > 0)
 				v *= 0.4f;
 			if (ctx->crisp)
@@ -1757,11 +1805,34 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 		/* growing tips: bioluminescent — each breathes on its own in quiet, and the phrase swell
 		 * gathers a soft halo of foxfire round them */
 		float halo = us_smooth(0.15f, 0.8f, st->swell_g);
+		float hatv = us_sat(a->hat * 1.4f);
 		for (int k = 0; k < st->ntips; k++) {
 			node_t *n = &st->nd[st->tip[k].node];
 			float breath = 0.5f + 0.5f * sinf(st->t * (0.7f + 0.05f * (k & 7)) + k * 2.39f);
-			float tv = us_sat(0.5f + 0.3f * st->bass_env + 0.2f * breath);
-			us_point(c, n->x * A, n->y, ctx->crisp ? 0.002f : 0.0016f, tv, US_MAT_LIGHT);
+			float tv = us_sat((0.3f + 0.3f * st->bass_env + 0.25f * breath) * lgain);
+			float x = n->x * A, y = n->y;
+			/* hats: about half the tips sparkle (a different half each hit) — a four-point glint */
+			uint32_t h = ((uint32_t)k * 2654435761u) ^ (st->hat_n * 0x9e3779b9u);
+			h ^= h >> 15;
+			h *= 0x2c1b3c6du;
+			h ^= h >> 12;
+			if (hatv > 0.03f && (h & 1)) {
+				float sv = us_sat(0.45f + 0.6f * hatv);
+				if (ctx->crisp) {
+					int px = (int)(x * c->s), py = (int)(y * c->s);
+					put_max(c, px, py, sv, US_MAT_LIGHT);
+					if (hatv > 0.3f) {
+						put_max(c, px - 1, py, sv * 0.8f, US_MAT_LIGHT), put_max(c, px + 1, py, sv * 0.8f, US_MAT_LIGHT);
+						put_max(c, px, py - 1, sv * 0.8f, US_MAT_LIGHT), put_max(c, px, py + 1, sv * 0.8f, US_MAT_LIGHT);
+					}
+				} else {
+					float L = 0.002f + 0.0055f * hatv;
+					wu_line(c, x - L, y, x + L, y, sv, US_MAT_LIGHT);
+					wu_line(c, x, y - L, x, y + L, sv, US_MAT_LIGHT);
+				}
+				continue;
+			}
+			us_point(c, x, y, ctx->crisp ? 0.002f : 0.0014f, tv, US_MAT_ACCENT); /* pale: a LIGHT tip would gild the fine web round it through the bloom */
 			if (!ctx->crisp && halo > 0.02f)
 				us_ring(c, n->x * A, n->y, 0.0035f + 0.003f * halo * breath, 0.0012f, 0.22f * halo * (0.5f + 0.5f * breath),
 					US_MAT_LIGHT);
@@ -1788,7 +1859,7 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 	{
 		float autumn = us_world_season_w(w, 2), winter = us_world_winter(w);
 		float lush = 0.6f * moist + 0.5f * w->growth + 0.3f * w->mycelium;
-		float fruit_ok = us_smooth(0.1f, 0.3f, frac) * us_smooth(0.12f, 0.45f, lush) * (1.0f + 1.5f * autumn) *
+		float fruit_ok = us_smooth(0.05f, 0.2f, frac) * fmaxf(0.3f, us_smooth(0.12f, 0.45f, lush)) * (1.0f + 1.5f * autumn) *
 				 (1.0f - 0.8f * winter);
 		if (us_rand(r) < dt * 0.22f * fruit_ok * (0.4f + 1.2f * st->bass_env)) {
 			int mi = -1;
@@ -1972,10 +2043,25 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 			/* air (the sizzle above the hats) lets a fine haze of spores drift from open gills */
 			if (open > 0.7f && wilt <= 0 && us_rand(r) < dt * 2.2f * st->air_env * st->air_env)
 				mu->emit++;
-			if ((arrive || a->beat) && open > 0.7f && wilt <= 0 && mu->puff <= 0 &&
-			    (arrive || us_rand(r) < 0.3f + 0.5f * a->onset)) {
+			if (arrive && open > 0.7f && wilt <= 0 && mu->puff <= 0) {
 				mu->puff = us_randr(r, 0.8f, 2.0f);
 				mu->emit += 2 + (int)(4.0f * mu->glow);
+			}
+			/* snare: every ripe cap fires a puff of spores at once, out from under the gills */
+			if (a->snare_hit && open > 0.4f && wilt < 0.5f) {
+				int nb = 5 + (int)(5.0f * us_sat(a->snare)) + (int)(mu->h * 40.0f);
+				for (int k = 0; k < nb && st->nspores < MAX_SPORES; k++) {
+					spore_t *sp2 = &st->spore[st->nspores++];
+					float u = us_randr(r, -0.9f, 0.9f), an = us_randr(r, -US_PI * 0.95f, -US_PI * 0.05f);
+					float spd2 = us_randr(r, 0.04f, 0.11f);
+					sp2->x = tx + u * cw * cosf(lean);
+					sp2->y = ty + u * cw * sinf(lean) + 0.002f;
+					sp2->vx = cosf(an) * spd2 * 1.3f + u * 0.03f;
+					sp2->vy = sinf(an) * spd2 * 0.6f + 0.02f;
+					sp2->life = us_randr(r, 0.55f, 0.85f);
+					sp2->ph = us_rand(r) * US_TAU;
+					sp2->b = 0.5f;
+				}
 			}
 			/* spores drop out of the gills one at a time, then the air takes them */
 			mu->emit_t -= dt;
@@ -1988,6 +2074,7 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 				sp2->vy = us_randr(r, -0.004f, 0.01f);
 				sp2->life = 1.0f;
 				sp2->ph = us_rand(r) * US_TAU;
+				sp2->b = 0.0f;
 				mu->emit--;
 				mu->emit_t = us_randr(r, 0.04f, 0.16f);
 			}
@@ -2001,8 +2088,10 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 			float jit = 0.0025f * sqrtf(dt * 30.0f);
 			s->vx += (n1 * 0.006f + 0.003f * wind) * dt + us_randn(r) * jit;
 			s->vy += (n2 * 0.006f - 0.004f) * dt + us_randn(r) * jit * 0.8f;
-			s->vx *= expf(-dt * 0.6f);
-			s->vy *= expf(-dt * 0.6f);
+			float drag = expf(-dt * (0.6f + 5.0f * s->b)); /* a fresh puff slows quickly into a drifting cloud */
+			s->vx *= drag;
+			s->vy *= drag;
+			s->b *= expf(-dt * 5.0f);
 			s->x += s->vx * dt;
 			s->y += s->vy * dt;
 			s->life -= dt * 0.16f;
@@ -2011,11 +2100,11 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 				continue;
 			}
 			float tw = 0.65f + 0.35f * sinf(st->t * 2.3f + s->ph);
-			float v = 0.55f * us_smooth(0.0f, 0.25f, s->life) * tw;
+			float v = us_sat((0.55f * tw + s->b) * us_smooth(0.0f, 0.25f, s->life));
 			if (ctx->crisp)
-				put_max(c, (int)(s->x * c->s), (int)(s->y * c->s), v, US_MAT_ACCENT);
+				put_max(c, (int)(s->x * c->s), (int)(s->y * c->s), v, s->b > 0.15f ? US_MAT_BLOOM : US_MAT_ACCENT);
 			else
-				us_point(c, s->x, s->y, 0.0012f, v, US_MAT_ACCENT);
+				us_point(c, s->x, s->y, 0.0012f + 0.0012f * s->b, v, s->b > 0.15f ? US_MAT_BLOOM : US_MAT_ACCENT);
 			k++;
 		}
 	}
@@ -2023,4 +2112,4 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 	PROF_END;
 }
 
-const us_scene_vt us_scene_mycelium = {"mycelium", "Mycelium", 0.3f, create, destroy, frame};
+const us_scene_vt us_scene_mycelium = {"mycelium", "Mycelium", 0.16f, create, destroy, frame};
