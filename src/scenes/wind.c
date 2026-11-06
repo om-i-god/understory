@@ -558,11 +558,23 @@ static void draw_tree(st_t *s, us_canvas *c, const us_ctx *ctx, float A, float s
 		float wd = (c->crisp ? 0.024f : 0.009f) * g->w;
 		if (wd < 0.0011f)
 			wd = 0.0011f;
-		float bv = us_sat((ctx->crisp ? 0.3f : 0.5f) * dayv + 0.05f * (5 - g->depth));
-		if (c->crisp)
+		if (c->crisp) {
+			float bv = us_sat(0.3f * dayv + 0.05f * (5 - g->depth));
 			oline(c, px, py, ex, ey, wd, bv, US_MAT_STEM);
-		else
+		} else if (wd * c->s > 2.2f) {
+			/* ink: trunk and main limbs as two fine tapering edges (the crown carries the glow) */
+			float bv = us_sat(0.36f * dayv + 0.03f * (5 - g->depth));
+			float we = wd * 0.62f;
+			float nx = -sinf(ang) * 0.5f, ny = cosf(ang) * 0.5f;
+			wline(c, px + nx * wd, py + ny * wd, ex + nx * we, ey + ny * we, 0.0011f, bv, US_MAT_STEM);
+			wline(c, px - nx * wd, py - ny * wd, ex - nx * we, ey - ny * we, 0.0011f, bv * 0.75f, US_MAT_STEM);
+			if (g->parent < 0) /* the foot of the trunk flares into the knoll */
+				for (int q = -1; q <= 1; q += 2)
+					wline(c, px + q * nx * wd, py + q * ny * wd, px + q * nx * wd * 2.6f, py + 0.004f, 0.0011f, bv * 0.8f, US_MAT_STEM);
+		} else {
+			float bv = us_sat(0.42f * dayv + 0.04f * (5 - g->depth));
 			wline(c, px, py, ex, ey, wd, bv, US_MAT_STEM);
+		}
 		if (winter > 0.4f && g->depth <= 3 && fabsf(cosf(ang)) > 0.5f) /* snow along the limbs */
 			wline(c, px, py - 0.002f, ex, ey - 0.002f, 0.0016f, 0.6f * winter * dayv, US_MAT_WATER);
 	}
@@ -1455,15 +1467,19 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 	fp.push = s->kimp * (ctx->crisp ? 1.7f : 4.0f); /* ink: the whole field brightens under the gust; pixel: gently, so it never flashes */
 	fp.hat = s->henv;
 	fp.cloud = s->cloud_t;
+	/* pixel/mono: the land follows the daylight like the sky does; by night it sinks into muted earth and
+	 * the gust bands become the moonlit accents */
+	float sunk = us_smooth(0.15f, 0.7f, day);
 	{
 		/* aerial perspective: the far downs hazy and pale, the near slope deep; the season sets the colours */
 		static const float cb[NLAY] = {0.4f, 0.3f, 0.17f}, cbd[NLAY] = {0.18f, 0.32f, 0.42f}, ccr[NLAY] = {0.14f, 0.2f, 0.24f};
 		static const float ib[NLAY] = {0.08f, 0.065f, 0.045f}, ibd[NLAY] = {0.06f, 0.07f, 0.06f}, icr[NLAY] = {0.08f, 0.11f, 0.1f};
 		for (int k = 0; k < NLAY; k++) {
-			fp.base[k] = ctx->crisp ? cb[k] : ib[k];
-			fp.band[k] = ctx->crisp ? cbd[k] : ibd[k];
+			static const float cbn[NLAY] = {0.26f, 0.2f, 0.13f};
+			fp.base[k] = ctx->crisp ? us_lerp(cbn[k], cb[k], sunk) : ib[k];
+			fp.band[k] = ctx->crisp ? cbd[k] * (0.72f + 0.28f * sunk) : ibd[k];
 			fp.crest[k] = ctx->crisp ? ccr[k] : icr[k];
-			fp.hiv[k] = ctx->crisp ? 0.6f : 0.2f;
+			fp.hiv[k] = ctx->crisp ? us_lerp(0.34f, 0.6f, sunk) : 0.2f;
 			if (winter > 0.5f) {
 				fp.m[k] = US_MAT_ACCENT;
 				fp.mh[k] = US_MAT_ACCENT;
@@ -1473,6 +1489,10 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 			} else {
 				fp.m[k] = k == 0 ? US_MAT_LEAF : US_MAT_STEM;
 				fp.mh[k] = US_MAT_LEAF;
+			}
+			if (ctx->crisp && sunk < 0.5f && winter <= 0.5f) {
+				fp.m[k] = US_MAT_EARTH;
+				fp.mh[k] = k == 0 ? US_MAT_LEAF : US_MAT_STEM;
 			}
 		}
 	}
@@ -1506,7 +1526,7 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 				float y = ridge(s, k, xc, A) + d * lay_drop[k];
 				if (have) {
 					if (ctx->crisp) {
-						float pv = (0.52f + 0.06f * winter) * dayv * lightk;
+						float pv = (0.52f + 0.06f * winter) * dayv * lightk * (0.6f + 0.4f * sunk);
 						otri(c, px0 - pw0 * 0.45f, py0, px0 + pw0 * 0.45f, py0, xc + hw * 0.45f, y, pv, US_MAT_EARTH);
 						otri(c, px0 - pw0 * 0.45f, py0, xc + hw * 0.45f, y, xc - hw * 0.45f, y, pv, US_MAT_EARTH);
 					} else {
@@ -1553,7 +1573,7 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 				vrow = k == 0 ? 0.0f : (k == 1 ? 0.5f : 0.42f + 0.25f * sc);
 			else
 				vrow = k == 0 ? 0.3f : (k == 1 ? 0.42f + 0.4f * sc : 0.5f + 0.3f * sc);
-			vrow *= dayv * lightk * (0.15f + 0.85f * lightk);
+			vrow *= dayv * lightk * (0.15f + 0.85f * lightk) * (ctx->crisp ? 0.62f + 0.38f * sunk : 1.0f);
 			if (vrow <= 0)
 				continue;
 			float push = s->kimp * (0.1f + 0.22f * sc); /* the kick's pressure: the whole field ducks, near more */
