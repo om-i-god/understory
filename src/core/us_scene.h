@@ -68,6 +68,7 @@ typedef struct us_engine {
 	uint32_t xf_count;
 	us_canvas disp;  /* composited display canvas used during a dissolve (and for bloom) */
 	float *bloom_buf;
+	float light_pulse; /* eased kick envelope that makes the bloom breathe with the music */
 	size_t bloom_n;
 } us_engine;
 

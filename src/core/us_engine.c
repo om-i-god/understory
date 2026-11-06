@@ -237,8 +237,15 @@ void us_engine_frame(us_engine *e, const us_audio *a_in, float dt, double clock_
 			e->bloom_buf = malloc(need * sizeof(float));
 			e->bloom_n = e->bloom_buf ? need : 0;
 		}
+		/* the light breathes with the music: kicks flare the glow, the phrase swell lifts it, and
+		 * silence leaves it exactly as set. Eased (≈0.25 s decay) so it never strobes. */
+		float kp = us_sat(a.kick * 0.8f + a.onset * 0.3f);
+		e->light_pulse = kp > e->light_pulse ? us_lerp(e->light_pulse, kp, 0.6f)
+						     : e->light_pulse * powf(0.5f, dt / 0.12f);
+		float act = us_sat(a.active);
+		float amt = e->look.bloom * (1.0f + act * (0.45f * e->light_pulse + 0.25f * (a.swell - 0.4f)));
 		if (e->bloom_buf)
-			us_bloom(&e->disp, e->look.bloom, e->bloom_buf);
+			us_bloom(&e->disp, us_clampf(amt, 0.0f, 1.6f * e->look.bloom + 0.05f), e->bloom_buf);
 	}
 	us_compose(&e->disp, &e->look, e->rgba);
 }
