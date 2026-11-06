@@ -224,16 +224,12 @@ void us_engine_frame(us_engine *e, const us_audio *a_in, float dt, double clock_
 				e->disp.mat[i] = e->canvas.mat[i];
 			}
 		}
-	} else if (us_style_is_ink(e->look.style) && e->look.bloom > 0.001f && e->disp.ink) {
-		size_t n = (size_t)e->canvas.w * e->canvas.h;
-		memcpy(e->disp.ink, e->canvas.ink, n);
-		memcpy(e->disp.mat, e->canvas.mat, n);
+		us_compose(&e->disp, &e->look, e->rgba);
 	} else {
 		us_compose(&e->canvas, &e->look, e->rgba);
-		return;
 	}
 	if (us_style_is_ink(e->look.style) && e->look.bloom > 0.001f) {
-		size_t need = us_bloom_scratch(e->disp.w, e->disp.h);
+		size_t need = us_bloom_scratch(e->canvas.w, e->canvas.h);
 		if (need > e->bloom_n) {
 			free(e->bloom_buf);
 			e->bloom_buf = malloc(need * sizeof(float));
@@ -247,7 +243,7 @@ void us_engine_frame(us_engine *e, const us_audio *a_in, float dt, double clock_
 		float act = us_sat(a.active);
 		float amt = e->look.bloom * (1.0f + act * (0.45f * e->light_pulse + 0.25f * (a.swell - 0.4f)));
 		if (e->bloom_buf)
-			us_bloom(&e->disp, us_clampf(amt, 0.0f, 1.6f * e->look.bloom + 0.05f), e->bloom_buf);
+			us_bloom_rgba(e->rgba, e->canvas.w, e->canvas.h, e->look.invert,
+				      us_clampf(amt, 0.0f, 1.6f * e->look.bloom + 0.05f), e->bloom_buf);
 	}
-	us_compose(&e->disp, &e->look, e->rgba);
 }

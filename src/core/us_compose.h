@@ -32,7 +32,7 @@ void us_compose(const us_canvas *c, const us_look *look, uint8_t *rgba);
  * ink_scale = canvas/output ratio for Ink. */
 void us_style_canvas_size(int style, int out_w, int out_h, int pixel_size, float ink_scale, int *cw, int *ch);
 
-/* Soft bloom: adds a blurred copy of the bright parts back onto c->ink, in place.
- * scratch must hold at least us_bloom_scratch(c->w, c->h) floats. */
+/* Soft bloom on the composed picture: adds a blurred copy of its bright parts back, in colour, in place
+ * (in paper mode it bleeds the ink instead). scratch must hold us_bloom_scratch(w, h) floats. */
 size_t us_bloom_scratch(int w, int h);
-void us_bloom(us_canvas *c, float amount, float *scratch);
+void us_bloom_rgba(uint8_t *rgba, int w, int h, int invert, float amount, float *scratch);

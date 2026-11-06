@@ -177,8 +177,8 @@ void us_compose(const us_canvas *c, const us_look *look, uint8_t *rgba)
 size_t us_bloom_scratch(int w, int h)
 {
 	size_t bw = (size_t)(w + BLOOM_DS - 1) / BLOOM_DS, bh = (size_t)(h + BLOOM_DS - 1) / BLOOM_DS;
-	/* blur buffers (3 planes) + glow-material planes (2 value + 2 byte planes) + one row of upsample scratch */
-	return bw * bh * 3 + bw * bh * 2 + (bw * bh + 1) / 2 + 2 + bw * 2 + (size_t)w / 4 + 4;
+	/* tight + wide planes per channel (6), one blur temp, one interpolated row per channel */
+	return bw * bh * 7 + bw * 3 + 16;
 }
 
 static void box_blur(float *a, float *tmp, int w, int h, int r)
@@ -207,125 +207,85 @@ static void box_blur(float *a, float *tmp, int w, int h, int r)
 	}
 }
 
-void us_bloom(us_canvas *c, float amount, float *scratch)
+/* Soft bloom in colour, after compose: a low-res copy of the bright parts of the picture is blurred at two
+ * scales and added back with bilinear upsampling. Working on RGB means a glow takes the real colour of the
+ * light that casts it and blends smoothly where two colours meet. In paper mode the same is done to the
+ * darkness, so ink bleeds softly into the paper instead. */
+void us_bloom_rgba(uint8_t *rgba, int w, int h, int invert, float amount, float *scratch)
 {
-	if (amount <= 0.001f || !c->ink)
+	if (amount <= 0.001f || !rgba || w < 1 || h < 1)
 		return;
-	int w = c->w, h = c->h;
 	int bw = (w + BLOOM_DS - 1) / BLOOM_DS, bh = (h + BLOOM_DS - 1) / BLOOM_DS;
-	float *a = scratch, *tmp = scratch + (size_t)bw * bh;
-	/* downsample: per block, mix of mean and max (thin 1px lines in a 4x4 block still bloom) — row-linear */
-	int *bsum = (int *)tmp, *bmax = bsum + bw; /* tmp holds bw*bh floats >= 2*bw ints */
 	size_t nb = (size_t)bw * bh;
-	float *gv = scratch + nb * 3, *gv2 = gv + nb;  /* brightest source value near each block   */
-	uint8_t *gm = (uint8_t *)(gv2 + nb), *gm2 = gm + nb; /* ...and its material (the glow's colour) */
+	float *tight = scratch, *wide = scratch + nb * 3, *tmp = scratch + nb * 6, *ir = scratch + nb * 7;
+	/* downsample: per block and channel, a mix of mean and max (1 px lines in a 4x4 block still glow) */
 	for (int by = 0; by < bh; by++) {
-		memset(bsum, 0, sizeof(int) * 2 * bw);
-		int y1 = by * BLOOM_DS + BLOOM_DS < h ? by * BLOOM_DS + BLOOM_DS : h, rows = y1 - by * BLOOM_DS;
-		for (int y = by * BLOOM_DS; y < y1; y++) {
-			const uint8_t *row = c->ink + (size_t)y * w;
-			const uint8_t *mrow = c->mat + (size_t)y * w;
-			for (int x = 0; x < w; x++) {
-				int v = row[x], b = x / BLOOM_DS;
-				bsum[b] += v;
-				if (v > bmax[b]) {
-					bmax[b] = v;
-					gm[(size_t)by * bw + b] = mrow[x];
-				}
-			}
-		}
+		int y0 = by * BLOOM_DS, y1 = y0 + BLOOM_DS < h ? y0 + BLOOM_DS : h;
 		for (int bx = 0; bx < bw; bx++) {
-			gv[(size_t)by * bw + bx] = (float)bmax[bx];
-			if (!bmax[bx])
-				gm[(size_t)by * bw + bx] = 0;
-			int cols = (bx + 1) * BLOOM_DS <= w ? BLOOM_DS : w - bx * BLOOM_DS;
-			float v = (0.5f * bsum[bx] / (float)(cols * rows) + 0.5f * bmax[bx]) / 255.0f;
-			a[(size_t)by * bw + bx] = v * v;
+			int x0 = bx * BLOOM_DS, x1 = x0 + BLOOM_DS < w ? x0 + BLOOM_DS : w;
+			int sum[3] = {0, 0, 0}, mx[3] = {0, 0, 0};
+			for (int y = y0; y < y1; y++) {
+				const uint8_t *p = rgba + ((size_t)y * w + x0) * 4;
+				for (int x = x0; x < x1; x++, p += 4)
+					for (int k = 0; k < 3; k++) {
+						int v = invert ? 255 - p[k] : p[k];
+						sum[k] += v;
+						mx[k] = v > mx[k] ? v : mx[k];
+					}
+			}
+			float cnt = (float)((y1 - y0) * (x1 - x0));
+			for (int k = 0; k < 3; k++) {
+				float v = (0.5f * sum[k] / cnt + 0.5f * mx[k]) / 255.0f - 0.04f; /* the ground itself never glows */
+				v = v > 0 ? v : 0;
+				tight[nb * k + (size_t)by * bw + bx] = v * v;
+			}
 		}
-	}
-	/* spread each bright source's material over the area its glow will cover (separable argmax, r=4) */
-	{
-		const int R = bw > 200 ? 8 : 4; /* = the wide blur's full reach, so no glow is left the wrong colour at a hard edge */
-		for (int y = 0; y < bh; y++)
-			for (int x = 0; x < bw; x++) {
-				float best = -1;
-				uint8_t bm = 0;
-				for (int d = -R; d <= R; d++) {
-					int xx = x + d;
-					if (xx < 0 || xx >= bw)
-						continue;
-					float v = gv[(size_t)y * bw + xx] * (1.0f - 0.08f * (d < 0 ? -d : d));
-					if (v > best) {
-						best = v;
-						bm = gm[(size_t)y * bw + xx];
-					}
-				}
-				gv2[(size_t)y * bw + x] = best;
-				gm2[(size_t)y * bw + x] = bm;
-			}
-		for (int y = 0; y < bh; y++)
-			for (int x = 0; x < bw; x++) {
-				float best = -1;
-				uint8_t bm = 0;
-				for (int d = -R; d <= R; d++) {
-					int yy = y + d;
-					if (yy < 0 || yy >= bh)
-						continue;
-					float v = gv2[(size_t)yy * bw + x] * (1.0f - 0.08f * (d < 0 ? -d : d));
-					if (v > best) {
-						best = v;
-						bm = gm2[(size_t)yy * bw + x];
-					}
-				}
-				gm[(size_t)y * bw + x] = bm;
-			}
 	}
 	/* two scales: a tight halo (point lights, lines) and a wide haze (big bright areas) */
-	float *wide = scratch + (size_t)bw * bh * 2;
-	memcpy(wide, a, sizeof(float) * (size_t)bw * bh);
-	box_blur(a, tmp, bw, bh, 1);
-	box_blur(a, tmp, bw, bh, 1);
+	memcpy(wide, tight, sizeof(float) * nb * 3);
 	int r = bw > 200 ? 4 : 2;
-	box_blur(wide, tmp, bw, bh, r);
-	box_blur(wide, tmp, bw, bh, r);
-	for (size_t i = 0, n = (size_t)bw * bh; i < n; i++)
-		a[i] = 0.55f * a[i] + 1.1f * wide[i];
+	for (int k = 0; k < 3; k++) {
+		box_blur(tight + nb * k, tmp, bw, bh, 1);
+		box_blur(tight + nb * k, tmp, bw, bh, 1);
+		box_blur(wide + nb * k, tmp, bw, bh, r);
+		box_blur(wide + nb * k, tmp, bw, bh, r);
+	}
+	for (size_t i = 0; i < nb * 3; i++)
+		tight[i] = 0.55f * tight[i] + 1.1f * wide[i];
 	/* upsample bilinear + add. With a 4x factor the 4 pixels of block k sample at fixed offsets:
 	 * k-0.375, k-0.125 (between k-1 and k) and k+0.125, k+0.375 (between k and k+1). */
 	float gain = 255.0f * 2.0f * amount;
-	float *ir = tmp; /* one interpolated row, bw wide (tmp is free after the blur) */
 	static const float TX[4] = {0.625f, 0.875f, 0.125f, 0.375f};
 	for (int y = 0; y < h; y++) {
 		float fy = (y + 0.5f) / BLOOM_DS - 0.5f;
 		int y0 = (int)floorf(fy);
 		float ty = fy - y0;
 		int ya = y0 < 0 ? 0 : (y0 >= bh ? bh - 1 : y0), yb = y0 + 1 >= bh ? bh - 1 : (y0 + 1 < 0 ? 0 : y0 + 1);
-		const float *ra = a + (size_t)ya * bw, *rb = a + (size_t)yb * bw;
-		for (int bx = 0; bx < bw; bx++)
-			ir[bx] = (ra[bx] + (rb[bx] - ra[bx]) * ty) * gain;
-		uint8_t *row = c->ink + (size_t)y * w;
-		uint8_t *addrow = (uint8_t *)(ir + bw); /* w bytes after the interpolated row */
-		int any = 0;
-		for (int k = 0; k < bw; k++) {
-			float l = ir[k > 0 ? k - 1 : 0], m = ir[k], r = ir[k + 1 < bw ? k + 1 : bw - 1];
-			int x = k * BLOOM_DS;
-			for (int j = 0; j < BLOOM_DS && x + j < w; j++) {
-				float v = j < 2 ? l + (m - l) * TX[j] : m + (r - m) * TX[j];
-				int ad = v > 255.0f ? 255 : (int)v;
-				addrow[x + j] = (uint8_t)ad;
-				any |= ad;
+		float rowmax = 0;
+		for (int k = 0; k < 3; k++) {
+			const float *ra = tight + nb * k + (size_t)ya * bw, *rb = tight + nb * k + (size_t)yb * bw;
+			float *o = ir + (size_t)bw * k;
+			for (int bx = 0; bx < bw; bx++) {
+				o[bx] = (ra[bx] + (rb[bx] - ra[bx]) * ty) * gain;
+				rowmax = o[bx] > rowmax ? o[bx] : rowmax;
 			}
 		}
-		if (!any)
+		if (rowmax < 0.5f)
 			continue;
-		const uint8_t *gmrow = gm + (size_t)(y / BLOOM_DS < bh ? y / BLOOM_DS : bh - 1) * bw;
-		uint8_t *mrow = c->mat + (size_t)y * w;
-		for (int x = 0; x < w; x++) {
-			unsigned ad = addrow[x], o = (unsigned)row[x] + ad;
-			/* where the glow outshines what is drawn here, it takes the colour of the light that cast it */
-			if (ad > row[x] && gmrow[x / BLOOM_DS])
-				mrow[x] = gmrow[x / BLOOM_DS];
-			row[x] = (uint8_t)(o > 255 ? 255 : o);
+		uint8_t *row = rgba + (size_t)y * w * 4;
+		for (int bk = 0; bk < bw; bk++) {
+			int x = bk * BLOOM_DS;
+			for (int c = 0; c < 3; c++) {
+				const float *o = ir + (size_t)bw * c;
+				float l = o[bk > 0 ? bk - 1 : 0], m = o[bk], rr = o[bk + 1 < bw ? bk + 1 : bw - 1];
+				for (int j = 0; j < BLOOM_DS && x + j < w; j++) {
+					float v = j < 2 ? l + (m - l) * TX[j] : m + (rr - m) * TX[j];
+					int ad = v > 255.0f ? 255 : (int)v;
+					uint8_t *px = row + (size_t)(x + j) * 4 + c;
+					int nv = invert ? (int)*px - ad : (int)*px + ad;
+					*px = (uint8_t)(nv < 0 ? 0 : nv > 255 ? 255 : nv);
+				}
+			}
 		}
 	}
 }
