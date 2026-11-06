@@ -1,23 +1,24 @@
 /* Understory scene: Aurora — curtains of light over a still northern lake.
  *
- * Each curtain is a ribbon path through the sky whose travelling folds double it back on itself,
- * with hundreds of fine vertical rays hanging upward from a sharp, bright lower rim, drawn
- * additively so folds and overlaps glow. Rays are graded: a bright lower rim, a green body, a faint magenta
- * fringe at the top (BLOOM in Pixel palettes). Ripples travel along the ribbon.
- * Audio: stereo width + highs/air -> ripple speed and ray flicker; bass/kick -> brightness surge
- *        (the curtain "breathes" brighter on every low hit); centroid -> curtain height.
- *        kick -> a pulse of light running outward along each curtain; bands[] -> each stretch of a
- *        curtain lights and lengthens with its own band; sub -> a red lower border below the rim, and
- *        the lake ice booms (a crack glints); air -> stars scintillate; strong onsets -> the odd
- *        shooting star; lowmid -> the cabin hearth (window + smoke); width -> curtain spread;
- *        swell -> curtain count + the quiet arc.
+ * Each curtain is a ribbon path through the sky whose travelling folds double it back on itself. Its
+ * light is deposited into a low-res emission field (columns hanging up from a sharp lower rim: a
+ * green body fading with height, turning to a dimmer pink fringe at the same fraction of every column,
+ * so the colour change is one coherent band). The field is soft-saturated (folds seen edge-on glow, never
+ * a slab), then drawn with a screen-space texture of fine vertical rays and a fine bright rim line.
+ * Audio: kick -> the curtain's lower body flashes and a pulse of light runs outward along its folds;
+ *        snare -> a corona flare: the pink fringe blazes and drops, the curtains stretch upward, and a
+ *        sudden fold snaps into one curtain and relaxes; hats -> a fresh scatter of fine rays flares and
+ *        stars glint; loudness -> brightness + curtain height (quiet sinks to a faint breathing arc);
+ *        swell -> curtain count; bands[] -> each stretch of a curtain lights and lengthens with its own
+ *        band; centroid -> curtain height; width/high/air -> ripple speed, ray drift and flicker; width ->
+ *        curtain spread; sub -> a red lower border under the rim, and the lake ice booms (a crack glints);
+ *        strong onsets -> the odd shooting star; lowmid -> the cabin hearth (window + smoke).
  * World: daylight (by day only a pale washed ghost remains), season (strongest in winter),
- *        storm_charge (a geomagnetic storm: more curtains, taller red fringes, faster motion).
- * Silence: curtains keep folding slowly with a 9 s breath, a quiet arc glows low over the ridge,
+ *        storm_charge (a geomagnetic storm: more curtains, lower/brighter pink fringes, faster motion).
+ * Silence: curtains keep folding slowly, a quiet arc breathes low over the ridge (about 9 s), rays drift,
  *        stars twinkle, the odd meteor falls, a fox sometimes trots along the shore past the lit cabin.
- * The scene is reflected (compressed, wobbling) in the lake below the treeline: curtains, their
- * rims, the far ridge and the spruce stand. The reflection carries the whole curtain (fringe colour
- * included); the sky's glow lights the snowy crests, the foothills and a glimmer on the water.
+ * The lake mirrors the same light field about the shore (rows wobbling and broken by ripples, hidden
+ * behind the mirrored ridge); the sky's glow lights the snowy crests, the foothills and a glimmer on the water.
  */
 #include "../core/us_scene.h"
 #include "../core/us_math.h"
@@ -25,7 +26,13 @@
 #include <string.h>
 
 #define MAX_CURT 5
-#define MAX_RAYS 560
+#define MAX_RAYS 520  /* fine rays in the screen-space ray texture */
+#define GW 192        /* emission field: the sky as a low-res grid of light, x across the width */
+#define GH 128        /* ... and y over [0, SKY_Y] */
+#define SKY_Y 0.74f
+#define NSAMP 240     /* samples along each curtain's ribbon */
+#define MAXCOL 8192   /* per-column scratch (ray texture, ridge line) */
+#define MAX_FOLD 3
 #define MAX_STARS 500
 #define MAX_TREES 110
 
@@ -70,9 +77,20 @@ typedef struct {
 	/* reactive envelopes */
 	float bandv[US_NBANDS]; /* per-band envelopes: each band lights its own stretch of curtain */
 	float sub_env, air_env, lm_env, spread;
-	float pulse_age[MAX_PULSE]; /* kick pulses running outward along the curtains */
+	float pulse_age[MAX_PULSE]; /* kick pulses running outward along the curtains from pulse_u */
+	float pulse_u[MAX_PULSE];
 	int pulse_i;
-	float kick_cool, met_cool;
+	float kick_cool, met_cool, snare_cool;
+	/* snare: a sudden fold snaps into one curtain and relaxes */
+	float fold_age[MAX_FOLD], fold_u[MAX_FOLD], fold_amp[MAX_FOLD];
+	int fold_c[MAX_FOLD], fold_i;
+	float lvl_env, rayT;
+	uint32_t hat_seed; /* each hat re-picks which rays flare */
+	/* per frame: the emission field (light + pinkness), the ray texture, the ridge per column */
+	float fld[GH * GW], pk[GH * GW];
+	int gw, gh; /* the field's size this frame: full in ink, half on crisp (pixel) canvases */
+	short rmin[GH], rmax[GH];
+	float colR[MAXCOL], ridgeAt[MAXCOL];
 	/* ice cracks along the near lake edge; sub hits make the ice boom and a crack glints */
 	float crack[MAX_CRACK][2 * CRACK_PTS];
 	float crack_g[MAX_CRACK];
@@ -99,42 +117,170 @@ static float hash1(int k, float seed)
 	return (h & 0xffffff) / 16777216.0f;
 }
 
-/* One ray, rasterised row by row: smooth brightness profile from a sharp lower rim fading upward,
- * green body (LEAF) turning to a magenta fringe (BLOOM) above fringe_t. dir = -1 draws upward (sky),
- * +1 draws downward (reflection). */
-static void ray(us_canvas *c, float x, float yb, float ln, float lean, float b, float fringe_t, int dir, uint8_t body, float flat)
+/* One column of curtain light, deposited into the emission field. The column hangs upward from the
+ * lower rim at yb for ln: a sharp lower edge, a green body fading with height, turning to a dimmer pink
+ * fringe above fr (a fraction of ln, the same for every column of a curtain, so the colour change is one
+ * coherent band, never speckle). kick brightens the lower body, pinkb scales the fringe, and below the
+ * rim hangs an optional red border (subd deep, subb bright). b is the column's brightness. */
+static void deposit(st_t *s, float A, float x, float yb, float ln, float b, float fr, float pinkb, float kick,
+		    float subd, float subb, float lean)
 {
-	float S = c->s;
-	float py0 = yb * S, len = ln * S;
-	if (len < 1.0f || b < 0.004f)
+	if (b < 1e-4f || ln < 0.004f || !(x == x) || !(yb == yb))
 		return;
-	int n = (int)len;
-	float e = 1.0f, ek = expf(-2.6f / len);
-	for (int i = 0; i <= n; i++, e *= ek) {
-		float t = i / len;
-		float py = py0 + dir * i;
-		int iy = (int)floorf(py);
-		if (iy < 0 || iy >= c->h) {
-			if ((dir < 0 && iy < 0) || (dir > 0 && iy >= c->h))
-				break;
-			continue;
+	int GWr = s->gw, GHr = s->gh;
+	float cw = A / GWr, ch = SKY_Y / GHr;
+	float gx0 = x / cw - 0.5f, glean = lean * ch / cw; /* columns shifted per row of height */
+	float gtop = gx0 + glean * (ln / ch + 1.0f);
+	if ((gx0 < -3.0f && gtop < -3.0f) || (gx0 > GWr + 2.0f && gtop > GWr + 2.0f))
+		return;
+	int cx[4], nc = 0;
+	float cwt[4];
+	(void)gtop;
+	int jr = (int)floorf(yb / ch - 0.5f); /* last row centre at or above the rim */
+	int jt = (int)floorf((yb - ln) / ch);
+	int jb = (int)ceilf((yb + subd) / ch + 0.5f);
+	if (jt < 0) jt = 0;
+	if (jb > GHr - 1) jb = GHr - 1;
+	if (jr > GHr - 1) jr = GHr - 1;
+	float il = 1.0f / ln, ich = 1.0f / ch;
+	/* walk upward from the rim: exponentials advance by a constant factor per row */
+	float h0 = yb - (jr + 0.5f) * ch;
+	float eg = expf(-2.4f * h0 * il), ek = expf(-7.0f * h0 * il), em = expf(-1.1f * h0 * il);
+	float kg = expf(-2.4f * ch * il), kk = expf(-7.0f * ch * il), km = expf(-1.1f * ch * il);
+	float fa = fr - 0.14f, fb = fr + 0.14f;
+	for (int j = jr; j >= jt; j--, eg *= kg, ek *= kk, em *= km) {
+		if (j < 0)
+			break;
+		float h = yb - (j + 0.5f) * ch;
+		float t = h * il;
+		if (t >= 1.0f)
+			break;
+		float p = t > fa ? us_smooth(fa, fb, t) : 0.0f;
+		float I = (1.0f - p) * eg * (1.0f + 1.6f * kick * ek) + p * 0.36f * pinkb * em;
+		if (h < 0.5f * ch)
+			I *= us_sat(0.5f + h * ich);
+		if (t > 0.7f)
+			I *= 1.0f - us_smooth(0.7f, 1.0f, t);
+		/* a soft horizontal tent (2 cells each side), so folds seen edge-on glow without hard walls */
+		float gx = gx0 + glean * (h > 0.0f ? h * ich : 0.0f);
+		int c0 = (int)floorf(gx - 2.0f) + 1;
+		float *fr_ = s->fld + j * GWr, *pr_ = s->pk + j * GWr, Ib = I * b, Ipb = Ib * p;
+		for (int k = 0; k < 4; k++) {
+			int ci = c0 + k;
+			float wv = (1.0f - fabsf(ci - gx) * 0.5f) * 0.5f;
+			if ((unsigned)ci < (unsigned)GWr && wv > 0.0f) {
+				fr_[ci] += wv * Ib;
+				pr_[ci] += wv * Ipb;
+			}
 		}
-		float v = b * (0.16f + 0.84f * (flat + (1.0f - flat) * e));
-		if (t < 0.05f)
-			v *= us_smooth(0.0f, 0.05f, t);
-		else if (t > 0.8f)
-			v *= us_smooth(1.0f, 0.8f, t);
-		uint8_t m = t > fringe_t ? US_MAT_BLOOM : body;
-		if (t > fringe_t)
-			v *= 1.25f;
-		float px = (x + lean * t) * S - 0.5f;
-		if (c->crisp) {
-			us_put(c, (int)floorf(px + 0.5f), iy, v, m);
-		} else {
-			int ix = (int)floorf(px);
-			float fx = px - ix;
-			us_put(c, ix, iy, v * (1.0f - fx), m);
-			us_put(c, ix + 1, iy, v * fx, m);
+	}
+	/* below the rim: the edge's anti-aliased fall-off, and the red lower border */
+	for (int j = jr + 1; j <= jb; j++) {
+		if (j < 0)
+			continue;
+		float h = yb - (j + 0.5f) * ch; /* negative */
+		float I = us_sat(0.5f + h * ich), p = 0.0f;
+		if (subd > 1e-4f) {
+			float sI = subb * us_sat(1.0f + h / subd);
+			if (sI > I) {
+				p = 1.0f;
+				I = sI;
+			}
+		}
+		if (I <= 0.0f)
+			continue;
+		/* a soft horizontal tent (2 cells each side), so folds seen edge-on glow without hard walls */
+		float gx = gx0 + glean * (h > 0.0f ? h * ich : 0.0f);
+		nc = 0;
+		int c0 = (int)floorf(gx - 2.0f) + 1;
+		for (int k = 0; k < 4; k++) {
+			int ci = c0 + k;
+			float wv = (1.0f - fabsf(ci - gx) * 0.5f) * 0.5f;
+			if (ci >= 0 && ci < GWr && wv > 0.0f) {
+				cx[nc] = ci;
+				cwt[nc++] = wv * b;
+			}
+		}
+		float *fr_ = s->fld + j * GWr, *pr_ = s->pk + j * GWr, Ip = I * p;
+		for (int k = 0; k < nc; k++) {
+			fr_[cx[k]] += cwt[k] * I;
+			pr_[cx[k]] += cwt[k] * Ip;
+		}
+	}
+}
+
+/* Rasterise the emission field (bilinear) into the canvas with MAX blend, sky rows [py0, py1) mapped from
+ * sky altitude ys(py) = ya + (py+0.5)/S * yk (yk = 1 for the sky, -2 for the mirrored lake), each row
+ * shifted by xoff(py) px and scaled by rowv(py). Light is the field times the ray texture; colour is
+ * green, or pink where the field says so. Columns whose sky point sits below the ridge are skipped. */
+static void raster(st_t *s, us_canvas *c, float A, int py0, int py1, float ya, float yk, float gain, int mirror, double t)
+{
+	int GWr = s->gw, GHr = s->gh;
+	float S = c->s, cw = A / GWr, ch = SKY_Y / GHr;
+	int W = c->w < MAXCOL ? c->w : MAXCOL;
+	if (py0 < 0) py0 = 0;
+	if (py1 > c->h) py1 = c->h;
+	float cpx = cw * S; /* pixels per field cell */
+	float rowV[GW + 1], rowP[GW + 1];
+	for (int py = py0; py < py1; py++) {
+		float y = ya + (py + 0.5f) / S * yk;
+		if (y < 0.0f || y >= SKY_Y)
+			continue;
+		float fy = y / ch - 0.5f;
+		int iy = (int)floorf(fy);
+		float ty = fy - iy;
+		int iy0 = iy < 0 ? 0 : iy, iy1 = iy + 1 > GHr - 1 ? GHr - 1 : iy + 1;
+		if (iy0 > GHr - 1) iy0 = GHr - 1;
+		int cmin = s->rmin[iy0] < s->rmin[iy1] ? s->rmin[iy0] : s->rmin[iy1];
+		int cmax = s->rmax[iy0] > s->rmax[iy1] ? s->rmax[iy0] : s->rmax[iy1];
+		if (cmax < cmin)
+			continue;
+		float rv = gain, xo = 0.0f;
+		if (mirror) { /* the lake: rows wobble sideways and break into ripples, dimmer with depth */
+			float yy = (py + 0.5f) / S;
+			xo = S * (0.0045f * us_noise2(yy * 70.0f, (float)t * 0.6f) + 0.0018f * us_noise2(yy * 210.0f, (float)t * 1.4f));
+			rv *= (0.6f + 0.4f * us_sat(0.55f + 0.9f * us_noise2(yy * 130.0f, (float)t * 0.45f))) * (1.0f - 1.2f * (yy - SHORE));
+			if (rv <= 0.0f)
+				continue;
+		}
+		/* the two field rows, blended once per canvas row */
+		const float *f0 = s->fld + iy0 * GWr, *f1 = s->fld + iy1 * GWr, *p0 = s->pk + iy0 * GWr, *p1 = s->pk + iy1 * GWr;
+		int a0 = cmin > 0 ? cmin - 1 : 0, a1 = cmax + 1 < GWr - 1 ? cmax + 1 : GWr - 1;
+		for (int i = a0; i <= a1; i++) {
+			rowV[i] = (f0[i] + (f1[i] - f0[i]) * ty) * rv;
+			rowP[i] = p0[i] + (p1[i] - p0[i]) * ty;
+		}
+		uint8_t *ink = c->ink + (size_t)py * c->w, *mat = c->mat + (size_t)py * c->w;
+		/* walk cell to cell (centres i and i+1); skip spans that are dark at both ends */
+		float icpx = 1.0f / cpx;
+		int ixo = (int)floorf(xo + 0.5f);
+		for (int i = a0; i < a1; i++) {
+			float va = rowV[i], vb = rowV[i + 1];
+			if (va < 0.004f && vb < 0.004f)
+				continue;
+			int px0 = (int)ceilf((i + 0.5f) * cpx - 0.5f - xo), px1 = (int)ceilf((i + 1.5f) * cpx - 0.5f - xo);
+			if (i == 0 && px0 > 0) px0 = 0; /* the field's edge columns extend to the canvas edges */
+			if (i + 1 == GWr - 1) px1 = W;
+			if (px0 < 0) px0 = 0;
+			if (px1 > W) px1 = W;
+			if (px1 <= px0)
+				continue;
+			float pa = rowP[i], pb = rowP[i + 1];
+			float tx = (px0 + 0.5f + xo) * icpx - 0.5f - i;
+			float dV = (vb - va) * icpx, dP = (pb - pa) * icpx;
+			float V = va + (vb - va) * tx, P = pa + (pb - pa) * tx;
+			for (int px = px0; px < px1; px++, V += dV, P += dP) {
+				int sx = px + ixo;
+				if ((unsigned)sx >= (unsigned)W || y > s->ridgeAt[sx] || V < 0.004f)
+					continue;
+				float v = V * (1.0f + (s->colR[sx] - 1.0f) * (0.75f + 0.5f * P));
+				int iv = (int)(v * 255.0f);
+				if (iv > 255) iv = 255;
+				if (iv > ink[px]) {
+					ink[px] = (uint8_t)iv;
+					mat[px] = P > 0.6f ? US_MAT_BLOOM : US_MAT_LEAF;
+				}
+			}
 		}
 	}
 }
@@ -172,10 +318,10 @@ static void rim(us_canvas *c, float ax, float ay, float bx, float by, float v, u
  * their sway outruns the span) */
 static float curtain_u2x(const curtain_t *cu, float u, float T, float spread)
 {
-	float fa = u * US_TAU * 1.3f + T * 0.55f + cu->seed;
-	float fb = u * US_TAU * 2.7f - T * 0.4f + cu->seed * 1.7f;
-	float env = 0.35f + 0.65f * sinf(US_PI * us_sat(u));
-	float fold = cu->fold * (env * (0.42f * sinf(fa) + 0.18f * sinf(fb)) + 0.9f * us_fbm2(u * 1.8f + T * 0.3f, cu->seed, 2));
+	float fa = u * US_TAU * 1.8f + T * 0.55f + cu->seed;
+	float fb = u * US_TAU * 3.1f - T * 0.4f + cu->seed * 1.7f;
+	float env = sinf(US_PI * us_sat(u)); /* the ends run straight out: no fold turns back at an end */
+	float fold = cu->fold * env * (0.62f * sinf(fa) + 0.2f * sinf(fb) + 0.9f * us_fbm2(u * 1.8f + T * 0.3f, cu->seed, 2));
 	return cu->xc + cu->span * spread * (u - 0.5f) + fold;
 }
 
@@ -248,6 +394,8 @@ static void *create(uint32_t seed)
 	s->next_meteor = us_randr(r, 5, 20);
 	for (int i = 0; i < MAX_PULSE; i++)
 		s->pulse_age[i] = 9.0f;
+	for (int i = 0; i < MAX_FOLD; i++)
+		s->fold_age[i] = 9.0f;
 	s->spread = 1.0f;
 	/* ice cracks: wandering, mostly shore-parallel lines in the near water at both edges */
 	for (int i = 0; i < MAX_CRACK; i++) {
@@ -432,14 +580,16 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 	float winter = us_world_season_w(w, 3), summer = us_world_season_w(w, 1);
 	float day = w->daylight, storm = w->storm_charge;
 	float night = 1.0f - 0.6f * us_smooth(0.15f, 0.8f, day);
+	float kick = us_sat(a->kick), snare = us_sat(a->snare), hat = us_sat(a->hat);
 
 	/* ---- envelopes ---- */
-	s->surge = us_approach(s->surge, us_sat(0.8f * a->bass + 0.7f * a->kick + 0.2f * a->sub), a->kick > s->surge ? 0.05f : 0.6f, rdt);
-	float sh = us_sat(0.55f * a->width + 0.35f * a->high + 0.5f * a->air);
+	s->lvl_env = us_approach(s->lvl_env, us_sat(a->level), a->level > s->lvl_env ? 0.12f : 0.4f, rdt);
+	float sh = us_sat(0.45f * a->width + 0.35f * a->high + 0.5f * a->air);
 	s->shimmer = us_approach(s->shimmer, sh, 0.4f, rdt);
 	s->height = us_approach(s->height, a->active > 0.2f ? a->centroid : 0.4f, 2.0f, rdt);
-	s->T += dt * (0.05f + 0.06f * storm + 0.04f * a->swell);
-	s->flick_t += rdt * (2.0f + 10.0f * s->shimmer);
+	s->T += dt * (0.075f + 0.06f * storm + 0.05f * a->swell + 0.03f * s->lvl_env);
+	s->flick_t += rdt * (2.2f + 4.0f * s->shimmer);
+	s->rayT += dt * (0.9f + 1.6f * s->shimmer + storm);
 	s->twk += rdt * (1.7f + 5.0f * s->air_env);
 	/* each band: quick to light (~0.06 s), slow to let go (~0.35 s) */
 	for (int i = 0; i < US_NBANDS; i++) {
@@ -451,31 +601,54 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 	s->lm_env = us_approach(s->lm_env, a->lowmid, 0.8f, rdt);
 	/* stereo width spreads the curtains across the sky (slowly) */
 	s->spread = us_approach(s->spread, 0.82f + 0.4f * a->width, 2.5f, rdt);
-	/* kick: a pulse of light runs outward along every curtain from its middle */
+	/* hats: the rays shimmer -- each hat re-picks which fine rays flare, and the flicker jumps on */
+	if (a->hat_hit) {
+		s->hat_seed = s->hat_seed * 1664525u + 1013904223u;
+		s->flick_t += 0.5f;
+	}
+	/* kick: a pulse of light runs outward along every curtain's folds from a point on it */
 	s->kick_cool -= rdt;
 	for (int i = 0; i < MAX_PULSE; i++)
 		s->pulse_age[i] += rdt;
-	if (a->beat && a->kick > 0.4f && s->kick_cool <= 0) {
+	if (a->kick_hit && s->kick_cool <= 0) {
 		s->pulse_i = (s->pulse_i + 1) % MAX_PULSE;
 		s->pulse_age[s->pulse_i] = 0;
-		s->kick_cool = 0.22f;
+		s->pulse_u[s->pulse_i] = us_randr(r, 0.25f, 0.75f);
+		s->kick_cool = 0.12f;
 	}
 	float pamp[MAX_PULSE], pdist[MAX_PULSE];
 	for (int i = 0; i < MAX_PULSE; i++) {
 		float ag = s->pulse_age[i];
-		/* eases in over ~40 ms, out over ~0.45 s; the front slows as it spreads */
-		pamp[i] = ag < 1.5f ? us_smooth(0.0f, 0.04f, ag) * expf(-ag / 0.32f) : 0.0f;
-		pdist[i] = 0.75f * (1.0f - expf(-ag / 0.45f));
+		/* eases in over ~30 ms, out over ~0.4 s; the front slows as it spreads */
+		pamp[i] = ag < 1.5f ? us_smooth(0.0f, 0.03f, ag) * expf(-ag / 0.3f) : 0.0f;
+		pdist[i] = 0.55f * (1.0f - expf(-ag / 0.35f));
+	}
+	/* snare: a sudden fold snaps into one curtain (a corona-like kink) and relaxes */
+	s->snare_cool -= rdt;
+	for (int i = 0; i < MAX_FOLD; i++)
+		s->fold_age[i] += rdt;
+	if (a->snare_hit && s->snare_cool <= 0) {
+		s->fold_i = (s->fold_i + 1) % MAX_FOLD;
+		s->fold_age[s->fold_i] = 0;
+		s->fold_u[s->fold_i] = us_randr(r, 0.2f, 0.8f);
+		s->fold_amp[s->fold_i] = us_randr(r, 0.035f, 0.06f) * (us_rand(r) < 0.5f ? -1.0f : 1.0f);
+		s->fold_c[s->fold_i] = (int)(us_rand(r) * MAX_CURT) % MAX_CURT;
+		s->snare_cool = 0.1f;
+	}
+	float famp[MAX_FOLD];
+	for (int i = 0; i < MAX_FOLD; i++) {
+		float ag = s->fold_age[i];
+		famp[i] = ag < 2.0f ? us_smooth(0.0f, 0.035f, ag) * expf(-ag / 0.45f) * cosf(ag * 7.0f) : 0.0f;
 	}
 	/* sub: the ice booms; one crack glints and fades */
 	for (int i = 0; i < MAX_CRACK; i++)
 		s->crack_g[i] = us_approach(s->crack_g[i], 0.0f, 0.5f, rdt);
-	if (a->beat && a->sub > 0.55f) {
+	if (a->kick_hit && a->sub > 0.55f) {
 		int ci = (int)(us_rand(r) * MAX_CRACK) % MAX_CRACK;
 		s->crack_g[ci] = us_sat(s->crack_g[ci] + 0.5f + 0.5f * a->sub);
 	}
 	/* quiet passages: the sky still breathes, slowly (about a 9 s breath) */
-	float quiet = 1.0f - us_sat(1.4f * s->surge);
+	float quiet = 1.0f - us_sat(1.6f * s->lvl_env);
 	float breath = 0.5f + 0.5f * sinf((float)ctx->t * (US_TAU / 9.0f));
 
 	/* ---- how many curtains: density + geomagnetic storm + loudness ---- */
@@ -503,23 +676,37 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 	}
 
 	/* pixel styles quantise a faint ghost away against the banded day sky: keep more of it there */
-	float strength = (0.55f + 0.45f * winter - 0.15f * summer) * (ctx->crisp ? (night > 0.95f ? night : 0.95f) : night);
-	float cov = us_clampf(c->s / 620.0f, 0.22f, 1.0f); /* rays per pixel compensation */
+	float strength = (0.55f + 0.45f * winter - 0.15f * summer) * (ctx->crisp ? (night > 0.95f ? night : 0.95f) : night * night);
 
-	/* ---- stars ---- */
+	/* the ridge line, per canvas column (the aurora hangs behind the mountains, and so does its reflection) */
+	int W = c->w < MAXCOL ? c->w : MAXCOL;
+	{
+		float rt[97];
+		for (int i = 0; i <= 96; i++)
+			rt[i] = ridge_y(i / 96.0f);
+		for (int px = 0; px < W; px++) {
+			float uu = us_sat((px + 0.5f) / c->s / A) * 96.0f;
+			int i = (int)uu;
+			if (i > 95) i = 95;
+			s->ridgeAt[px] = us_lerp(rt[i], rt[i + 1], uu - i) - 0.002f;
+		}
+	}
+
+	/* ---- stars: hats make a scatter of them glint ---- */
 	{
 		int ns = (int)(MAX_STARS * (0.25f + 0.75f * dens));
 		float sv = us_sat(1.0f - day * 1.6f);
 		if (sv > 0.01f)
 			for (int i = 0; i < ns; i++) {
 				star_t *t = &s->st[i];
-				float x = t->x * A;
-				if (t->y > ridge_y(t->x) - 0.01f)
+				int px = (int)(t->x * A * c->s);
+				if (px < 0 || px >= W || t->y > s->ridgeAt[px] - 0.008f)
 					continue;
-				/* air (hats, breath, cymbal wash) sets the stars scintillating */
 				float tw = 0.75f + (0.25f + 0.3f * s->air_env) * us_noise2(t->tw, s->twk);
+				if (hat > 0.02f && hash1(i, (float)(s->hat_seed & 0xffff)) < 0.22f)
+					tw += 1.6f * hat;
 				float v = t->m * tw * sv * (ctx->crisp ? 0.9f : 1.1f);
-				us_point(c, x, t->y, t->m > 0.7f ? 0.0016f : 0.0011f, v, US_MAT_LIGHT);
+				us_point(c, t->x * A, t->y, t->m > 0.7f ? 0.0016f : 0.0011f, v, US_MAT_LIGHT);
 			}
 	}
 
@@ -547,165 +734,183 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 			0.0012f, v * 0.8f, US_MAT_LIGHT);
 	}
 
-	/* ---- curtains ---- */
-	float glow[64];
-	memset(glow, 0, sizeof(glow));
-	c->blend = US_BLEND_ADD;
-	int nr = (int)(130 + 250 * dens);
-	if (nr > MAX_RAYS)
-		nr = MAX_RAYS;
-	float rip_speed = 0.5f + 5.0f * s->shimmer + 2.0f * storm;
-	float flick_amt = 0.12f + 0.75f * s->shimmer;
-	float L0 = 0.17f + 0.24f * s->height + 0.06f * storm;
+	/* ---- the ray texture: fine vertical rays across the sky, drifting and shimmering ---- */
+	{
+		float base = ctx->crisp ? 0.8f : 0.62f;
+		for (int px = 0; px < W; px++)
+			s->colR[px] = base;
+		int nray = (int)(160 + 360 * dens);
+		if (nray > MAX_RAYS)
+			nray = MAX_RAYS;
+		float hs = (float)(s->hat_seed & 0xffff);
+		float amp_k = ctx->crisp ? 0.3f : 1.1f;
+		for (int i = 0; i < nray; i++) {
+			float h1 = hash1(i, 1.3f), h2 = hash1(i + 5003, 1.3f), h3 = hash1(i + 9001, 1.3f);
+			float xr = h1 + s->rayT * 0.03f * (h2 - 0.5f) + 0.007f * sinf(s->rayT * (0.7f + h3) + h1 * 40.0f);
+			xr -= floorf(xr);
+			float amp = (0.2f + 0.8f * h3 * h3) * (0.6f + 0.5f * us_noise2(i * 0.71f, s->flick_t));
+			if (hash1(i, hs) < 0.3f)
+				amp += 1.6f * hat;
+			amp *= amp_k;
+			float px = xr * W - 0.5f;
+			int ix = (int)floorf(px);
+			float fx = px - ix;
+			if (ix >= 0 && ix < W)
+				s->colR[ix] += amp * (1.0f - fx);
+			if (ix + 1 >= 0 && ix + 1 < W)
+				s->colR[ix + 1] += amp * fx;
+		}
+	}
+
+	/* ---- curtains: deposited into the emission field ---- */
+	s->gw = ctx->crisp ? GW / 2 : GW;
+	s->gh = ctx->crisp ? GH / 2 : GH;
+	memset(s->fld, 0, sizeof(float) * s->gw * s->gh);
+	memset(s->pk, 0, sizeof(float) * s->gw * s->gh);
+	float L0 = (0.11f + 0.16f * s->lvl_env + 0.12f * s->height + 0.06f * storm) * (1.0f + 0.3f * snare);
 	float lift = 0.07f * (s->height - 0.4f);
+	float rip_speed = 1.2f + 4.5f * s->shimmer + 2.0f * storm;
 	float nact = 0;
 	for (int ci = 0; ci < MAX_CURT; ci++)
 		nact += s->cu[ci].life;
-	/* more curtains share the light: brightness grows sub-linearly with their number */
-	/* quiet keeps a floor (and breathes) so a breakdown still glows; loud passages are unchanged */
-	float bright = strength * (0.44f + 0.5f * quiet * (0.75f + 0.5f * breath) + 0.9f * s->surge + 0.15f * a->level) * (0.95f + 0.2f * storm) / powf(nact > 1.5f ? nact / 1.5f : 1.0f, 0.7f);
-	float fringe = us_sat(0.62f - 0.25f * storm - 0.12f * s->surge);
+	float share = 1.0f / powf(nact > 1.5f ? nact / 1.5f : 1.0f, 0.5f);
+	/* the pink fringe: lower with a storm; a snare flares it and pulls it down the curtain */
+	float fringe = us_clampf(0.6f - 0.2f * storm - 0.12f * snare, 0.2f, 0.9f);
+	float pinkb = 1.0f + 2.2f * snare + 0.6f * storm;
 	float subf = us_sat(1.3f * s->sub_env - 0.05f);
+	float rimx[MAX_CURT][NSAMP / 2 + 1], rimy[MAX_CURT][NSAMP / 2 + 1], rimb[MAX_CURT][NSAMP / 2 + 1];
+	int rimn[MAX_CURT];
 	for (int ci = 0; ci < MAX_CURT; ci++) {
 		curtain_t *cu = &s->cu[ci];
+		rimn[ci] = 0;
 		if (cu->life < 0.01f)
 			continue;
 		cu->ph += dt * rip_speed;
 		float T = s->T + cu->seed;
 		/* depth: curtains low over the horizon are farther away -> shorter, fainter */
 		float near = us_sat((0.56f - cu->y0) / 0.2f);
-		float lifev = cu->life * bright * (0.6f + 0.5f * near) * cov * sqrtf(255.0f / nr);
+		float lifev = cu->life * (0.65f + 0.45f * near) * share;
 		float lscale = 0.6f + 0.7f * near;
-		/* the lower rim is traced as we go: a sharp bright border, the curtain's signature */
-		float rpx = 0, rpy = 0, rpb = 0, xprev = 0;
-		int rprev = 0;
-		float du = 1.0f / (nr - 1);
-		for (int k = 0; k < nr; k++) {
-			float h1 = hash1(k, cu->seed), h2 = hash1(k + 7919, cu->seed);
-			float u = (k + 0.9f * (h1 - 0.5f)) / (nr - 1);
-			/* travelling folds: the ribbon doubles back on itself where its sway outruns its span; rays
-			 * pile up there and glow (additive), and the folded-back part sits a little higher (farther) */
-			float fa = u * US_TAU * 1.3f + T * 0.55f + cu->seed;
+		float xprev = curtain_u2x(cu, 0.0f, T, s->spread);
+		for (int k = 0; k < NSAMP; k++) {
+			float u = (k + 0.5f) / NSAMP;
+			float fa = u * US_TAU * 1.8f + T * 0.55f + cu->seed;
 			float xf = curtain_u2x(cu, u, T, s->spread);
-			/* where the ribbon turns edge-on its rays pile up; let them glow, but not into a solid slab */
-			float slope = k > 0 ? fabsf(xf - xprev) / (du * cu->span) : 1.0f;
+			/* snare folds: a sharp kink snaps in sideways and lifts the rim there */
+			float kink = 0.0f;
+			for (int fi = 0; fi < MAX_FOLD; fi++)
+				if (s->fold_c[fi] == ci && famp[fi] != 0.0f) {
+					float d = (u - s->fold_u[fi]) * 14.0f;
+					kink += famp[fi] * s->fold_amp[fi] * expf(-d * d);
+				}
+			/* where the ribbon turns edge-on its light piles up: let a fold glow, but not into a slab */
+			float slope = fabsf(xf - xprev) * NSAMP / (cu->span * s->spread);
 			xprev = xf;
-			/* rays bunch where the ribbon turns edge-on: thin them so a fold glows a little, never a slab */
-			float pile = us_clampf(0.04f + 1.0f * slope, 0.04f, 1.0f);
+			float pile = us_clampf(0.3f + 0.9f * slope, 0.3f, 1.0f);
+			xf += kink;
 			float ripple = 0.006f * sinf(u * 70.0f - cu->ph) + 0.004f * sinf(u * 23.0f - cu->ph * 0.6f + 1.0f);
 			float x = xf * A + ripple * (0.4f + s->shimmer);
-			if (x < -0.05f || x > A + 0.05f) {
-				rprev = 0;
-				continue;
-			}
 			float yb = cu->y0 - lift + 0.07f * us_noise2(u * 2.4f + T * 0.2f, cu->seed + 7.0f) +
-				   0.03f * us_noise2(u * 5.0f + T * 0.5f, cu->seed + 9.0f) - 0.035f * cu->fold * 3.0f * cosf(fa) +
-				   0.01f * sinf(u * 9.0f - cu->ph * 0.3f) + 0.007f * (0.4f + s->shimmer) * sinf(u * 17.0f - cu->ph * 0.5f + cu->seed);
-			float ln = L0 * lscale * (0.45f + 0.9f * us_sat(0.55f + 0.7f * us_noise2(u * 5.0f - T * 0.4f, cu->seed + 3.0f)));
-			ln *= 0.65f + 0.6f * h2;
-			float patch = us_sat(0.55f + 0.9f * us_noise2(u * 7.0f - T * 0.9f, cu->seed + 13.0f));
-			float ends = us_smooth(0.0f, 0.22f, u) * us_smooth(1.0f, 0.78f, u);
-			ln *= 0.35f + 0.65f * ends; /* the curtain's ends shrink away, no hard vertical edge */
-			float fl = 1.0f + flick_amt * us_noise2(k * 0.73f + cu->seed, s->flick_t);
+				   0.03f * us_noise2(u * 5.0f + T * 0.5f, cu->seed + 9.0f) - 0.09f * cu->fold * cosf(fa) * sinf(US_PI * u) +
+				   0.01f * sinf(u * 9.0f - cu->ph * 0.3f) + 0.045f * sinf(u * US_TAU * 0.9f + T * 0.25f + cu->seed * 2.3f) -
+				   1.2f * fabsf(kink);
+			float ends = us_smooth(0.0f, 0.3f, u) * us_smooth(1.0f, 0.7f, u);
+			float ln = L0 * lscale * (0.45f + 0.75f * us_sat(0.55f + 0.7f * us_noise2(u * 5.0f - T * 0.4f, cu->seed + 3.0f)) +
+						  0.25f * us_noise2(u * 17.0f + T * 0.3f, cu->seed + 5.0f));
+			ln *= 0.25f + 0.75f * ends; /* the curtain's ends shrink away, no hard vertical edge */
+			float patch = us_sat(0.45f + 1.1f * us_noise2(u * 6.0f - T * 0.9f, cu->seed + 13.0f) +
+					     0.35f * us_noise2(u * 19.0f - T * 1.7f, cu->seed + 17.0f));
+			/* rays lean a little, varying along the curtain and swaying slowly: folds curve, never walls */
+			float lean = 0.22f * us_noise2(u * 3.0f + T * 0.15f, cu->seed + 29.0f) + 0.08f * (x / A - 0.5f);
 			/* the spectrum laid along the ribbon (mids in the middle): each band lights and lifts its stretch */
 			float bf = 4.0f + 23.0f * (ci & 1 ? 1.0f - u : u);
 			int bi = (int)bf;
 			float bandk = us_lerp(s->bandv[bi], s->bandv[bi + 1], bf - bi);
-			/* kick pulses travelling out from the middle */
+			/* kick pulses travelling out along the ribbon */
 			float pul = 0;
 			for (int pi = 0; pi < MAX_PULSE; pi++)
 				if (pamp[pi] > 0.01f) {
-					float d = fabsf(u - 0.5f) - pdist[pi];
-					pul += pamp[pi] * expf(-d * d * 160.0f);
+					float d = fabsf(u - s->pulse_u[pi]) - pdist[pi];
+					pul += pamp[pi] * expf(-d * d * 140.0f);
 				}
-			ln *= 0.84f + 0.12f * quiet + 0.38f * bandk + 0.18f * pul;
-			float b = lifev * patch * ends * fl * (0.7f + 0.6f * h1) * pile * (0.74f + 0.22f * quiet + 0.55f * bandk) * (1.0f + 1.8f * pul);
-			if (b < 0.01f) {
-				rprev = 0;
-				continue;
-			}
-			float yr = ridge_y(us_sat(x / A)) - 0.025f;
-			if (yb > yr)
-				yb = yr;
-			float lean = 0.04f * ln * (0.5f + h2);
-			ray(c, x, yb, ln * (0.9f + 0.2f * fl), lean, b * 0.3f, fringe, -1, US_MAT_LEAF, 0.0f);
-			/* sub: a red-magenta lower border hangs below the rim (type-B aurora), deeper with the sub */
-			if (subf > 0.03f && !(k & 1)) {
-				float fln = (0.004f + 0.026f * subf) * lscale;
-				if (fln > yr + 0.02f - yb)
-					fln = yr + 0.02f - yb;
-				if (fln > 0.002f)
-					ray(c, x, yb + 1.0f / c->s, fln, 0.0f, b * (ctx->crisp ? 0.35f : 0.5f) * subf, -1.0f, 1, US_MAT_BLOOM, 0.0f);
-			}
-			{ /* how brightly this stretch of sky glows: lights the snow on the ridge and the lake */
-				int gi = (int)(us_sat(x / A) * 63.0f);
-				glow[gi] += b * 0.02f;
-			}
-			if (rprev) {
-				float dx = x - rpx, dy = yb - rpy;
-				if (dx * dx + dy * dy < 0.0009f) {
-					float rv = 0.16f * (b + rpb) * (ctx->crisp ? 0.8f : 1.0f);
-					if (ctx->crisp)
-						us_line(c, rpx, rpy, x, yb, 0.001f, rv, US_MAT_LEAF);
-					else
-						rim(c, rpx, rpy, x, yb, rv, US_MAT_LEAF);
-				}
-			}
-			rpx = x;
-			rpy = yb;
-			rpb = b;
-			rprev = 1;
-			/* reflection in the lake: compressed, wobbling */
-			if (k % 3)
-				continue;
-			/* reflection in the still lake: the whole curtain, squashed, its fringe colour kept at the far end */
-			float ry0 = SHORE + 0.012f + (SHORE - yb) * 0.22f;
-			if (ry0 < 1.0f) {
-				float wob = 0.006f * us_noise2(x * 7.0f, ry0 * 25.0f + (float)ctx->t * 0.7f);
-				float rl = ln * 0.48f;
-				ray(c, x + wob, ry0, rl, -lean * 0.4f + wob, b * (ctx->crisp ? 0.55f : 0.32f), fringe, 1, US_MAT_WATER, 0.45f);
-				if (!ctx->crisp)
-					us_put(c, (int)((x + wob) * c->s), (int)(ry0 * c->s), b * 0.3f, US_MAT_WATER);
+			ln *= 0.85f + 0.4f * bandk + 0.15f * pul;
+			float b = lifev * (0.25f + 0.75f * patch) * ends * pile * (0.7f + 0.6f * bandk) * (1.0f + 1.5f * pul + 1.2f * fabsf(kink) / 0.06f);
+			float fln = subf > 0.05f ? (0.003f + 0.018f * subf) * lscale : 0.0f;
+			deposit(s, A, x, yb, ln, b * 0.62f, fringe, pinkb, kick, fln, 0.45f * subf, lean);
+			if (!(k & 1) && rimn[ci] < NSAMP / 2 + 1) {
+				rimx[ci][rimn[ci]] = x;
+				rimy[ci][rimn[ci]] = yb;
+				rimb[ci][rimn[ci]] = b * (1.0f + 0.5f * pul);
+				rimn[ci]++;
 			}
 		}
 	}
 
-	/* ---- the quiet arc: a faint, homogeneous band low over the ridge, the aurora's resting form. It fills
-	 * the sky above the mountains and carries the scene through breakdowns (brighter as the music thins,
-	 * breathing in silence), and it lies on the lake too. ---- */
+	/* ---- the quiet arc: a faint, homogeneous band low over the ridge, the aurora's resting form, breathing ---- */
 	{
-		int nq = nr * 2 / 3;
-		float qv = strength * cov * sqrtf(255.0f / (nq > 1 ? nq : 1)) * (0.13f + 0.2f * quiet * (0.7f + 0.6f * breath) + 0.06f * a->swell);
+		int nq = 120;
+		float qb = 0.16f + 0.14f * quiet * (0.6f + 0.8f * breath) + 0.06f * a->swell;
 		float qT = s->T * 0.35f;
-		float qpx = 0, qpy = 0;
 		for (int k = 0; k < nq; k++) {
-			float h1 = hash1(k, 3.7f), h2 = hash1(k + 4111, 3.7f), h3 = hash1(k + 977, 5.1f);
-			float u = (k + 1.6f * (h3 - 0.5f)) / nq;
-			float x = u * A;
-			float yr = ridge_y(u) - 0.012f;
-			float y = 0.56f - 0.035f * sinf(US_PI * u) + 0.012f * us_noise2(u * 2.2f + qT, 21.0f) - 0.03f * (s->height - 0.4f);
-			if (y > yr)
-				y = yr;
+			float u = (k + 0.5f) / nq;
+			float y = 0.555f - 0.035f * sinf(US_PI * u) + 0.012f * us_noise2(u * 2.2f + qT, 21.0f) - 0.03f * (s->height - 0.4f);
 			float patch = us_sat(0.6f + 0.8f * us_noise2(u * 6.0f - qT * 1.6f, 23.0f));
-			float b = qv * patch * (0.25f + 1.1f * h1 * h1);
-			/* its soft lower edge (ink) */
-			if (!ctx->crisp && k > 0)
-				rim(c, qpx, qpy, x, y, qv * patch * 0.05f, US_MAT_LEAF);
-			qpx = x;
-			qpy = y;
-			if (b < 0.01f)
-				continue;
-			float ln = (0.02f + 0.04f * patch) * (0.6f + 0.6f * h2);
-			ray(c, x, y, ln, 0.002f, b * 0.3f, 2.0f, -1, US_MAT_LEAF, 0.15f);
-			int gi = (int)(us_sat(u) * 63.0f);
-			glow[gi] += b * 0.004f;
-			if (k % 3 == 0) {
-				float ry0 = SHORE + 0.012f + (SHORE - y) * 0.22f;
-				float wob = 0.004f * us_noise2(x * 9.0f, (float)ctx->t * 0.7f);
-				ray(c, x + wob, ry0, ln * 0.5f, wob, b * (ctx->crisp ? 0.35f : 0.18f), 2.0f, 1, US_MAT_WATER, 0.4f);
-			}
+			float ln = 0.035f + 0.03f * patch;
+			deposit(s, A, u * A, y, ln, qb * (0.4f + 0.6f * patch), 2.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f);
 		}
 	}
+
+	/* tone: soft saturation (folds glow but never clip into a slab); pinkness = pink share of the light */
+	float glow[64];
+	memset(glow, 0, sizeof(glow));
+	for (int j = 0; j < s->gh; j++) {
+		int mn = s->gw, mx = -1;
+		for (int i = 0; i < s->gw; i++) {
+			int q = j * s->gw + i;
+			float f = s->fld[q];
+			if (f > 1e-4f) {
+				s->pk[q] = us_sat(s->pk[q] / f);
+				float V = 1.0f - expf(-0.9f * f);
+				s->fld[q] = V;
+				if (i < mn) mn = i;
+				mx = i;
+				int gi = i * 64 / s->gw;
+				if (V > glow[gi])
+					glow[gi] = V;
+			} else {
+				s->fld[q] = 0.0f;
+				s->pk[q] = 0.0f;
+			}
+		}
+		s->rmin[j] = (short)mn;
+		s->rmax[j] = (short)mx;
+	}
+
+	/* brightness: loudness lifts the whole sky; quiet sinks to a faint breathing glow; the kick flashes it */
+	float gain = strength * 1.25f * (0.42f + 1.0f * s->lvl_env + 0.1f * quiet * breath) * (1.0f + 0.35f * kick) * (0.95f + 0.2f * storm);
+	for (int g = 0; g < 64; g++)
+		glow[g] *= gain * 1.6f;
+	raster(s, c, A, 0, (int)ceilf(SKY_Y * c->s), 0.0f, 1.0f, gain, 0, ctx->t);
+	/* the lower rim: a fine bright line along each curtain's base, where its light is sharpest */
+	for (int ci = 0; ci < MAX_CURT; ci++)
+		for (int k = 1; k < rimn[ci]; k++) {
+			float x0 = rimx[ci][k - 1], y0 = rimy[ci][k - 1], x1 = rimx[ci][k], y1 = rimy[ci][k];
+			float dx = x1 - x0, dy = y1 - y0;
+			if (dx * dx + dy * dy > 0.0009f)
+				continue;
+			int px = (int)(x1 * c->s);
+			if (px < 0 || px >= W || y1 > s->ridgeAt[px] || y0 > s->ridgeAt[px])
+				continue;
+			float rv = us_sat(gain * 0.75f * us_sat(0.5f * (rimb[ci][k] + rimb[ci][k - 1])) * (1.0f + 0.6f * kick));
+			if (rv < 0.03f)
+				continue;
+			if (ctx->crisp)
+				us_line(c, x0, y0, x1, y1, 0.001f, rv, US_MAT_LEAF);
+			else
+				rim(c, x0, y0, x1, y1, rv, US_MAT_LEAF);
+		}
+	/* reflection in the still lake: the same light, mirrored about the shore, rippled and dimmer */
+	raster(s, c, A, (int)(SHORE * c->s) + 2, c->h, 3.0f * SHORE + 0.01f, -2.0f, gain * (ctx->crisp ? 0.8f : 0.7f), 1, ctx->t);
 	c->blend = US_BLEND_MAX;
 
 	/* ---- pixel styles by day: banded pale-blue sky behind (MAX) the ghost aurora; ink stays black ---- */
@@ -891,4 +1096,4 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 	}
 }
 
-const us_scene_vt us_scene_aurora = {"aurora", "Aurora", 0.45f, create, destroy, frame};
+const us_scene_vt us_scene_aurora = {"aurora", "Aurora", 0.25f, create, destroy, frame};
