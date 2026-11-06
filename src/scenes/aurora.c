@@ -6,9 +6,15 @@
  * fringe at the top (BLOOM in Pixel palettes). Ripples travel along the ribbon.
  * Audio: stereo width + highs/air -> ripple speed and ray flicker; bass/kick -> brightness surge
  *        (the curtain "breathes" brighter on every low hit); centroid -> curtain height.
+ *        kick -> a pulse of light running outward along each curtain; bands[] -> each stretch of a
+ *        curtain lights and lengthens with its own band; sub -> a red lower border below the rim, and
+ *        the lake ice booms (a crack glints); air -> stars scintillate; strong onsets -> the odd
+ *        shooting star; lowmid -> the cabin hearth (window + smoke); width -> curtain spread;
+ *        swell -> curtain count + the quiet arc.
  * World: daylight (by day only a pale washed ghost remains), season (strongest in winter),
  *        storm_charge (a geomagnetic storm: more curtains, taller red fringes, faster motion).
- * Silence: curtains keep folding slowly, stars twinkle, the odd meteor falls.
+ * Silence: curtains keep folding slowly with a 9 s breath, a quiet arc glows low over the ridge,
+ *        stars twinkle, the odd meteor falls, a fox sometimes trots along the shore past the lit cabin.
  * The scene is reflected (compressed, wobbling) in the lake below the treeline: curtains, their
  * rims, the far ridge and the spruce stand. The reflection carries the whole curtain (fringe colour
  * included); the sky's glow lights the snowy crests, the foothills and a glimmer on the water.
@@ -24,6 +30,9 @@
 #define MAX_TREES 110
 
 #define SHORE 0.75f
+#define MAX_CRACK 7
+#define CRACK_PTS 9
+#define MAX_PULSE 3
 
 typedef struct {
 	float seed;      /* noise offset */
@@ -55,8 +64,22 @@ typedef struct {
 	float shimmer;    /* highs/width envelope */
 	float height;     /* centroid envelope */
 	float flick_t;
+	float twk; /* star twinkle phase: runs faster with air */
 	float meteor_t, meteor_x, meteor_y, meteor_vx, meteor_vy, next_meteor;
 	int inited;
+	/* reactive envelopes */
+	float bandv[US_NBANDS]; /* per-band envelopes: each band lights its own stretch of curtain */
+	float sub_env, air_env, lm_env, spread;
+	float pulse_age[MAX_PULSE]; /* kick pulses running outward along the curtains */
+	int pulse_i;
+	float kick_cool, met_cool;
+	/* ice cracks along the near lake edge; sub hits make the ice boom and a crack glints */
+	float crack[MAX_CRACK][2 * CRACK_PTS];
+	float crack_g[MAX_CRACK];
+	/* a lit cabin in a clearing on the far shore; a fox that sometimes trots along the shore */
+	float cab_x;
+	float fox_x, fox_dir, fox_ph, next_fox;
+	int fox_on;
 } st_t;
 
 static float ridge_y(float u)
@@ -147,13 +170,13 @@ static void rim(us_canvas *c, float ax, float ay, float bx, float by, float v, u
 
 /* the curtain's lower edge, as a fraction of the width: span + travelling folds (doubling back where
  * their sway outruns the span) */
-static float curtain_u2x(const curtain_t *cu, float u, float T)
+static float curtain_u2x(const curtain_t *cu, float u, float T, float spread)
 {
 	float fa = u * US_TAU * 1.3f + T * 0.55f + cu->seed;
 	float fb = u * US_TAU * 2.7f - T * 0.4f + cu->seed * 1.7f;
 	float env = 0.35f + 0.65f * sinf(US_PI * us_sat(u));
 	float fold = cu->fold * (env * (0.42f * sinf(fa) + 0.18f * sinf(fb)) + 0.9f * us_fbm2(u * 1.8f + T * 0.3f, cu->seed, 2));
-	return cu->xc + cu->span * (u - 0.5f) + fold;
+	return cu->xc + cu->span * spread * (u - 0.5f) + fold;
 }
 
 /* hairline polyline for ink (Wu spans, ~0.8 px): cheaper than us_polyline for the treeline */
@@ -223,6 +246,25 @@ static void *create(uint32_t seed)
 	}
 	s->T = us_rand(r) * 100;
 	s->next_meteor = us_randr(r, 5, 20);
+	for (int i = 0; i < MAX_PULSE; i++)
+		s->pulse_age[i] = 9.0f;
+	s->spread = 1.0f;
+	/* ice cracks: wandering, mostly shore-parallel lines in the near water at both edges */
+	for (int i = 0; i < MAX_CRACK; i++) {
+		float x = i & 1 ? us_randr(r, 0.0f, 0.28f) : us_randr(r, 0.72f, 1.0f);
+		float y = us_randr(r, 0.84f, 0.985f);
+		float ang = (x < 0.5f ? 0.0f : US_PI) + us_randr(r, -0.5f, 0.5f);
+		float step = us_randr(r, 0.012f, 0.022f);
+		for (int k = 0; k < CRACK_PTS; k++) {
+			s->crack[i][2 * k] = x;
+			s->crack[i][2 * k + 1] = y;
+			ang += us_randr(r, -0.7f, 0.7f);
+			x += cosf(ang) * step / 1.78f; /* x is a width fraction */
+			y += sinf(ang) * step * 0.35f;  /* foreshortened on the flat lake */
+		}
+	}
+	s->cab_x = us_randr(r, 0.58f, 0.8f);
+	s->next_fox = us_randr(r, 15, 35);
 	return s;
 }
 
@@ -271,6 +313,114 @@ static void spruce(us_canvas *c, int crisp, float x, float y, float h, float w, 
 	hpoly(c, pts, n / 2, v, US_MAT_LEAF);
 }
 
+/* a log cabin in its clearing: walls, roof, a lit window (lowmid = the hearth's warmth) and curling smoke */
+static void cabin(st_t *s, const us_ctx *ctx, us_canvas *c, float day)
+{
+	float A = ctx->aspect, x = s->cab_x * A, y = SHORE + 0.001f;
+	float w = 0.026f, h = 0.014f, rh = 0.012f;
+	float lv = 0.30f + 0.25f * day;
+	int cr = ctx->crisp;
+	if (cr) {
+		us_tri(c, x - w * 0.5f, y - h, x + w * 0.5f, y - h, x - w * 0.5f, y, lv, US_MAT_EARTH);
+		us_tri(c, x + w * 0.5f, y - h, x + w * 0.5f, y, x - w * 0.5f, y, lv, US_MAT_EARTH);
+		us_tri(c, x - w * 0.62f, y - h, x + w * 0.62f, y - h, x, y - h - rh, lv, US_MAT_STEM);
+	} else {
+		float pts[] = {x - w * 0.5f, y, x - w * 0.5f, y - h, x - w * 0.62f, y - h, x, y - h - rh, x + w * 0.62f, y - h,
+			       x + w * 0.5f, y - h, x + w * 0.5f, y};
+		hpoly(c, pts, 7, lv * 1.2f, US_MAT_STEM);
+		rim(c, x - w * 0.5f, y - h, x + w * 0.5f, y - h, lv * 0.7f, US_MAT_STEM);
+		for (int k = 1; k < 3; k++) /* log courses */
+			rim(c, x - w * 0.5f, y - h * k / 3.0f, x + w * 0.5f, y - h * k / 3.0f, lv * 0.35f, US_MAT_STEM);
+	}
+	/* chimney */
+	float chx = x + w * 0.28f, chy = y - h - rh * 0.45f;
+	wline_(c, cr, chx, chy, chx, chy - rh * 0.5f, lv, US_MAT_STEM);
+	/* window: warm, flickering gently with the hearth (lowmid), dimmer by day */
+	float fire = 0.55f + 0.3f * s->lm_env + 0.08f * us_noise2((float)ctx->t * 3.1f, 5.0f);
+	float wv = fire * (1.0f - 0.6f * us_smooth(0.3f, 0.8f, day));
+	float wx = x - w * 0.18f, wy = y - h * 0.5f;
+	if (cr) {
+		us_disc(c, wx, wy, 0.0045f, wv, US_MAT_LIGHT);
+	} else {
+		us_disc(c, wx, wy, 0.008f, wv * 0.07f, US_MAT_LIGHT); /* glow on the snow */
+		us_line(c, wx - 0.0028f, wy, wx + 0.0028f, wy, 0.0042f, wv, US_MAT_LIGHT);
+	}
+	/* its reflection: a broken warm streak on the water */
+	for (int k = 0; k < (cr ? 2 : 4); k++) {
+		float ry = SHORE + 0.008f + 0.0085f * k + 0.002f * us_noise2(k * 3.0f, (float)ctx->t * 0.8f);
+		float hw = 0.0035f * (1.0f + 0.4f * us_noise2(k * 1.7f, (float)ctx->t * 1.1f));
+		wline_(c, cr, wx - hw, ry, wx + hw, ry, wv * (0.5f - 0.1f * k), US_MAT_LIGHT);
+	}
+	/* smoke: rises, leans with the wind and the stereo spread, curls; thicker as the hearth warms */
+	float px = chx, py = chy - rh * 0.5f;
+	float lean = 0.25f + 0.6f * ctx->w->wind + 0.3f * (s->spread - 0.8f);
+	for (int k = 1; k <= 9; k++) {
+		float t = k / 9.0f;
+		float nx = chx + lean * 0.05f * t * t + 0.006f * t * us_noise2(t * 3.0f - (float)ctx->t * 0.4f, 9.0f);
+		float ny = chy - rh * 0.5f - 0.055f * t;
+		wline_(c, cr, px, py, nx, ny, (0.16f + 0.1f * s->lm_env) * (1.0f - t), US_MAT_WATER);
+		px = nx;
+		py = ny;
+	}
+}
+
+/* now and then a fox trots along the shore in front of the spruces, with its reflection */
+static void fox(st_t *s, const us_ctx *ctx, us_canvas *c, float day)
+{
+	float A = ctx->aspect, rdt = ctx->real_dt;
+	if (!s->fox_on) {
+		s->next_fox -= ctx->dt;
+		if (s->next_fox > 0)
+			return;
+		s->fox_on = 1;
+		s->fox_dir = us_rand(&s->rng) < 0.5f ? 1.0f : -1.0f;
+		s->fox_x = s->fox_dir > 0 ? -0.04f : A + 0.04f;
+	}
+	/* a steady trot; a beat-quick lope in loud passages */
+	float sp = 0.045f * (1.0f + 0.4f * ctx->a->level);
+	s->fox_x += s->fox_dir * sp * ctx->dt;
+	s->fox_ph += ctx->dt * 9.0f * (1.0f + 0.4f * ctx->a->level);
+	(void)rdt;
+	if (s->fox_x < -0.06f || s->fox_x > A + 0.06f) {
+		s->fox_on = 0;
+		s->next_fox = us_randr(&s->rng, 45, 110);
+		return;
+	}
+	float d = s->fox_dir, x = s->fox_x, y = SHORE - 0.0005f;
+	float L = 0.016f, H = 0.006f, leg = 0.0045f;
+	float v = 0.42f + 0.2f * day;
+	int cr = ctx->crisp;
+	for (int m = 0; m < 2; m++) { /* m = 1: the reflection, flipped and dim */
+		float sg = m ? -1.0f : 1.0f, vv = m ? v * 0.35f : v;
+		float by = y - sg * leg; /* body line */
+		float bob = 0.0006f * sinf(s->fox_ph * 2.0f);
+		by -= sg * bob;
+		/* body + head + ears + snout */
+		float hx = x + d * L * 0.55f, hy = by - sg * H * 0.6f;
+		if (cr) {
+			us_line(c, x - d * L * 0.5f, by, x + d * L * 0.4f, by, 0.004f, vv, US_MAT_ACCENT);
+			us_line(c, hx, hy, hx + d * 0.004f, hy + sg * 0.001f, 0.004f, vv, US_MAT_ACCENT);
+		} else {
+			float body[] = {x - d * L * 0.5f, by, x - d * L * 0.1f, by - sg * H * 0.35f, x + d * L * 0.35f, by - sg * H * 0.3f,
+					hx, hy, hx + d * 0.0045f, hy + sg * 0.0012f, hx, hy + sg * 0.0016f, x + d * L * 0.35f, by + sg * 0.0006f,
+					x - d * L * 0.5f, by + sg * 0.0005f};
+			hpoly(c, body, 8, vv * 1.2f, US_MAT_ACCENT);
+			rim(c, hx - d * 0.0008f, hy, hx - d * 0.0005f, hy - sg * 0.0035f, vv, US_MAT_ACCENT); /* ear */
+		}
+		/* bushy tail, low behind */
+		float tx = x - d * L * 0.5f;
+		float tw = 0.0015f * sinf(s->fox_ph * 1.0f);
+		wline_(c, cr, tx, by, tx - d * 0.009f, by + sg * (0.001f + tw), vv, US_MAT_ACCENT);
+		wline_(c, cr, tx - d * 0.003f, by - sg * 0.0012f, tx - d * 0.011f, by + sg * (0.0002f + tw), vv * 0.8f, US_MAT_ACCENT);
+		/* legs: a diagonal-pair trot */
+		for (int l = 0; l < 4; l++) {
+			float lx = x + d * (l < 2 ? 0.3f : -0.38f) * L + (l & 1) * d * 0.002f;
+			float sw = 0.0022f * sinf(s->fox_ph + ((l == 0 || l == 3) ? 0.0f : US_PI));
+			wline_(c, cr, lx, by, lx + d * sw, y, vv * 0.9f, US_MAT_ACCENT);
+		}
+	}
+}
+
 static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 {
 	st_t *s = sp;
@@ -290,6 +440,43 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 	s->height = us_approach(s->height, a->active > 0.2f ? a->centroid : 0.4f, 2.0f, rdt);
 	s->T += dt * (0.05f + 0.06f * storm + 0.04f * a->swell);
 	s->flick_t += rdt * (2.0f + 10.0f * s->shimmer);
+	s->twk += rdt * (1.7f + 5.0f * s->air_env);
+	/* each band: quick to light (~0.06 s), slow to let go (~0.35 s) */
+	for (int i = 0; i < US_NBANDS; i++) {
+		float bv = a->bands[i];
+		s->bandv[i] = us_approach(s->bandv[i], bv, bv > s->bandv[i] ? 0.06f : 0.35f, rdt);
+	}
+	s->sub_env = us_approach(s->sub_env, a->sub, a->sub > s->sub_env ? 0.08f : 0.45f, rdt);
+	s->air_env = us_approach(s->air_env, a->air, 0.25f, rdt);
+	s->lm_env = us_approach(s->lm_env, a->lowmid, 0.8f, rdt);
+	/* stereo width spreads the curtains across the sky (slowly) */
+	s->spread = us_approach(s->spread, 0.82f + 0.4f * a->width, 2.5f, rdt);
+	/* kick: a pulse of light runs outward along every curtain from its middle */
+	s->kick_cool -= rdt;
+	for (int i = 0; i < MAX_PULSE; i++)
+		s->pulse_age[i] += rdt;
+	if (a->beat && a->kick > 0.4f && s->kick_cool <= 0) {
+		s->pulse_i = (s->pulse_i + 1) % MAX_PULSE;
+		s->pulse_age[s->pulse_i] = 0;
+		s->kick_cool = 0.22f;
+	}
+	float pamp[MAX_PULSE], pdist[MAX_PULSE];
+	for (int i = 0; i < MAX_PULSE; i++) {
+		float ag = s->pulse_age[i];
+		/* eases in over ~40 ms, out over ~0.45 s; the front slows as it spreads */
+		pamp[i] = ag < 1.5f ? us_smooth(0.0f, 0.04f, ag) * expf(-ag / 0.32f) : 0.0f;
+		pdist[i] = 0.75f * (1.0f - expf(-ag / 0.45f));
+	}
+	/* sub: the ice booms; one crack glints and fades */
+	for (int i = 0; i < MAX_CRACK; i++)
+		s->crack_g[i] = us_approach(s->crack_g[i], 0.0f, 0.5f, rdt);
+	if (a->beat && a->sub > 0.55f) {
+		int ci = (int)(us_rand(r) * MAX_CRACK) % MAX_CRACK;
+		s->crack_g[ci] = us_sat(s->crack_g[ci] + 0.5f + 0.5f * a->sub);
+	}
+	/* quiet passages: the sky still breathes, slowly (about a 9 s breath) */
+	float quiet = 1.0f - us_sat(1.4f * s->surge);
+	float breath = 0.5f + 0.5f * sinf((float)ctx->t * (US_TAU / 9.0f));
 
 	/* ---- how many curtains: density + geomagnetic storm + loudness ---- */
 	float want_f = 1.2f + 1.6f * dens + 2.2f * storm + 1.2f * a->swell;
@@ -329,15 +516,20 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 				float x = t->x * A;
 				if (t->y > ridge_y(t->x) - 0.01f)
 					continue;
-				float tw = 0.75f + 0.25f * us_noise2(t->tw, (float)ctx->t * 1.7f);
-				float v = t->m * tw * sv * 0.75f;
+				/* air (hats, breath, cymbal wash) sets the stars scintillating */
+				float tw = 0.75f + (0.25f + 0.3f * s->air_env) * us_noise2(t->tw, s->twk);
+				float v = t->m * tw * sv * (ctx->crisp ? 0.9f : 1.1f);
 				us_point(c, x, t->y, t->m > 0.7f ? 0.0016f : 0.0011f, v, US_MAT_LIGHT);
 			}
 	}
 
 	/* ---- meteor (rare, in quiet) ---- */
 	s->next_meteor -= rdt * (1.0f - 0.7f * a->level);
-	if (s->next_meteor <= 0 && s->meteor_t <= 0) {
+	s->met_cool -= rdt;
+	/* a strong onset can throw a shooting star (rarely: a hit is a chance, not a rule) */
+	int met_hit = a->beat && a->onset > 0.8f && s->met_cool <= 0 && s->meteor_t <= 0 && us_rand(r) < 0.2f;
+	if ((s->next_meteor <= 0 || met_hit) && s->meteor_t <= 0) {
+		s->met_cool = 5.0f;
 		s->meteor_t = 1.0f;
 		s->meteor_x = us_randr(r, 0.1f, 0.9f) * A;
 		s->meteor_y = us_randr(r, 0.03f, 0.25f);
@@ -370,8 +562,10 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 	for (int ci = 0; ci < MAX_CURT; ci++)
 		nact += s->cu[ci].life;
 	/* more curtains share the light: brightness grows sub-linearly with their number */
-	float bright = strength * (0.44f + 0.9f * s->surge + 0.15f * a->level) * (0.95f + 0.2f * storm) / powf(nact > 1.5f ? nact / 1.5f : 1.0f, 0.7f);
+	/* quiet keeps a floor (and breathes) so a breakdown still glows; loud passages are unchanged */
+	float bright = strength * (0.44f + 0.5f * quiet * (0.75f + 0.5f * breath) + 0.9f * s->surge + 0.15f * a->level) * (0.95f + 0.2f * storm) / powf(nact > 1.5f ? nact / 1.5f : 1.0f, 0.7f);
 	float fringe = us_sat(0.62f - 0.25f * storm - 0.12f * s->surge);
+	float subf = us_sat(1.3f * s->sub_env - 0.05f);
 	for (int ci = 0; ci < MAX_CURT; ci++) {
 		curtain_t *cu = &s->cu[ci];
 		if (cu->life < 0.01f)
@@ -392,7 +586,7 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 			/* travelling folds: the ribbon doubles back on itself where its sway outruns its span; rays
 			 * pile up there and glow (additive), and the folded-back part sits a little higher (farther) */
 			float fa = u * US_TAU * 1.3f + T * 0.55f + cu->seed;
-			float xf = curtain_u2x(cu, u, T);
+			float xf = curtain_u2x(cu, u, T, s->spread);
 			/* where the ribbon turns edge-on its rays pile up; let them glow, but not into a solid slab */
 			float slope = k > 0 ? fabsf(xf - xprev) / (du * cu->span) : 1.0f;
 			xprev = xf;
@@ -413,7 +607,19 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 			float ends = us_smooth(0.0f, 0.22f, u) * us_smooth(1.0f, 0.78f, u);
 			ln *= 0.35f + 0.65f * ends; /* the curtain's ends shrink away, no hard vertical edge */
 			float fl = 1.0f + flick_amt * us_noise2(k * 0.73f + cu->seed, s->flick_t);
-			float b = lifev * patch * ends * fl * (0.7f + 0.6f * h1) * pile;
+			/* the spectrum laid along the ribbon (mids in the middle): each band lights and lifts its stretch */
+			float bf = 4.0f + 23.0f * (ci & 1 ? 1.0f - u : u);
+			int bi = (int)bf;
+			float bandk = us_lerp(s->bandv[bi], s->bandv[bi + 1], bf - bi);
+			/* kick pulses travelling out from the middle */
+			float pul = 0;
+			for (int pi = 0; pi < MAX_PULSE; pi++)
+				if (pamp[pi] > 0.01f) {
+					float d = fabsf(u - 0.5f) - pdist[pi];
+					pul += pamp[pi] * expf(-d * d * 160.0f);
+				}
+			ln *= 0.84f + 0.12f * quiet + 0.38f * bandk + 0.18f * pul;
+			float b = lifev * patch * ends * fl * (0.7f + 0.6f * h1) * pile * (0.74f + 0.22f * quiet + 0.55f * bandk) * (1.0f + 1.8f * pul);
 			if (b < 0.01f) {
 				rprev = 0;
 				continue;
@@ -423,6 +629,14 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 				yb = yr;
 			float lean = 0.04f * ln * (0.5f + h2);
 			ray(c, x, yb, ln * (0.9f + 0.2f * fl), lean, b * 0.3f, fringe, -1, US_MAT_LEAF, 0.0f);
+			/* sub: a red-magenta lower border hangs below the rim (type-B aurora), deeper with the sub */
+			if (subf > 0.03f && !(k & 1)) {
+				float fln = (0.004f + 0.026f * subf) * lscale;
+				if (fln > yr + 0.02f - yb)
+					fln = yr + 0.02f - yb;
+				if (fln > 0.002f)
+					ray(c, x, yb + 1.0f / c->s, fln, 0.0f, b * (ctx->crisp ? 0.35f : 0.5f) * subf, -1.0f, 1, US_MAT_BLOOM, 0.0f);
+			}
 			{ /* how brightly this stretch of sky glows: lights the snow on the ridge and the lake */
 				int gi = (int)(us_sat(x / A) * 63.0f);
 				glow[gi] += b * 0.02f;
@@ -452,6 +666,43 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 				ray(c, x + wob, ry0, rl, -lean * 0.4f + wob, b * (ctx->crisp ? 0.55f : 0.32f), fringe, 1, US_MAT_WATER, 0.45f);
 				if (!ctx->crisp)
 					us_put(c, (int)((x + wob) * c->s), (int)(ry0 * c->s), b * 0.3f, US_MAT_WATER);
+			}
+		}
+	}
+
+	/* ---- the quiet arc: a faint, homogeneous band low over the ridge, the aurora's resting form. It fills
+	 * the sky above the mountains and carries the scene through breakdowns (brighter as the music thins,
+	 * breathing in silence), and it lies on the lake too. ---- */
+	{
+		int nq = nr * 2 / 3;
+		float qv = strength * cov * sqrtf(255.0f / (nq > 1 ? nq : 1)) * (0.13f + 0.2f * quiet * (0.7f + 0.6f * breath) + 0.06f * a->swell);
+		float qT = s->T * 0.35f;
+		float qpx = 0, qpy = 0;
+		for (int k = 0; k < nq; k++) {
+			float h1 = hash1(k, 3.7f), h2 = hash1(k + 4111, 3.7f), h3 = hash1(k + 977, 5.1f);
+			float u = (k + 1.6f * (h3 - 0.5f)) / nq;
+			float x = u * A;
+			float yr = ridge_y(u) - 0.012f;
+			float y = 0.56f - 0.035f * sinf(US_PI * u) + 0.012f * us_noise2(u * 2.2f + qT, 21.0f) - 0.03f * (s->height - 0.4f);
+			if (y > yr)
+				y = yr;
+			float patch = us_sat(0.6f + 0.8f * us_noise2(u * 6.0f - qT * 1.6f, 23.0f));
+			float b = qv * patch * (0.25f + 1.1f * h1 * h1);
+			/* its soft lower edge (ink) */
+			if (!ctx->crisp && k > 0)
+				rim(c, qpx, qpy, x, y, qv * patch * 0.05f, US_MAT_LEAF);
+			qpx = x;
+			qpy = y;
+			if (b < 0.01f)
+				continue;
+			float ln = (0.02f + 0.04f * patch) * (0.6f + 0.6f * h2);
+			ray(c, x, y, ln, 0.002f, b * 0.3f, 2.0f, -1, US_MAT_LEAF, 0.15f);
+			int gi = (int)(us_sat(u) * 63.0f);
+			glow[gi] += b * 0.004f;
+			if (k % 3 == 0) {
+				float ry0 = SHORE + 0.012f + (SHORE - y) * 0.22f;
+				float wob = 0.004f * us_noise2(x * 9.0f, (float)ctx->t * 0.7f);
+				ray(c, x + wob, ry0, ln * 0.5f, wob, b * (ctx->crisp ? 0.35f : 0.18f), 2.0f, 1, US_MAT_WATER, 0.4f);
 			}
 		}
 	}
@@ -565,11 +816,15 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 			/* keep the full stand ordering stable: skip by hash, not by index */
 			if ((int)(t->x * 997.0f) % s->ntr >= nt)
 				continue;
+			if (fabsf(t->x - s->cab_x) * A < 0.03f) /* the cabin's clearing */
+				continue;
 			spruce(c, ctx->crisp, t->x * A, SHORE + 0.002f, t->h, t->w, tv);
 			/* mirrored in the still water, dim and shortened */
 			spruce(c, ctx->crisp, t->x * A, SHORE + 0.004f, -t->h * 0.7f, t->w * 0.9f, tv * (ctx->crisp ? 0.5f : 0.32f));
 		}
 		us_line(c, 0, SHORE, A, SHORE, 0.0012f, 0.35f, US_MAT_EARTH);
+		cabin(s, ctx, c, day);
+		fox(s, ctx, c, day);
 		/* the far ridge, reflected and broken by slow ripples */
 		if (!ctx->crisp) {
 			float px = 0, py = 0;
@@ -604,6 +859,34 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 			float y = SHORE + 0.03f + k * k * 0.009f;
 			float x0 = (0.1f + 0.5f * (0.5f + 0.5f * us_noise2(k * 3.1f, (float)ctx->t * 0.02f))) * A;
 			us_line(c, x0, y, x0 + A * (0.1f + 0.06f * k), y, 0.0009f, 0.10f + 0.05f * day, US_MAT_WATER);
+		}
+		/* the brighter low stars, mirrored and trembling on the water */
+		float sv = us_sat(1.0f - day * 1.6f);
+		if (sv > 0.01f)
+			for (int i = 0; i < MAX_STARS / 2; i++) {
+				star_t *t = &s->st[i];
+				if (t->m < 0.3f || t->y < 0.25f)
+					continue;
+				float ry = SHORE + (SHORE - t->y) * 0.5f;
+				if (ry > 0.995f || t->y > ridge_y(t->x) - 0.01f)
+					continue;
+				float wob = 0.0025f * us_noise2(t->tw, (float)ctx->t * 0.9f);
+				float v = t->m * sv * (0.3f + 0.15f * us_noise2(t->tw + 7.0f, s->twk));
+				us_point(c, t->x * A + wob, ry, 0.0011f, v, US_MAT_WATER);
+			}
+		/* ice along the near edge: fine cracks, glinting when the sub makes the lake boom */
+		float icev = 0.06f + 0.1f * winter;
+		for (int i = 0; i < MAX_CRACK; i++) {
+			float g = s->crack_g[i];
+			float v = icev + 0.45f * g;
+			float *p = s->crack[i];
+			for (int k = 0; k + 1 < CRACK_PTS; k++)
+				wline_(c, ctx->crisp, p[2 * k] * A, p[2 * k + 1], p[2 * k + 2] * A, p[2 * k + 3],
+				       v * (1.0f - 0.08f * k), g > 0.4f ? US_MAT_LIGHT : US_MAT_WATER);
+			/* a short side branch */
+			int bk = 3 + i % 3;
+			wline_(c, ctx->crisp, p[2 * bk] * A, p[2 * bk + 1], p[2 * bk] * A + 0.01f, p[2 * bk + 1] + (i & 2 ? 0.008f : -0.006f),
+			       v * 0.7f, US_MAT_WATER);
 		}
 	}
 }
