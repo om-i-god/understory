@@ -9,6 +9,22 @@
  * Near seeds are full 3-D dandelion parachutes (achene, beak, a turning umbrella of barbed bristles); seed clocks
  * are spheres of tiny parachutes. The wind itself is drawn: streamlines (stream-function contours) ring each eddy
  * in drifting patches. Slanted light shafts (warm at dusk, pale by day) catch the particles inside them.
+ * Small living detail: a sycamore bough reaching in from the top-left (hanging flower tassels, paired seed keys that
+ * whirl down by autorotation), thistle down, dust motes adrift in the shafts, a big dandelion clock close to us in
+ * the lower right, a couple of bumblebees working the heads and hoverflies hanging in the air.
+ * More of the music, each with its own meaning (fast reactions are springs / eased envelopes, never on-off):
+ *   kick          -> a thump through the ground (grass and stems dip and spring back) and a jolt through the bough;
+ *                    a strong one may shake a ripe sycamore key loose
+ *   beat / onset  -> clocks release parachutes (the big foreground clock lets its largest seeds go)
+ *   hats (top bands' flux) -> about half the dust motes in the light shafts glitter
+ *   lowmid        -> the bumblebees' drone: flight speed, looping and wing blur
+ *   mid bands     -> each hoverfly darts to a new station when its own band rises (melody)
+ *   bands[]       -> each row head fluffs out with its own band (bass on the left, treble on the right); every
+ *                    seed of the foreground clock trembles with its own band
+ *   air           -> thistle down flares and is held aloft; motes brighten
+ *   swell         -> the bough heaves, its tassels sway wider and shed pollen
+ *   centroid      -> sun height: brighter music stands the light shafts up
+ *   width         -> a wide stereo image brings more of the wind's threads to the surface
  * World: reads bloom (flowers vs seed heads), pollen (how much is airborne), daylight, season, wind;
  *        writes pollen. In winter the air holds slow snow motes instead and the heads are bare.
  */
@@ -25,8 +41,14 @@
 #define NBEAM 3
 #define KX 52 /* streamline (contour) grid */
 #define KY 29
+#define NFLY 3   /* hoverflies */
+#define NBEE 2   /* bumblebees */
+#define NKEY 3   /* sycamore keys hanging from the bough */
+#define NCAT 6   /* flower tassels hanging from the bough */
+#define FGN 44   /* seeds on the big foreground clock */
+#define NMOTE 22 /* dust motes per light shaft */
 
-enum { K_GRAIN = 0, K_SPORE, K_SEED, K_SNOW };
+enum { K_GRAIN = 0, K_SPORE, K_SEED, K_SNOW, K_SAMARA, K_THISTLE };
 
 typedef struct {
 	float x, y, vx, vy; /* x stored as fraction of width */
@@ -45,8 +67,21 @@ typedef struct {
 	float flower;  /* 1 = flower (bloom), 0 = seed clock */
 	float ph;      /* sway phase */
 	float hx, hy;  /* current head position (normalized, x already * aspect) */
+	float top;     /* y of the top of the head (where a bee lands) */
 	int petals;
 } head_t;
+
+typedef struct {
+	float x, y, hx, hy; /* position, current hover station */
+	float cool, dir, ph, idle, env; /* env: slow memory of its band, so only a fresh rise makes it dart */
+	int band; /* the mid band this hoverfly answers */
+} fly_t;
+
+typedef struct {
+	float x, y, vx, vy, visit, ph, dir;
+	int tgt, state; /* state 0 flying, 1 on a head; tgt >= 0 a head, -1 an air waypoint, -2 choose next */
+	float wx, wy;
+} bee_t;
 
 typedef struct {
 	us_rng rng;
@@ -59,6 +94,15 @@ typedef struct {
 	float bass_s, high_s, lvl_s, swirl_t, wind_t;
 	float spawn_acc;
 	float beam_x[NBEAM], beam_w[NBEAM], beam_ph[NBEAM];
+	/* reactive envelopes */
+	float bslow[US_NBANDS], bdev[US_NBANDS]; /* per-band slow mean + eased rise above it */
+	float hat, lowmid_s, air_s, swell_s, slant, width_s, kick_prev;
+	float thump, thump_v; /* ground spring (kicks) */
+	float bough, bough_v; /* bough spring (kicks) */
+	float key_on[NKEY];   /* 1 = key hanging, regrows from 0 */
+	float fg_seeds, fg_ph;
+	fly_t fly[NFLY];
+	bee_t bee[NBEE];
 } st_t;
 
 static void *create(uint32_t seed)
@@ -69,6 +113,25 @@ static void *create(uint32_t seed)
 }
 
 static void destroy(void *p) { free(p); }
+
+static part_t *free_slot(st_t *st)
+{
+	for (int j = 0; j < MAXP; j++)
+		if (!st->p[j].alive)
+			return &st->p[j];
+	return NULL;
+}
+
+static inline float fract1(float x) { return x - floorf(x); }
+static inline float hash1(float x) { return fract1(sinf(x) * 43758.5453f); }
+
+/* the sycamore bough reaching in from the top-left: point at u (0 at the frame edge .. 1 at its tip) */
+static void bough_pt(const st_t *st, float t, float u, float *x, float *y)
+{
+	float heave = 0.004f * sinf(t * 0.35f) * (0.4f + st->swell_s) + 0.02f * st->bough;
+	*x = -0.03f + 0.40f * u;
+	*y = 0.045f + 0.07f * u * u + 0.006f * sinf(u * 7.0f + 1.0f) + heave * u * u;
+}
 
 static float ground_y(float xf) { return 0.93f + 0.015f * us_noise2(xf * 2.3f, 8.1f); }
 
@@ -84,6 +147,8 @@ static void spawn(st_t *st, part_t *q, float winter, int anywhere, float A)
 		q->kind = K_SNOW;
 	else if (u < 0.03f + 0.04f * q->z)
 		q->kind = K_SEED;
+	else if (u < 0.05f + 0.04f * q->z)
+		q->kind = K_THISTLE;
 	else if (u < 0.35f)
 		q->kind = K_SPORE;
 	else
@@ -252,6 +317,122 @@ static void pappus(us_canvas *c, int crisp, float x, float y, float sz, float ti
 	}
 }
 
+
+/* a sycamore key whirling down: nutlet + one veined wing turning about the vertical (autorotation), so the wing
+ * swings side to side and foreshortens as it turns edge-on */
+static void samara(us_canvas *c, int crisp, float x, float y, float L, float rot, float v, uint8_t m)
+{
+	float cr = cosf(rot), sr = sinf(rot);
+	float tx = x + cr * L, ty = y - L * (0.42f - 0.12f * sr);
+	float ux = tx - x, uy = ty - y, ul = sqrtf(ux * ux + uy * uy) + 1e-6f;
+	float nx = -uy / ul, ny = ux / ul;
+	float chord = L * (0.07f + 0.26f * fabsf(sr)); /* broad face-on, a sliver edge-on */
+	float bx = x + ux * 0.62f + nx * chord, by = y + uy * 0.62f + ny * chord;
+	if (crisp) {
+		us_disc(c, x, y, 0.004f, v, m);
+		us_line(c, x, y, tx, ty, 0.003f, v * 0.85f, m);
+		if (chord > L * 0.18f)
+			us_line(c, x, y, bx, by, 0.003f, v * 0.6f, m);
+		return;
+	}
+	us_disc(c, x, y, L * 0.11f + 0.0006f, v, m);
+	wline2(c, x, y, tx, ty, v, v * 0.7f, m);          /* thick leading edge */
+	wline2(c, x, y, bx, by, v * 0.5f, v * 0.45f, m);  /* trailing edge bellies out ... */
+	wline2(c, bx, by, tx, ty, v * 0.45f, v * 0.55f, m); /* ... and sweeps back to the tip */
+	for (int k = 1; k <= 3; k++) {                    /* fine veins fanning from the nut */
+		float f = k / 4.0f;
+		float ex = us_lerp(us_lerp(x, bx, 0.8f), tx, f), ey = us_lerp(us_lerp(y, by, 0.8f), ty, f);
+		wline(c, x + ux * 0.08f, y + uy * 0.08f, ex, ey, v * 0.22f, m);
+	}
+}
+
+/* thistle down: a seed hanging under a wide, soft tuft of feathery silk, rocking as it drifts.
+ * `open` (the air band) spreads the tuft wider and lifts the silk. */
+static void thistle(us_canvas *c, int crisp, float x, float y, float sz, float rock, float open, float v, uint8_t m)
+{
+	int n = crisp ? 6 : (sz > 0.02f ? 17 : 11);
+	float spread = 1.15f + 0.45f * open; /* half-angle of the tuft about straight up */
+	float sx = x - sinf(rock) * sz * 0.35f, sy = y + cosf(rock) * sz * 0.35f; /* the seed, hanging below */
+	if (crisp) {
+		us_point(c, sx, sy, 0.003f, v, m);
+		for (int k = 0; k < n; k++) {
+			float an = -US_PI * 0.5f + rock + spread * (2.0f * k / (n - 1) - 1.0f);
+			us_line(c, x, y, x + cosf(an) * sz * 0.8f, y + sinf(an) * sz * 0.7f, 0.002f, v * 0.45f, m);
+		}
+		return;
+	}
+	us_disc(c, sx, sy, 0.0008f + sz * 0.035f, v * 0.9f, m);
+	wline2(c, sx, sy, x, y, v * 0.6f, v * 0.4f, m);
+	int plume = sz > 0.018f;
+	for (int k = 0; k < n; k++) {
+		float f = 2.0f * (k + 0.5f) / n - 1.0f; /* -1 .. 1 across the tuft */
+		float an = -US_PI * 0.5f + rock + spread * f + 0.12f * sinf(k * 2.9f);
+		float L = sz * (0.75f + 0.25f * sinf(k * 3.1f + 1.0f)) * (1.0f - 0.2f * f * f);
+		float ca = cosf(an), sa = sinf(an);
+		/* each silk bows outward and its tip droops */
+		float mx = x + ca * L * 0.55f, my = y + sa * L * 0.55f;
+		float ex = x + ca * L, ey = y + sa * L + L * 0.18f * fabsf(f);
+		float hv = v * (0.32f + 0.2f * open) * (0.75f + 0.25f * (1.0f - fabsf(f)));
+		wline2(c, x, y, mx, my, hv, hv * 0.85f, m);
+		wline2(c, mx, my, ex, ey, hv * 0.85f, hv * 0.2f, m);
+		if (plume && (k & 1)) { /* feathery: a pair of fine side hairs on every other silk */
+			float bl = L * 0.18f;
+			wline2(c, mx, my, mx + (ca - sa) * bl, my + (sa + ca) * bl, hv * 0.4f, 0.0f, m);
+			wline2(c, mx, my, mx + (ca + sa) * bl, my + (sa - ca) * bl, hv * 0.4f, 0.0f, m);
+		}
+	}
+}
+
+/* an insect seen side-on. kind 0 = hoverfly (slim, striped), 1 = bumblebee (round, furry).
+ * wing 0..1 = how hard the wings are going (drawn as a translucent beat-blur). */
+static void insect(us_canvas *c, int crisp, int kind, float x, float y, float dir, float sc, float wing, float wph, float v)
+{
+	float L = (kind ? 0.024f : 0.021f) * sc;
+	if (crisp)
+		L *= 1.7f;
+	float hx = x + dir * L * 0.5f, hy = y - L * 0.06f;   /* head */
+	float tx = x - dir * L * 0.55f, ty = y + L * 0.12f;  /* tail */
+	if (crisp) {
+		/* body, head, and a wing pixel or two that flicker with the beat */
+		us_line(c, tx, ty, hx, hy, kind ? 0.006f : 0.004f, v * 0.85f, US_MAT_LIGHT);
+		us_point(c, hx, hy, 0.003f, v, US_MAT_EARTH);
+		float wa = 0.6f + 0.5f * sinf(wph);
+		us_line(c, x, y - L * 0.15f, x - dir * L * 0.35f, y - L * (0.6f + 0.35f * wa * wing), 0.003f,
+			v * (0.35f + 0.3f * wing), US_MAT_ACCENT);
+		return;
+	}
+	/* wing blur: a faint fan swept between the up- and down-stroke */
+	float wl = L * (kind ? 0.75f : 0.9f);
+	float sweep = 0.3f + 0.7f * wing; /* harder beating = wider blur */
+	float bx = x + dir * L * 0.08f, by = y - L * 0.18f;
+	float ux = bx - dir * wl * 0.45f, uy = by - wl * 0.8f;                    /* top of the stroke */
+	float lx = bx - dir * wl * 0.95f, ly = by - wl * (0.55f - 0.45f * sweep); /* bottom of the stroke */
+	us_tri(c, bx, by, ux, uy, lx, ly, v * (0.05f + 0.07f * wing), US_MAT_ACCENT);
+	float f = 0.5f + 0.5f * sinf(wph); /* the wing itself, caught somewhere in its stroke */
+	wline2(c, bx, by, us_lerp(ux, lx, f), us_lerp(uy, ly, f), v * 0.4f, v * 0.15f, US_MAT_ACCENT);
+	if (kind) {
+		/* bumblebee: round brown body, yellow collar and tail band, a dark head */
+		us_disc(c, x - dir * L * 0.22f, y + L * 0.06f, L * 0.34f, v * 0.42f, US_MAT_EARTH);
+		us_disc(c, x + dir * L * 0.14f, y, L * 0.28f, v * 0.4f, US_MAT_EARTH);
+		us_arc(c, x + dir * L * 0.14f, y, L * 0.2f, -2.6f, -0.5f, L * 0.12f, v * 0.6f, US_MAT_LIGHT);
+		float sx = x - dir * L * 0.3f;
+		wline(c, sx, y - L * 0.22f, sx - dir * L * 0.04f, y + L * 0.36f, v * 0.6f, US_MAT_LIGHT);
+		wline(c, sx - dir * L * 0.03f, y - L * 0.2f, sx - dir * L * 0.06f, y + L * 0.34f, v * 0.48f, US_MAT_LIGHT);
+		us_disc(c, hx, hy, L * 0.15f, v * 0.45f, US_MAT_EARTH);
+		/* legs dangling a little */
+		wline(c, x, y + L * 0.25f, x - dir * L * 0.1f, y + L * 0.6f, v * 0.4f, US_MAT_EARTH);
+	} else {
+		/* hoverfly: slim dark body, yellow wasp bands, big eye */
+		us_line(c, tx, ty, hx, hy, L * 0.17f, v * 0.42f, US_MAT_EARTH);
+		for (int k = 0; k < 3; k++) {
+			float g = 0.12f + 0.15f * k;
+			float sx = us_lerp(tx, hx, g), sy = us_lerp(ty, hy, g);
+			wline(c, sx, sy - L * 0.1f, sx, sy + L * 0.1f, v * 0.6f, US_MAT_LIGHT);
+		}
+		us_disc(c, hx, hy, L * 0.13f, v * 0.55f, US_MAT_EARTH);
+	}
+}
+
 static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 {
 	st_t *st = sp;
@@ -286,6 +467,26 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 			st->beam_w[k] = us_randr(r, 0.04f, 0.11f);
 			st->beam_ph[k] = us_rand(r) * 10.0f;
 		}
+		st->slant = 0.42f;
+		st->fg_seeds = us_randr(r, 0.75f, 1.0f);
+		st->fg_ph = us_rand(r) * 10.0f;
+		for (int k = 0; k < NKEY; k++)
+			st->key_on[k] = us_randr(r, 0.6f, 1.0f);
+		for (int f = 0; f < NFLY; f++) {
+			st->fly[f].hx = st->fly[f].x = us_randr(r, 0.15f, 0.85f) * A;
+			st->fly[f].hy = st->fly[f].y = us_randr(r, 0.32f, 0.72f);
+			st->fly[f].dir = us_rand(r) < 0.5f ? -1.0f : 1.0f;
+			st->fly[f].ph = us_rand(r) * 20.0f;
+			st->fly[f].idle = us_randr(r, 2.0f, 8.0f);
+			st->fly[f].band = 15 + 3 * f; /* ~1–2.5 kHz: the melody's register */
+		}
+		for (int b = 0; b < NBEE; b++) {
+			st->bee[b].x = us_randr(r, 0.2f, 0.8f) * A;
+			st->bee[b].y = us_randr(r, 0.4f, 0.7f);
+			st->bee[b].tgt = (int)(us_rand(r) * NHEADS);
+			st->bee[b].ph = us_rand(r) * 20.0f;
+			st->bee[b].dir = 1;
+		}
 		/* airborne amount at open remembers the world's pollen */
 		float nmax = 250.0f + 700.0f * dens;
 		int n0 = (int)(nmax * us_sat(0.4f + 0.8f * w->pollen + 0.2f * w->bloom));
@@ -303,6 +504,43 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 	float wind = us_sat(0.25f * w->wind + 0.5f * st->lvl_s);
 	st->wind_t += dt * (0.2f + wind);
 	st->swirl_t += dt * (0.05f + 0.12f * st->bass_s);
+
+	/* each band's rise above its own slow mean, eased (attack ~50 ms, release ~0.35 s): the clocks, the
+	 * hoverflies, the big foreground clock and the dust glints each listen to their own slice of the spectrum */
+	for (int b = 0; b < US_NBANDS; b++) {
+		float v = a->bands[b];
+		st->bslow[b] = us_approach(st->bslow[b], v, 0.6f, rdt);
+		float d = us_sat((v - st->bslow[b]) * 3.0f);
+		st->bdev[b] = us_approach(st->bdev[b], d, d > st->bdev[b] ? 0.05f : 0.35f, rdt);
+	}
+	{
+		float h = 0; /* hats / shakers: the top bands' flux */
+		for (int b = 23; b <= 28; b++)
+			h += st->bdev[b];
+		h = us_sat(h / 6.0f * 1.6f);
+		st->hat = us_approach(st->hat, h, h > st->hat ? 0.03f : 0.22f, rdt);
+	}
+	st->lowmid_s = us_approach(st->lowmid_s, a->lowmid, 0.5f, rdt);
+	st->air_s = us_approach(st->air_s, a->air, 0.35f, rdt);
+	st->swell_s = us_approach(st->swell_s, a->swell, 1.0f, rdt);
+	st->width_s = us_approach(st->width_s, a->width, 1.5f, rdt);
+	/* brightness of the music = height of the sun: brighter mixes stand the light shafts up */
+	st->slant = us_approach(st->slant, 0.52f - 0.3f * a->centroid, 4.0f, rdt);
+	/* kicks: a thump through the ground and a jolt through the bough, both damped springs */
+	int kick_hit = a->kick > st->kick_prev + 0.12f && a->kick > 0.35f;
+	if (kick_hit) {
+		st->thump_v += 17.0f * a->kick;
+		st->bough_v += 10.0f * a->kick;
+	}
+	st->kick_prev = a->kick;
+	{
+		float sdt = rdt > 0.05f ? 0.05f : rdt;
+		const float wt = US_TAU * 2.8f, wb = US_TAU * 1.6f;
+		st->thump_v += (-wt * wt * st->thump - 2.0f * 0.3f * wt * st->thump_v) * sdt;
+		st->thump += st->thump_v * sdt;
+		st->bough_v += (-wb * wb * st->bough - 2.0f * 0.22f * wb * st->bough_v) * sdt;
+		st->bough += st->bough_v * sdt;
+	}
 
 	/* ---- world ---- */
 	us_world_add(w, &w->pollen, 0.004f * (0.2f + st->high_s + a->onset * 0.5f) * (0.3f + w->bloom) * (1.0f - winter), dt);
@@ -362,11 +600,13 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 		gmean /= (float)(gx * gy);
 		float sv = (ctx->crisp ? 0.2f : 0.22f) * (0.55f + 0.6f * st->bass_s) * (1.0f - 0.5f * winter);
 		float hx = A / gx, hy = 1.0f / gy;
+		/* a wide stereo image opens the air: more of the wind's threads surface at once */
+		float wopen = 0.08f - 0.4f * st->width_s;
 		for (int j = 0; j < gy; j++)
 			for (int i = 0; i < gx; i++) {
 				float x0 = i * hx, y0 = j * hy;
 				/* only patches of the field show at a time, and never right down in the grass */
-				float patch = us_smooth(-0.05f, 0.45f, us_noise3(x0 * 1.4f, y0 * 1.6f, t * 0.04f)) *
+				float patch = us_smooth(wopen, 0.45f, us_noise3(x0 * 1.4f, y0 * 1.6f, t * 0.04f)) *
 					      (1.0f - us_smooth(0.72f, 0.9f, y0));
 				if (patch < 0.02f)
 					continue;
@@ -398,7 +638,7 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 	}
 
 	/* ---- light shafts: slanted bundles of hairlines, warm at dusk, pale by day ---- */
-	const float bdx = 0.42f; /* beam slant: x shift per unit of y */
+	const float bdx = st->slant; /* beam slant: x shift per unit of y (spectral centroid = sun height) */
 	float beam_v[NBEAM];
 	for (int k = 0; k < NBEAM; k++) {
 		float flick = 0.5f + 0.5f * us_noise2(t * 0.07f, st->beam_ph[k]);
@@ -434,6 +674,144 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 				wline2(c, x0 + off, -0.02f, x0 + off + bdx * (yb + 0.02f), yb,
 				       0.36f * beam_v[k] * edge * (0.35f + 0.65f * dust), 0.02f * beam_v[k], US_MAT_LIGHT);
 		}
+		/* dust motes adrift in the shaft: they turn slowly in the light, the air band brightens them all,
+		 * and hats / shakers make about half of them glitter (eased, so it reads as a shimmer, not a strobe) */
+		int nm = ctx->crisp ? NMOTE / 3 : NMOTE;
+		float mb = beam_v[k] * (0.6f + 0.6f * st->air_s);
+		for (int m = 0; m < nm; m++) {
+			float h1 = hash1(m * 12.9898f + k * 78.233f), h2 = hash1(m * 39.346f + k * 11.135f + 3.0f);
+			float h3 = hash1(m * 73.156f + k * 52.235f + 7.0f);
+			float u = fract1(h1 + t * (0.003f + 0.008f * h2));
+			float yy = -0.02f + u * 0.86f;
+			float off = (h3 - 0.5f) * wdt * 0.85f + 0.008f * us_noise2(t * 0.15f + m * 3.1f, k * 7.7f);
+			float xx = x0 + off + bdx * (yy + 0.02f);
+			float e = fabsf(off) / (wdt * 0.5f + 1e-4f);
+			float tw = 0.5f + 0.5f * sinf(t * (0.8f + 1.6f * h2) + h1 * 40.0f);
+			float sel = h2 > 0.45f ? 1.0f : 0.0f;
+			float fade = us_sat(u * 8.0f) * us_sat((1.0f - u) * 4.0f);
+			float vv = mb * us_sat(1.0f - e * e) * fade * (0.18f + 0.3f * tw * tw + 1.1f * st->hat * sel);
+			if (vv < 0.03f || (ctx->crisp && vv < 0.12f))
+				continue;
+			us_point(c, xx, yy, ctx->crisp ? 0.003f : 0.0011f, us_sat(vv), US_MAT_LIGHT);
+			if (!ctx->crisp && sel > 0 && st->hat * vv > 0.12f) {
+				float gl = 0.0035f * us_sat(st->hat * 1.5f); /* a tiny four-point glint */
+				float gv = us_sat(vv * 0.6f);
+				wline2(c, xx, yy, xx - gl, yy, gv, 0.0f, US_MAT_LIGHT);
+				wline2(c, xx, yy, xx + gl, yy, gv, 0.0f, US_MAT_LIGHT);
+				wline2(c, xx, yy, xx, yy - gl, gv, 0.0f, US_MAT_LIGHT);
+				wline2(c, xx, yy, xx, yy + gl, gv, 0.0f, US_MAT_LIGHT);
+			}
+		}
+	}
+
+	/* ---- a sycamore bough reaching in from the top-left: hanging flower tassels that sway wider and shed
+	 * pollen as the phrase swells, and seed keys that a kick can shake loose to whirl down ---- */
+	{
+		const int NS = 12;
+		float bx[13], by[13];
+		for (int i = 0; i <= NS; i++)
+			bough_pt(st, t, (float)i / NS, &bx[i], &by[i]);
+		for (int i = 0; i < NS; i++) {
+			float u = (float)i / NS;
+			float wd = ctx->crisp ? (u < 0.5f ? 0.008f : 0.005f) : 0.007f - 0.0052f * u;
+			us_line(c, bx[i], by[i], bx[i + 1], by[i + 1], wd, 0.42f, US_MAT_EARTH);
+		}
+		/* side twigs */
+		for (int k = 0; k < 4; k++) {
+			float u = 0.3f + 0.22f * k, px, py;
+			bough_pt(st, t, u > 1.0f ? 1.0f : u, &px, &py);
+			float tx = px + 0.035f + 0.01f * k, ty = py + 0.018f + 0.008f * (k & 1) - 0.03f * (k == 1);
+			if (ctx->crisp)
+				us_line(c, px, py, tx, ty, 0.003f, 0.45f, US_MAT_EARTH);
+			else
+				wline2(c, px, py, tx, ty, 0.5f, 0.3f, US_MAT_EARTH);
+		}
+		/* flower tassels (sycamore racemes): loose chains that whip at their tips */
+		float tas = 1.0f - winter;
+		if (tas > 0.1f)
+			for (int i = 0; i < NCAT; i++) {
+				float u = 0.14f + 0.15f * i, px, py;
+				bough_pt(st, t, u, &px, &py);
+				float len = (0.035f + 0.025f * hash1(i * 5.1f + 1.0f)) * tas;
+				float th = (0.22f * us_noise2(st->wind_t * 0.5f + i * 1.7f, 3.0f) + 0.1f) * (0.3f + wind) +
+					   0.3f * st->swell_s * sinf(t * 0.7f + i * 1.3f) + 0.8f * st->bough;
+				const int n = 7;
+				float cx = px, cy = py + 0.002f;
+				for (int j = 0; j < n; j++) {
+					float f = (j + 1.0f) / n, an = th * (0.25f + 0.75f * f);
+					float nx = cx + sinf(an) * len / n, ny = cy + cosf(an) * len / n;
+					if (ctx->crisp)
+						us_point(c, nx + ((j & 1) ? 0.003f : -0.003f), ny, 0.003f, 0.5f, US_MAT_BLOOM);
+					else {
+						wline(c, cx, cy, nx, ny, 0.3f, US_MAT_STEM);
+						/* little florets, alternate sides, smaller toward the tip */
+						float side = (j & 1) ? 1.0f : -1.0f, fr = 0.0024f * (1.0f - 0.45f * f);
+						us_disc(c, nx + side * cosf(an) * fr, ny - side * sinf(an) * fr, fr, 0.42f, US_MAT_BLOOM);
+					}
+					cx = nx, cy = ny;
+				}
+				/* the swelling phrase shakes pollen out of the tassels */
+				float rate = (0.03f + 1.3f * st->swell_s * st->swell_s) * tas;
+				if (us_rand(&st->rng) < dt * rate) {
+					part_t *q = free_slot(st);
+					if (q) {
+						spawn(st, q, 0, 1, A);
+						q->kind = K_GRAIN;
+						q->x = cx / A;
+						q->y = cy;
+						q->z = us_randr(&st->rng, 0.55f, 0.9f);
+						q->vx = us_randn(&st->rng) * 0.01f;
+						q->vy = 0.01f;
+						q->life = 0.5f;
+					}
+				}
+			}
+		/* seed keys: paired wings hanging in a V; a strong kick can shake a ripe one loose */
+		for (int k = 0; k < NKEY; k++) {
+			float u = 0.42f + 0.25f * k, px, py;
+			bough_pt(st, t, u > 1.0f ? 1.0f : u, &px, &py);
+			st->key_on[k] = us_sat(st->key_on[k] + dt * 0.02f);
+			float kr = st->key_on[k];
+			if (kr < 0.3f)
+				continue;
+			float sway = 0.15f * us_noise2(st->wind_t * 0.6f, k * 4.0f + 9.0f) + 0.7f * st->bough;
+			float nx = px + sinf(sway) * 0.012f, ny = py + cosf(sway) * 0.012f;
+			float L = 0.026f * kr;
+			if (ctx->crisp)
+				us_line(c, px, py, nx, ny, 0.003f, 0.4f, US_MAT_STEM);
+			else
+				wline(c, px, py, nx, ny, 0.35f, US_MAT_STEM);
+			for (int sd = -1; sd <= 1; sd += 2) {
+				float an = sway + sd * 0.42f;
+				float dx = sinf(an), dy = cosf(an);
+				float tx = nx + dx * L, ty = ny + dy * L;
+				float mx = nx + dx * L * 0.6f + sd * dy * L * 0.22f, my = ny + dy * L * 0.6f - sd * dx * L * 0.22f;
+				if (ctx->crisp) {
+					us_line(c, nx, ny, tx, ty, 0.003f, 0.5f, US_MAT_EARTH);
+					continue;
+				}
+				wline2(c, nx, ny, tx, ty, 0.7f, 0.5f, US_MAT_EARTH);
+				wline2(c, nx, ny, mx, my, 0.45f, 0.4f, US_MAT_EARTH);
+				wline2(c, mx, my, tx, ty, 0.4f, 0.5f, US_MAT_EARTH);
+			}
+			us_disc(c, nx, ny, ctx->crisp ? 0.004f : 0.0028f, 0.55f, US_MAT_EARTH);
+			int drop = kr > 0.99f && ((kick_hit && a->kick > 0.5f && us_rand(&st->rng) < 0.3f) ||
+						  us_rand(&st->rng) < dt * (0.004f + 0.03f * autumn));
+			if (drop) {
+				part_t *q = free_slot(st);
+				if (q) {
+					spawn(st, q, 0, 1, A);
+					q->kind = K_SAMARA;
+					q->x = nx / A;
+					q->y = ny;
+					q->z = us_randr(&st->rng, 0.7f, 1.0f);
+					q->vr = (us_rand(&st->rng) < 0.5f ? -1.0f : 1.0f) * us_randr(&st->rng, 7.0f, 10.0f);
+					q->life = 1.0f;
+					q->ttl = 60.0f;
+					st->key_on[k] = 0;
+				}
+			}
+		}
 	}
 
 	/* ---- ground: low grass line ---- */
@@ -448,7 +826,8 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 		int nb = (int)(NBLADE * (0.4f + 0.6f * dens) * (1.0f - 0.6f * winter));
 		for (int b = 0; b < nb; b++) {
 			float xf = st->blade_x[b], x0 = xf * A, gy = ground_y(xf), h = st->blade_h[b];
-			float sw = (us_noise2(x0 * 1.5f - st->wind_t * 0.5f, st->blade_ph[b]) * 0.6f + 0.3f) * (0.2f + 0.8f * wind);
+			float sw = (us_noise2(x0 * 1.5f - st->wind_t * 0.5f, st->blade_ph[b]) * 0.6f + 0.3f) * (0.2f + 0.8f * wind) +
+				   0.8f * st->thump * (0.5f + st->blade_ph[b] * 0.05f);
 			float bp[8];
 			for (int q = 0; q < 4; q++) {
 				float u = q / 3.0f;
@@ -483,22 +862,27 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 		int release = beat_ok && us_rand(&st->rng) < 0.3f + 0.4f * a->onset ? 1 + (us_rand(&st->rng) < a->onset * 0.5f) : 0;
 		float xf = h->x, x0 = xf * A, gy = ground_y(xf);
 		float H = h->h * (1.0f - 0.4f * winter);
-		float sw = (us_noise2(st->wind_t * 0.4f, h->ph) * 0.8f + 0.3f) * (0.04f + 0.12f * wind + 0.06f * st->high_s);
-		float hx = x0 + sw * H, hy = gy - H;
+		float sw = (us_noise2(st->wind_t * 0.4f, h->ph) * 0.8f + 0.3f) * (0.04f + 0.12f * wind + 0.06f * st->high_s) +
+			   0.12f * st->thump * (0.6f + 0.4f * sinf(h->ph)); /* a kick shudders up through the stems */
+		/* every head listens to its own band, low on the left to high on the right; its clock fluffs out (or
+		 * its petals open) when that band rises above its usual level */
+		float bd = st->bdev[3 + i * 24 / (NHEADS - 1)];
+		float hx = x0 + sw * H, hy = gy - H + 0.011f * st->thump * (H / 0.2f);
 		h->hx = hx;
 		h->hy = hy;
 		float sp[8];
 		for (int q = 0; q < 4; q++) {
 			float u = q / 3.0f;
 			sp[2 * q] = x0 + sw * H * u * u;
-			sp[2 * q + 1] = gy - H * u;
+			sp[2 * q + 1] = gy - H * u + 0.011f * st->thump * (H / 0.2f) * u;
 		}
 		us_polyline(c, sp, 4, ctx->crisp ? 0.002f : 0.0013f, 0.45f, US_MAT_STEM);
+		h->top = hy - (h->flower > 0.5f ? 0.006f : 0.029f + 0.022f * (H / 0.3f));
 		if (winter > 0.8f)
 			continue;
 		if (h->flower > 0.5f) {
 			/* composite flower: ray petals + disc */
-			float fr = 0.018f + 0.01f * (H / 0.22f);
+			float fr = (0.018f + 0.01f * (H / 0.22f)) * (0.92f + 0.16f * bd);
 			for (int k = 0; k < h->petals; k++) {
 				float ang = US_TAU * k / h->petals + h->ph;
 				float ex = hx + cosf(ang) * fr, ey = hy + sinf(ang) * fr * 0.45f;
@@ -524,7 +908,7 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 						}
 		} else {
 			/* dandelion clock: a sphere of radial hairs, thinning as seeds blow away */
-			float cr = 0.026f + 0.022f * (H / 0.3f);
+			float cr = (0.026f + 0.022f * (H / 0.3f)) * (0.95f + 0.12f * bd);
 			int nh = ctx->crisp ? 14 : 34;
 			int keep = (int)(nh * h->seeds + 0.5f);
 			for (int k = 0; k < keep; k++) {
@@ -536,7 +920,7 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 				float dep = sinf(ang) * 0.0f + zz; /* +1 near */
 				float rr = cr * (0.88f + 0.12f * sinf(k * 3.7f));
 				float ex = hx + ux * rr * 0.55f, ey = hy + uy * rr * 0.55f; /* beak ends, pappus begins */
-				float hv = 0.75f * (0.55f + 0.45f * (0.5f + 0.5f * dep));
+				float hv = 0.75f * (0.55f + 0.45f * (0.5f + 0.5f * dep)) * (0.9f + 0.35f * bd);
 				if (ctx->crisp) {
 					us_line(c, hx, hy, hx + ux * rr, hy + uy * rr, 0.002f, 0.32f, US_MAT_ACCENT);
 					us_point(c, hx + ux * rr, hy + uy * rr, 0.002f, 0.7f, US_MAT_ACCENT);
@@ -620,26 +1004,36 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 		case K_SEED: fall = 0.010f; buoy = 1.3f; break;
 		case K_SPORE: fall = 0.004f; buoy = 0.8f; break;
 		case K_SNOW: fall = 0.022f; buoy = 0.25f; break;
+		case K_SAMARA: fall = 0.055f; buoy = 0.12f; break;
+		case K_THISTLE: fall = 0.007f; buoy = 0.85f; break;
 		default: fall = 0.006f; buoy = 1.0f; break;
 		}
 		float tvx = (fvx + breeze * (0.6f + 0.4f * q->seedv)) * par;
 		float tvy = (fvy + fall - lift * buoy) * par;
 		/* thermals are patchy: noisy updraft columns */
 		tvy -= lift * buoy * 0.8f * us_sat(us_noise2(X * 2.0f + t * 0.05f, 3.3f)) * par;
-		float resp = q->kind == K_SEED ? 1.2f : 0.5f;
+		if (q->kind == K_THISTLE) /* the air band holds the silk aloft */
+			tvy -= 0.01f * st->air_s * par;
+		float resp = q->kind == K_SEED || q->kind == K_THISTLE ? 1.2f : (q->kind == K_SAMARA ? 0.35f : 0.5f);
 		q->vx = us_approach(q->vx, tvx, resp, dt);
 		q->vy = us_approach(q->vy, tvy, resp, dt);
 		q->x += q->vx * dt / A;
 		q->y += q->vy * dt;
-		q->rot += (q->vr + q->vx * 6.0f) * dt;
-		q->rot = us_lerp(q->rot, 0.0f, dt * 0.3f); /* pappus parachutes right themselves */
+		if (q->kind == K_SAMARA) {
+			/* autorotation: a whirl that also sways the key side to side as it spirals down */
+			q->rot += q->vr * dt;
+			q->x += 0.012f * cosf(q->rot) * fabsf(q->vr) * dt / A * 0.6f;
+		} else {
+			q->rot += (q->vr + q->vx * 6.0f) * dt;
+			q->rot = us_lerp(q->rot, 0.0f, dt * 0.3f); /* pappus parachutes right themselves */
+		}
 		q->age += dt;
 		if (q->age > q->ttl)
 			q->life -= dt * 0.4f; /* settles out of the air */
 		else
 			q->life = us_sat(q->life + dt * 0.5f);
 		int out = q->x < -0.05f || q->x > 1.05f || q->y < -0.06f || q->y > 1.02f;
-		if (q->kind == K_SNOW && q->y > ground_y(q->x))
+		if ((q->kind == K_SNOW || q->kind == K_SAMARA) && q->y > ground_y(q->x))
 			out = 1;
 		if (out || q->life < 0 || (alive > target + 20 && us_rand(&st->rng) < dt * 0.05f)) {
 			q->alive = 0;
@@ -682,6 +1076,18 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 			}
 			break;
 		}
+		case K_SAMARA:
+			samara(c, ctx->crisp, X, q->y, 0.016f + 0.014f * q->z, q->rot, us_sat(v * 0.8f), US_MAT_EARTH);
+			break;
+		case K_THISTLE: {
+			float sz = 0.008f + 0.034f * q->z * q->z;
+			if (q->z < 0.15f)
+				us_point(c, X, q->y, ctx->crisp ? 0.003f : 0.0016f, us_sat(v * 0.7f), US_MAT_ACCENT);
+			else
+				thistle(c, ctx->crisp, X, q->y, sz, 0.35f * sinf(q->age * (0.5f + q->seedv) + q->seedv * 9.0f) + q->vx * 3.0f, st->air_s, us_sat(v * 0.8f),
+					US_MAT_ACCENT);
+			break;
+		}
 		case K_SNOW: {
 			float r = 0.0012f + 0.004f * q->z;
 			if (ctx->crisp)
@@ -701,6 +1107,149 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 		}
 	}
 	c->blend = US_BLEND_MAX;
+
+	/* ---- hoverflies: hang motionless in the air, then dart to a new station when their slice of the melody
+	 * (one mid band each) rises; with nothing to answer they still drift off every few seconds ---- */
+	if (winter < 0.75f)
+		for (int f = 0; f < NFLY; f++) {
+			if (f == 2 && dens < 0.3f)
+				break;
+			fly_t *fl = &st->fly[f];
+			fl->cool -= rdt;
+			fl->idle -= dt;
+			float d = st->bdev[fl->band] + 0.5f * st->bdev[fl->band + 1];
+			int rise = d - fl->env > 0.22f;
+			fl->env = us_approach(fl->env, d, 0.5f, rdt);
+			if ((rise && fl->cool <= 0) || fl->idle <= 0) {
+				float jump = us_randr(&st->rng, 0.04f, 0.13f) * (us_rand(&st->rng) < 0.5f ? -1.0f : 1.0f);
+				float nhx = us_clampf(fl->hx + jump, 0.08f * A, 0.92f * A);
+				fl->hy = us_clampf(fl->hy + us_randn(&st->rng) * 0.04f, 0.28f, 0.78f);
+				if (fabsf(nhx - fl->hx) > 0.01f)
+					fl->dir = nhx > fl->hx ? 1.0f : -1.0f;
+				fl->hx = nhx;
+				fl->cool = us_randr(&st->rng, 0.9f, 1.8f);
+				fl->idle = us_randr(&st->rng, 3.0f, 9.0f);
+			}
+			float ox = fl->x, oy = fl->y;
+			fl->x = us_approach(fl->x, fl->hx, 0.09f, dt);
+			fl->y = us_approach(fl->y, fl->hy, 0.09f, dt);
+			float spd = sqrtf((fl->x - ox) * (fl->x - ox) + (fl->y - oy) * (fl->y - oy)) / (dt + 1e-4f);
+			float jx = 0.0018f * us_noise2(t * 2.3f, fl->ph), jy = 0.0014f * us_noise2(t * 2.0f, fl->ph + 5.0f);
+			insect(c, ctx->crisp, 0, fl->x + jx, fl->y + jy, fl->dir, 1.0f, us_sat(0.4f + spd * 2.0f), t * 31.0f + fl->ph,
+			       0.75f + 0.25f * day);
+		}
+
+	/* ---- bumblebees: the low-mid drone. They work the heads one by one; the more low-mid body in the
+	 * music, the faster and loopier they fly and the harder the wings blur ---- */
+	for (int b = 0; b < NBEE; b++) {
+		if (b == 1 && dens < 0.35f)
+			break;
+		bee_t *be = &st->bee[b];
+		float lm = st->lowmid_s;
+		int away = winter > 0.6f;
+		if (be->state == 1 && be->tgt >= 0 && !away) {
+			head_t *h = &st->hd[be->tgt];
+			be->x = us_approach(be->x, h->hx + 0.003f * sinf(t * 0.9f + be->ph), 0.15f, dt);
+			be->y = us_approach(be->y, h->top, 0.15f, dt);
+			be->visit -= dt * (0.7f + 0.8f * lm);
+			if (be->visit <= 0 || (h->flower < 0.5f && h->seeds < 0.1f))
+				be->state = 0, be->tgt = -2; /* lift off, then choose */
+		} else {
+			if (be->tgt == -2 || away) {
+				if (away) {
+					be->tgt = -1, be->wx = A + 0.2f, be->wy = 0.35f;
+				} else if (us_rand(&st->rng) < 0.7f) {
+					be->tgt = (int)(us_rand(&st->rng) * NHEADS);
+				} else {
+					be->tgt = -1;
+					be->wx = us_randr(&st->rng, 0.1f, 0.9f) * A;
+					be->wy = us_randr(&st->rng, 0.35f, 0.7f);
+				}
+			}
+			float txp = be->tgt >= 0 ? st->hd[be->tgt].hx : be->wx, typ = be->tgt >= 0 ? st->hd[be->tgt].top : be->wy;
+			float dx = txp - be->x, dy = typ - be->y, dist = sqrtf(dx * dx + dy * dy) + 1e-5f;
+			float vmax = 0.05f + 0.13f * lm, sp = fminf(vmax, dist * 2.0f + 0.01f);
+			float wob = (0.03f + 0.08f * lm) * us_noise2(t * (0.9f + 1.2f * lm), be->ph);
+			float dvx = dx / dist * sp - dy / dist * wob, dvy = dy / dist * sp + dx / dist * wob;
+			be->vx = us_approach(be->vx, dvx, 0.3f, dt);
+			be->vy = us_approach(be->vy, dvy, 0.3f, dt);
+			be->x += be->vx * dt;
+			be->y += be->vy * dt;
+			if (fabsf(be->vx) > 0.01f)
+				be->dir = be->vx > 0 ? 1.0f : -1.0f;
+			if (be->tgt >= 0 && dist < 0.006f)
+				be->state = 1, be->visit = us_randr(&st->rng, 1.5f, 5.0f);
+			else if (be->tgt == -1 && dist < 0.02f && !away)
+				be->tgt = -2;
+			if (be->tgt >= 0 && st->hd[be->tgt].flower < 0.5f && st->hd[be->tgt].seeds < 0.1f)
+				be->tgt = -2;
+		}
+		if (away && be->x > A + 0.05f)
+			continue;
+		if (!away && be->x > A + 0.05f) /* came back after the winter */
+			be->x = A + 0.04f;
+		float bob = be->state == 1 ? 0 : 0.002f * sinf(t * 5.0f + be->ph);
+		insect(c, ctx->crisp, 1, be->x, be->y - 0.004f + bob, be->dir, 1.0f + 0.15f * (b == 0),
+		       be->state == 1 ? 0.15f : 0.45f + 0.55f * lm, t * 37.0f + be->ph, 0.8f + 0.2f * day);
+	}
+
+	/* ---- a big dandelion clock close to us in the lower right. Each of its seeds trembles with its own band,
+	 * so the spectrum ripples over the sphere; a strong hit lets a few go, very near and large ---- */
+	if (winter < 0.8f) {
+		float fx = A - 0.19f, fby = 1.03f;
+		float FH = 0.42f;
+		float fsw = (us_noise2(st->wind_t * 0.3f, st->fg_ph) * 0.6f + 0.2f) * (0.03f + 0.08f * wind) + 0.06f * st->thump;
+		float hx = fx + fsw * FH, hy = fby - FH + 0.01f * st->thump;
+		float sp[8];
+		for (int q = 0; q < 4; q++) {
+			float u = q / 3.0f;
+			sp[2 * q] = fx + fsw * FH * u * u;
+			sp[2 * q + 1] = fby - FH * u + 0.01f * st->thump * u;
+		}
+		us_polyline(c, sp, 4, ctx->crisp ? 0.004f : 0.0026f, 0.5f, US_MAT_STEM);
+		float R = 0.1f;
+		st->fg_seeds = us_sat(st->fg_seeds + dt * 0.008f * (1.0f - winter));
+		int keep = (int)(FGN * st->fg_seeds + 0.5f);
+		for (int k = 0; k < keep; k++) {
+			float zz = 1.0f - 2.0f * (k + 0.5f) / FGN;
+			float rr0 = sqrtf(1.0f - zz * zz);
+			float ang = US_TAU * (k * 0.618034f) + st->fg_ph + fsw * 1.5f;
+			float tremble = st->bdev[2 + (k * 11) % 27];
+			float ux = cosf(ang) * rr0, uy = sinf(ang) * rr0 * 0.92f - zz * 0.1f;
+			float rr = R * (0.9f + 0.1f * sinf(k * 3.7f)) * (1.0f + 0.07f * tremble);
+			float hv = 0.8f * (0.5f + 0.25f * (1.0f + zz)) * (0.85f + 0.4f * tremble);
+			float ex = hx + ux * rr * 0.55f, ey = hy + uy * rr * 0.55f;
+			if (ctx->crisp) {
+				us_line(c, hx, hy, hx + ux * rr, hy + uy * rr, 0.002f, 0.3f * hv, US_MAT_ACCENT);
+				us_point(c, hx + ux * rr, hy + uy * rr, 0.003f, us_sat(hv), US_MAT_ACCENT);
+			} else {
+				wline(c, hx, hy, ex, ey, 0.3f * hv, US_MAT_ACCENT);
+				float pl = sqrtf(ux * ux + uy * uy) + 1e-4f;
+				float tilt = atan2f(ux / pl, -uy / pl) + 0.12f * tremble * sinf(t * 7.0f + k);
+				pappus(c, 0, ex - ux / pl * 0.004f, ey - uy / pl * 0.004f, rr * 0.42f * (0.6f + 0.4f * pl), tilt,
+				       k * 1.3f, us_sat(hv), US_MAT_ACCENT, 12);
+			}
+		}
+		us_disc(c, hx, hy, R * 0.1f, 0.55f, US_MAT_EARTH);
+		int n = (a->beat && a->onset > 0.55f && us_rand(&st->rng) < 0.45f) +
+			(us_rand(&st->rng) < dt * 0.04f * (0.3f + st->high_s));
+		for (int k = 0; k < n && st->fg_seeds > 0.15f; k++) {
+			part_t *q = free_slot(st);
+			if (!q)
+				break;
+			spawn(st, q, 0, 1, A);
+			q->kind = K_SEED;
+			float an = us_randr(&st->rng, -US_PI * 0.9f, -US_PI * 0.1f);
+			q->x = (hx + cosf(an) * R) / A;
+			q->y = hy + sinf(an) * R;
+			q->z = us_randr(&st->rng, 0.9f, 1.0f);
+			q->vx = cosf(an) * 0.04f + 0.03f;
+			q->vy = sinf(an) * 0.04f - 0.03f;
+			q->life = 1.0f;
+			q->ttl = us_randr(&st->rng, 10.0f, 20.0f);
+			st->fg_seeds -= 1.0f / FGN;
+		}
+	}
 
 	if (!ctx->crisp) {
 		tint_air(c, US_MAT_ACCENT, 12, (1u << US_MAT_BG) | (1u << US_MAT_WATER));
