@@ -125,11 +125,13 @@ static void test_world(void)
 	CHECK(us_world_step(&w, &a, 3599 / 60.0, 1.0f / 60, 1) == 0, "double step not deduped");
 	CHECK(w.storm_charge > 0.1f, "storm didn't charge: %.3f", w.storm_charge);
 	CHECK(w.growth > 0.15f, "growth didn't rise: %.3f", w.growth);
-	const char *path = "/tmp/us_world_test.json";
+	const char *path = "us_world_test.json"; /* cwd: portable (no /tmp on Windows) */
 	CHECK(us_world_save(&w, path), "save");
+	CHECK(us_world_save(&w, path), "save over an existing file");
 	us_world r;
 	CHECK(us_world_load(&r, path), "load");
 	CHECK(fabsf(r.growth - w.growth) < 1e-4f && fabsf(r.season - w.season) < 1e-4f, "roundtrip");
+	remove(path);
 	float sum = 0;
 	for (int s = 0; s < 4; s++)
 		sum += us_world_season_w(&w, s);
