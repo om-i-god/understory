@@ -1,18 +1,25 @@
 /* Understory scene: Pond — a still pond seen from directly above.
  *
- * Under the surface a slow caustic light network (a low-res interference field of a few travelling
- * waves, warped and bent by every ripple) shifts across the bed; koi drift through it. Every drum hit
- * drops a ripple ring — a short wave packet that expands, fades, and interferes with the others both as
- * lines on the surface and as distortion in the caustics. Lily pads (notched discs with veins) drift
- * and bob as rings pass beneath them; water striders skate in bursts, leaving tiny dimple rings from their
- * legs; reed clumps fringe the bank. Around the water: grassy banks, pebbles at the waterline, ferns and
- * marsh flowers, a wooden jetty, and a tree leaning out over the pond whose shade dims the caustics and
- * whose weeping twigs dimple the surface. Deep winter puts an ice skin on the pond: muted rings, dim light,
- * crack lines that creak further on heavy hits.
+ * Under the surface a slow caustic light network (the Voronoi edges of a drifting, warped cellular net)
+ * lies on the bed, gathered in the sun's reflection and fading to a faint web away from it; koi drift
+ * through it and hide it where they pass. Lily pads (solid, notched, veined) and their lotus flowers are the
+ * focal points; water striders skate in bursts, dimpling the surface; reed clumps fringe the bank. Around
+ * the water: grassy banks, pebbles at the waterline, ferns and marsh flowers, a wooden jetty, and a tree
+ * leaning out over the pond whose shade dims the caustics and whose weeping twigs dimple the surface. Deep
+ * winter puts an ice skin on the pond: muted rings, dim light, crack lines that creak further on kicks.
  *
- * Audio: onsets -> rings (kicks -> big ones); bass -> caustic swell; highs -> striders more restless.
+ * Audio, one answer per part of the music:
+ *   kick  -> a lily pad dips, a sharp ring spreads from under it, a front of focused light sweeps out
+ *            across the bed from it and the whole net surges for an instant; koi dart.
+ *   snare -> a splash: the frog kicks off its pad (or a fish breaks the surface), a crown of spray, the drops
+ *            pattering back as a shiver of dimples; nearby pads lurch; a dragonfly darts.
+ *   hats  -> a scatter of sun glints in the sun's reflection; a strider strokes.
+ *   level / swell -> the light on the water (quiet = glassy and dim); bass focuses it; tonal onsets with no
+ *            drum (bells, piano) drop single soft rings; bands nod the reeds and open the lotuses; mids
+ *            rock the pads; width brings the breeze (riffles, fronds); low mids rustle leaves loose.
  * World: reads water_level (pond size), insects (striders), season (ice, autumn leaves, lotus flowers
- *        in summer, pads die back in winter), daylight (caustic strength). Writes a little moisture.
+ *        in summer, pads die back in winter), daylight (caustic strength, the sun's place). Writes a little
+ *        moisture.
  */
 #include "../core/us_scene.h"
 #include "../core/us_math.h"
@@ -40,9 +47,11 @@
 #define MAX_PEBBLES 70
 #define MAX_TUFTS 260
 #define MAX_DF 3      /* dragonflies */
-#define MAX_GLINTS 40 /* sun glints on the surface (hats / air) */
+#define MAX_GLINTS 96 /* sun glints on the surface (hats / air) */
 #define MAX_FALL 8    /* leaves falling from the tree */
 #define NRIFF 3       /* cat's-paw wind riffles (stereo width) */
+#define MAX_PULSES 4  /* kick: fronts of focused light sweeping out across the bed */
+#define MAX_SPLASH 4  /* snare: splashes (spray crown + a shiver of dimples) */
 
 typedef struct {
 	float x, y, r, speed, amp, age, life;
@@ -52,6 +61,7 @@ typedef struct {
 typedef struct {
 	float u, y, R, rot, notch, vx, vy, vr, bob, bph, flower;
 	float rock, rph, open; /* mid-driven rocking; lotus opening (one spectrum band each) */
+	float jolt, jdir;      /* a snare splash nearby: the pad lurches on the wave and settles */
 } pad_t;
 
 typedef struct {
@@ -90,6 +100,15 @@ typedef struct {
 typedef struct {
 	float x, y, z, rot, vr, size, vx, vy;
 } fall_t;
+
+typedef struct {
+	float x, y, r, e;
+} pulse_t;
+
+typedef struct {
+	float x, y, age, amp;
+	uint32_t seed;
+} splash_t;
 
 typedef struct {
 	us_rng rng;
@@ -139,6 +158,14 @@ typedef struct {
 	int frog_pad, frog_to;
 	float frog_jt, frog_cool, frog_ph, frog_hd, frog_x, frog_y;
 	float mid_slow, mid_cool, width_env, lowmid_env, high_env;
+	/* drums: kick -> light pulse from a pad, snare -> splash (frog / fish), hats -> sun glints */
+	pulse_t pl[MAX_PULSES];
+	int npl;
+	float kf, lvl_env;
+	float sun_x, sun_y, sun_k; /* where the sun lies on the water (the caustics gather there) */
+	splash_t sp[MAX_SPLASH];
+	int nsp;
+	unsigned hat_i, fly_i;
 } st_t;
 
 static void *create(uint32_t seed)
@@ -462,7 +489,10 @@ static void init_scene(st_t *st, const us_ctx *ctx)
 	st->inited = 1;
 }
 
-/* lily pad: notched disc. crisp -> filled fan; ink -> outline + veins */
+static void carve_disc(us_canvas *c, float x, float y, float R, float keep, const float *lob);
+
+/* lily pad: notched disc. crisp -> filled fan; ink -> the pad hides the light beneath it, a faint wash of
+ * green, a clear rim and fine veins */
 static void draw_pad(us_canvas *c, int crisp, const pad_t *p, float x, float y, float R, float v, uint8_t mat)
 {
 	enum { N = 22 };
@@ -483,11 +513,14 @@ static void draw_pad(us_canvas *c, int crisp, const pad_t *p, float x, float y, 
 			us_tri(c, x, y, pts[2 * i], pts[2 * i + 1], pts[2 * i + 2], pts[2 * i + 3], v * 0.55f, mat);
 		hpoly(c, pts + 2, N + 1, v, mat);
 	} else {
+		carve_disc(c, x, y, R * 0.97f, 0.1f, NULL);
+		for (int i = 1; i <= N; i++)
+			us_tri(c, x, y, pts[2 * i], pts[2 * i + 1], pts[2 * i + 2], pts[2 * i + 3], v * 0.14f, mat);
 		hpoly(c, pts, N + 3, v, mat);
 		/* veins */
 		for (int k = 1; k < 8; k++) {
 			float a = a0 + (a1 - a0) * k / 8.0f;
-			hl(c, x, y, x + cosf(a) * R * 0.86f, y + sinf(a) * R * 0.86f, v * 0.35f, mat);
+			hl(c, x, y, x + cosf(a) * R * 0.86f, y + sinf(a) * R * 0.86f, v * 0.3f, mat);
 		}
 	}
 }
@@ -585,6 +618,22 @@ static void caustic_points(st_t *st, float A, float cs, float lt, uint32_t salt,
 	*gho = gh;
 }
 
+/* kick light fronts: how much the bed light is focused at (x, y) by the travelling pulses */
+static float pulse_at(const st_t *st, float x, float y)
+{
+	float b = 0;
+	for (int k = 0; k < st->npl; k++) {
+		const pulse_t *p = &st->pl[k];
+		float dx = x - p->x, dy = y - p->y;
+		float q = (sqrtf(dx * dx + dy * dy) - p->r) * 10.0f; /* front half-width ~0.1 */
+		if (q > -1.0f && q < 1.0f) {
+			float u = 1.0f - q * q;
+			b += p->e * u * u;
+		}
+	}
+	return b;
+}
+
 static void caustic_edge(const st_t *st, us_canvas *c, int fw, int fh, float lt, float cs, float gain, float x0,
 			 float y0, float x1, float y1)
 {
@@ -609,7 +658,11 @@ static void caustic_edge(const st_t *st, us_canvas *c, int fw, int fh, float lt,
 		float m1 = us_smooth(1.0f, 0.9f, grid_at(st->qmask, fw, fh, st->A, qx, qy));
 		/* brightest at the nodes where filaments meet */
 		float node = 0.5f + 0.7f * (2.0f * fm - 1.0f) * (2.0f * fm - 1.0f);
-		float mv = v * node * fminf(m0, m1);
+		float sdx = (qx - st->sun_x) * 2.6f, sdy = (qy - st->sun_y) * 3.4f;
+		float lw = st->sun_k + (1.0f - st->sun_k) / (1.0f + sdx * sdx + sdy * sdy);
+		if (st->npl)
+			lw += 2.6f * pulse_at(st, qx, qy); /* a kick's front lights the net wherever it passes */
+		float mv = v * node * fminf(m0, m1) * lw;
 		if (mv > 0.01f)
 			hl(c, px, py, qx, qy, mv, US_MAT_WATER);
 		px = qx;
@@ -1272,6 +1325,114 @@ static void leaf_shape(us_canvas *c, int crisp, float x, float y, float rot, flo
 	hl(c, x - dx * L * 1.3f, y - dy * L * 1.3f, x + dx * L * 0.8f, y + dy * L * 0.8f, v * 0.7f, mat);
 }
 
+/* ---- snare splashes: a crown of spray flung out from the spot, the drops pattering back as a shiver
+ *      of tiny dimples round it, and one sharp ring ---- */
+static void add_splash(st_t *st, float x, float y, float amp)
+{
+	if (st->nsp >= MAX_SPLASH) {
+		int o = 0;
+		for (int k = 1; k < st->nsp; k++)
+			if (st->sp[k].age > st->sp[o].age)
+				o = k;
+		st->sp[o] = st->sp[--st->nsp];
+	}
+	splash_t *p = &st->sp[st->nsp++];
+	p->x = x;
+	p->y = y;
+	p->age = 0;
+	p->amp = amp;
+	p->seed = us_rng_u32(&st->rng);
+	/* the pads round about lurch on the splash's wave */
+	for (int k = 0; k < MAX_PADS; k++) {
+		pad_t *q = &st->pad[k];
+		float dx = q->u * st->A - x, dy = q->y - y;
+		float prox = us_sat(1.25f - sqrtf(dx * dx + dy * dy) / 0.4f);
+		if (prox * amp > q->jolt) {
+			q->jolt = prox * amp;
+			q->jdir = (k & 1) ? 1.0f : -1.0f;
+		}
+	}
+	add_ring(st, x, y, 0.7f + 0.4f * amp, 0.24f, 1.1f, 0);
+}
+
+static inline float hash01(uint32_t h)
+{
+	h ^= h >> 16;
+	h *= 0x7feb352du;
+	h ^= h >> 15;
+	h *= 0x846ca68bu;
+	h ^= h >> 16;
+	return (h & 0xffffff) * (1.0f / 16777216.0f);
+}
+
+#define SPLASH_T 0.55f
+static void draw_splashes(us_canvas *c, st_t *st, const us_ctx *ctx, int fw, int npads)
+{
+	int crisp = ctx->crisp;
+	float dens = ctx->p->density;
+	for (int i = 0; i < st->nsp;) {
+		splash_t *p = &st->sp[i];
+		p->age += ctx->dt;
+		if (p->age > SPLASH_T) {
+			*p = st->sp[--st->nsp];
+			continue;
+		}
+		i++;
+		float t = p->age;
+		/* the crown: drops flung out on short arcs, streaking along their flight, brightest at first */
+		int nd = 18 + (int)(16.0f * dens);
+		float fl = 0.16f; /* flight time */
+		for (int d = 0; d < nd; d++) {
+			float h1 = hash01(p->seed + d * 7919u), h2 = hash01(p->seed ^ (d * 104729u + 17u));
+			float ang = US_TAU * (d + 0.6f * h1) / nd;
+			float vel = 0.35f + 0.45f * h2;
+			float tf = fminf(t, fl);
+			float rr = 0.006f + vel * tf * (1.0f - 0.45f * tf / fl);
+			float ca = cosf(ang), sa = sinf(ang);
+			float x = p->x + ca * rr, y = p->y + sa * rr;
+			if (t < fl) {
+				float hgt = sinf(US_PI * t / fl); /* up toward the eye and back */
+				float v = p->amp * (1.0f - 0.5f * t / fl);
+				float L = 0.006f + 0.018f * hgt * (0.5f + h2);
+				if (crisp)
+					us_line(c, x - ca * L, y - sa * L, x, y, 0.001f, v, US_MAT_WATER);
+				else {
+					hl(c, x - ca * L, y - sa * L, x, y, v * 0.8f, US_MAT_WATER);
+					us_point(c, x, y, 0.0011f + 0.0011f * hgt, v, US_MAT_WATER);
+				}
+			} else if (!crisp) {
+				/* landed: a pinprick dimple */
+				float v = p->amp * 0.5f * (1.0f - (t - fl) / (SPLASH_T - fl));
+				if (v > 0.02f && qgrid(st, fw, x, y) < 0.97f)
+					us_ring(c, x, y, 0.002f + 0.01f * (t - fl), 0.001f, v, US_MAT_WATER);
+			}
+		}
+		/* the shiver: spray pattering down over a wider patch, dashes curving round the spot */
+		float f2 = us_sat(t / 0.2f), sv = p->amp * (1.0f - f2) * (1.0f - f2);
+		if (sv > 0.03f) {
+			int nsh = (int)((crisp ? 50.0f : 130.0f) * (0.6f + 0.8f * dens));
+			float R = 0.09f + 0.22f * sqrtf(f2);
+			for (int d = 0; d < nsh; d++) {
+				float h1 = hash01(p->seed + 31u * d + 5u), h2 = hash01(p->seed * 3u + 131u * d);
+				float ang = US_TAU * h1, rr = R * (0.35f + 0.65f * sqrtf(h2));
+				float x = p->x + cosf(ang) * rr, y = p->y + sinf(ang) * rr;
+				if (qgrid(st, fw, x, y) > 0.96f || in_pad(st, npads, x, y, 1.0f))
+					continue;
+				float L = 0.005f + 0.007f * h2;
+				float tx = -sinf(ang) * L, ty = cosf(ang) * L;
+				float v = sv * (0.45f + 0.55f * h1);
+				if (crisp)
+					us_put(c, (int)(x * c->s), (int)(y * c->s), v, US_MAT_WATER);
+				else
+					hl(c, x - tx, y - ty, x + tx, y + ty, v, US_MAT_WATER);
+			}
+		}
+		/* white water at the heart for the first instant */
+		if (t < 0.12f)
+			us_disc(c, p->x, p->y, 0.006f + 0.012f * p->amp * (1.0f - t / 0.12f), p->amp * (1.0f - t / 0.12f), US_MAT_WATER);
+	}
+}
+
 static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 {
 	st_t *st = sp;
@@ -1289,9 +1450,18 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 	/* ---- drivers ---- */
 	st->ice = us_approach(st->ice, us_smooth(0.6f, 0.9f, winter), 8.0f, dt);
 	st->scale = us_approach(st->scale, 0.8f + 0.2f * w->water_level, 20.0f, dt);
-	st->bass_env = us_approach(st->bass_env, us_sat(0.8f * a->bass + 0.5f * a->kick + 0.3f * a->sub), 0.25f, ctx->real_dt);
-	/* the light drifts faster as the phrase swells */
-	st->light_t += dt * (0.12f + 0.22f * a->level + 0.14f * a->swell);
+	/* the bass swells the light slowly (the kick has its own, sharper answer below) */
+	st->bass_env = us_approach(st->bass_env, us_sat(0.8f * a->bass + 0.3f * a->sub), 0.9f, ctx->real_dt);
+	st->lvl_env = us_approach(st->lvl_env, a->level, 0.25f, ctx->real_dt);
+	{
+		float sa = US_TAU * w->day_phase + st->so;
+		st->sun_x = A * 0.5f + cosf(sa) * A * 0.17f;
+		st->sun_y = 0.5f + sinf(sa) * 0.16f;
+		/* away from the sun's patch the net fades to a faint web (less so as the music swells) */
+		st->sun_k = 0.18f + 0.4f * st->lvl_env;
+	}
+	/* the light drifts a little faster as the phrase swells; slow enough that the water reads as calm */
+	st->light_t += dt * (0.03f + 0.07f * st->lvl_env + 0.04f * a->swell) * (ctx->crisp ? 2.5f : 1.0f); /* whole pixels need a little more drift to read as moving */
 	st->wave_t += dt;
 	float rdt = ctx->real_dt;
 	st->width_env = us_approach(st->width_env, a->width, 1.2f, rdt);
@@ -1310,20 +1480,52 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 	float ice = st->ice, open = 1.0f - ice;
 	us_world_add(w, &w->moisture, 0.0005f * open, dt);
 
+	int snare_go = a->snare_hit && ice < 0.6f, splashed = 0;
+	int hat_go = a->hat_hit && ice < 0.8f;
 	int npads = (int)((3 + dens * (MAX_PADS - 3)) * (1.0f - 0.85f * winter) + 0.5f);
 	if (npads > MAX_PADS)
 		npads = MAX_PADS;
 
-	/* ---- rings: every hit drops one; kicks drop big ones; quiet rain / fish keep it alive ---- */
-	if (a->beat && us_rand(r) < 1.0f - 0.75f * ice) {
+	/* ---- kick: a lily pad dips, a ring spreads from under it and a front of focused light sweeps out
+	 *      across the bed from the same spot (the whole net brightens for a moment as the water heaves) ---- */
+	st->kf *= expf(-rdt / 0.08f);
+	for (int i = 0; i < st->npl;) {
+		pulse_t *p = &st->pl[i];
+		p->r += dt * 2.4f;
+		p->e *= expf(-rdt / 0.085f);
+		if (p->e < 0.03f || p->r > 1.6f) {
+			*p = st->pl[--st->npl];
+			continue;
+		}
+		i++;
+	}
+	if (a->kick_hit) {
+		float ks = us_sat(0.55f + 0.5f * a->kick);
+		st->kf = fmaxf(st->kf, ks * (1.0f - 0.5f * ice));
+		float x, y;
+		if (npads > 0) {
+			pad_t *p = &st->pad[us_rng_u32(r) % (unsigned)npads];
+			x = p->u * A;
+			y = p->y;
+			p->bob = us_sat(p->bob + 0.8f * ks);
+		} else
+			random_water_point(st, npads, &x, &y);
+		add_ring(st, x, y, (0.75f + 0.35f * ks) * (1.0f - 0.55f * ice), 0.16f + 0.05f * ks, 1.8f, 0);
+		if (st->npl >= MAX_PULSES) { /* replace the weakest */
+			int o = 0;
+			for (int k = 1; k < st->npl; k++)
+				if (st->pl[k].e < st->pl[o].e)
+					o = k;
+			st->pl[o] = st->pl[--st->npl];
+		}
+		st->pl[st->npl++] = (pulse_t){x, y, 0.05f, ks * (1.0f - 0.6f * ice)};
+	}
+	/* a tonal onset with no drum in it (a bell, a piano note): a single soft drop */
+	if (a->beat && !a->kick_hit && !a->snare_hit && !a->hat_hit && a->kick < 0.2f && a->snare < 0.2f &&
+	    us_rand(r) < 0.7f - 0.6f * ice) {
 		float x, y;
 		random_water_point(st, npads, &x, &y);
-		float big = us_sat(a->kick * 1.2f);
-		float amp = (0.55f + 0.45f * a->onset) * (1.0f - 0.55f * ice);
-		add_ring(st, x, y, amp * (0.8f + 0.4f * big), 0.08f + 0.06f * big, 3.0f + 2.0f * big, 0);
-		/* a big hit sometimes lands as a little cluster */
-		if (big > 0.5f && us_rand(r) < 0.4f * dens + 0.1f)
-			add_ring(st, x + us_randr(r, -0.04f, 0.04f), y + us_randr(r, -0.04f, 0.04f), amp * 0.5f, 0.07f, 2.4f, 0);
+		add_ring(st, x, y, (0.35f + 0.3f * a->onset) * (1.0f - 0.55f * ice), 0.07f, 2.4f, 0);
 	}
 	st->drip_t -= dt;
 	if (st->drip_t <= 0) {
@@ -1384,7 +1586,7 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 					if (d < r0 || d > r1)
 						continue;
 					float q = (g->r - d) / band;
-					float pk = expf(-q * q * 0.5f) * fcos(q * 2.6f) * env * 0.022f / d;
+					float pk = expf(-q * q * 0.5f) * fcos(q * 2.6f) * env * 0.011f / d;
 					st->dpx[j * FW + i] += dx * pk;
 					st->dpy[j * FW + i] += dy * pk;
 				}
@@ -1402,16 +1604,20 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 			st->mask_scale = st->scale;
 			st->mask_A = A;
 		}
-		float gain = (0.11f + 0.3f * st->bass_env + 0.06f * w->daylight + 0.12f * a->swell) * (1.0f - 0.65f * ice);
+		/* light on the water: loudness and the phrase swell brighten it, the bass focuses it; the kick
+		 * throws a brief surge through the whole net */
+		float gain = (0.06f + 0.1f * st->bass_env + 0.05f * w->daylight + 0.05f * a->swell + 0.36f * st->lvl_env) *
+			     (1.0f - 0.65f * ice);
+		float kick_k = 1.1f * st->kf * (1.0f - 0.6f * ice) * (0.6f + 0.6f * st->lvl_env); /* added on top: the surge reads the same in a quiet or a loud mix */
 		if (!ctx->crisp) {
 			/* Ink: fine filaments; bass focuses the light (brighter, and the net breathes) */
-			caustic_lines(st, c, gw, gh, cs, lt, FW, FH, 0.2f + 2.0f * gain);
+			caustic_lines(st, c, gw, gh, cs, lt, FW, FH, 0.06f + 1.35f * gain + kick_k);
 			/* a second, finer and fainter net drifting the other way: the two interfere like real caustics */
 			int gw2, gh2;
 			const float cs2 = 0.083f;
 			caustic_points(st, A, cs2, lt * 1.35f + 40.0f, 0x51ed270bu, &gw2, &gh2);
 			/* brighter timbre -> the finer net catches more light */
-			caustic_lines(st, c, gw2, gh2, cs2, lt, FW, FH, (0.2f + 2.0f * gain) * (0.3f + 0.28f * a->centroid));
+			caustic_lines(st, c, gw2, gh2, cs2, lt, FW, FH, (0.06f + 1.35f * gain + kick_k) * (0.12f + 0.2f * a->centroid));
 			goto caustics_done;
 		}
 		/* Pixel: one pass fills the pond bed and the land around it (nearest lookup in the mask grid), then
@@ -1452,7 +1658,7 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 				}
 			}
 		}
-		caustic_lines(st, c, gw, gh, cs, lt, FW, FH, 0.42f + 1.6f * gain);
+		caustic_lines(st, c, gw, gh, cs, lt, FW, FH, 0.24f + 1.3f * gain + 0.75f * kick_k);
 	}
 caustics_done:
 
@@ -1474,7 +1680,7 @@ caustics_done:
 				k->turn = dd > 0 ? 1.2f : -1.2f;
 			}
 			/* a kick startles it: a flick of the tail and a darting turn that eases out */
-			if (a->beat && a->kick > 0.45f && us_rand(r) < 0.55f + 0.3f * a->kick) {
+			if (a->kick_hit && us_rand(r) < 0.45f + 0.3f * a->kick) {
 				k->dart = us_sat(k->dart + 0.6f + 0.4f * a->kick);
 				k->dturn = (us_rand(r) < 0.5f ? -1.0f : 1.0f) * us_randr(r, 2.0f, 3.6f);
 				if (q > 0.7f) {
@@ -1503,7 +1709,7 @@ caustics_done:
 				k->sx[j] = k->sx[j - 1] + dx / d * seg;
 				k->sy[j] = k->sy[j - 1] + dy / d * seg;
 			}
-			float kv = 0.6f * (1.0f - 0.5f * ice);
+			float kv = 0.75f * (1.0f - 0.5f * ice);
 			koi_draw(c, ctx->crisp, k, i, kv);
 		}
 	}
@@ -1539,7 +1745,7 @@ caustics_done:
 			float be = a->bands[bi];
 			st->clump_env[i] = us_approach(st->clump_env[i], be, be > st->clump_env[i] ? 0.06f : 0.45f, rdt);
 			float ce = st->clump_env[i];
-			float sway = us_noise2(t * (0.3f + 1.2f * wind) + q->ph, i * 1.3f) * (0.12f + 0.6f * wind) + 0.22f * ce * sinf(q->ph * 3.0f);
+			float sway = us_noise2(t * (0.2f + 0.5f * wind) + q->ph, i * 1.3f) * (0.1f + 0.4f * wind) + 0.22f * ce * sinf(q->ph * 3.0f);
 			int nb = 6 + (i % 5);
 			for (int b = 0; b < nb; b++) {
 				float hsh = sinf(i * 12.9898f + b * 78.233f) * 43758.5f;
@@ -1564,8 +1770,9 @@ caustics_done:
 	for (int k = 0; k < st->nrg; k++) {
 		ring_t *g = &st->rg[k];
 		float f = g->age / g->life;
-		float fade = powf(1.0f - f, 1.5f) * us_sat(g->age / 0.08f);
-		int waves = g->small ? 1 : 3;
+		/* a ring lands bright and sharp, then settles quickly into a faint, lingering ripple */
+		float fade = powf(1.0f - f, 1.5f) * us_sat(g->age / 0.05f) * (0.16f + 0.84f * expf(-g->age / 0.12f));
+		int waves = g->small ? 1 : (g->amp > 0.6f ? 3 : 2);
 		for (int wv = 0; wv < waves; wv++) {
 			float rr = g->r - wv * 0.016f * (1.0f + 0.8f * f);
 			if (rr <= 0.001f)
@@ -1710,22 +1917,39 @@ caustics_done:
 		}
 	}
 
-	/* ---- glints: the hats and the air throw sparks of sun off the surface; each flares and eases out ---- */
+	/* ---- glints: every hat throws a scatter of sun sparks off the water, thickest in the sun's own
+	 *      reflection (a broad patch that wanders with the time of day); the air keeps a few twinkling ---- */
 	{
-		float rate = (1.5f + 40.0f * st->high_env * st->high_env) * (1.0f - 0.7f * ice) * (0.6f + 0.6f * w->daylight);
+		float sun_x = st->sun_x, sun_y = st->sun_y;
+		float rate = (0.4f + 10.0f * st->high_env * st->high_env) * (1.0f - 0.7f * ice) * (0.6f + 0.6f * w->daylight);
 		float n_new = rate * dt;
-		while (n_new > 0 && st->ngl < MAX_GLINTS) {
+		int burst = 0;
+		if (hat_go) {
+			burst = (int)((16.0f + 26.0f * dens) * (0.7f + 0.5f * a->hat));
+			n_new += burst;
+		}
+		for (int guard = 0; n_new > 0 && st->ngl < MAX_GLINTS && guard < MAX_GLINTS; guard++) {
 			if (n_new < 1.0f && us_rand(r) > n_new)
 				break;
 			n_new -= 1.0f;
+			float gx = 0, gy = 0;
+			int ok = 0;
+			for (int tries = 0; tries < 4 && !ok; tries++) {
+				gx = sun_x + us_randn(r) * 0.17f * A * 0.6f;
+				gy = sun_y + us_randn(r) * 0.15f;
+				ok = pond_q(st, gx, gy) < 0.93f && !in_pad(st, npads, gx, gy, 1.1f);
+			}
+			if (!ok)
+				continue;
 			glint_t *g = &st->gl[st->ngl++];
-			random_water_point(st, npads, &g->x, &g->y);
-			g->e = us_randr(r, 0.6f, 1.0f) * (0.5f + 0.5f * st->high_env);
+			g->x = gx;
+			g->y = gy;
+			g->e = burst ? us_randr(r, 0.75f, 1.0f) : us_randr(r, 0.4f, 0.8f) * (0.5f + 0.5f * st->high_env);
 			g->L = us_randr(r, 0.6f, 1.0f);
 		}
 		for (int i = 0; i < st->ngl;) {
 			glint_t *g = &st->gl[i];
-			g->e *= expf(-dt / 0.18f);
+			g->e *= expf(-dt / 0.07f);
 			if (g->e < 0.04f) {
 				*g = st->gl[--st->ngl];
 				continue;
@@ -1734,14 +1958,18 @@ caustics_done:
 			if (ctx->crisp) {
 				int px = (int)(g->x * c->s), py = (int)(g->y * c->s);
 				us_put(c, px, py, v, US_MAT_LIGHT);
-				if (v > 0.55f) {
-					us_put(c, px - 1, py, v * 0.5f, US_MAT_LIGHT);
-					us_put(c, px + 1, py, v * 0.5f, US_MAT_LIGHT);
+				if (v > 0.45f) {
+					us_put(c, px - 1, py, v * 0.6f, US_MAT_LIGHT);
+					us_put(c, px + 1, py, v * 0.6f, US_MAT_LIGHT);
+					us_put(c, px, py - 1, v * 0.45f, US_MAT_LIGHT);
+					us_put(c, px, py + 1, v * 0.45f, US_MAT_LIGHT);
 				}
 			} else {
-				float L = (0.002f + 0.006f * g->e) * g->L;
+				/* a four-point star: long level arms, shorter upright ones, a bright core */
+				float L = (0.004f + 0.014f * g->e) * g->L;
 				hl(c, g->x - L, g->y, g->x + L, g->y, v, US_MAT_LIGHT);
-				hl(c, g->x, g->y - L * 0.6f, g->x, g->y + L * 0.6f, v * 0.7f, US_MAT_LIGHT);
+				hl(c, g->x, g->y - L * 0.6f, g->x, g->y + L * 0.6f, v * 0.8f, US_MAT_LIGHT);
+				us_point(c, g->x, g->y, 0.0012f + 0.001f * g->e, v, US_MAT_LIGHT);
 			}
 			i++;
 		}
@@ -1796,15 +2024,16 @@ caustics_done:
 			p->y = y;
 			p->rot += (p->vr + 0.6f * p->bob * sinf(p->bph * 0.7f)) * dt;
 			p->bob *= expf(-dt * 1.2f);
+			p->jolt *= expf(-rdt / 0.13f);
 			p->bph += dt * (3.0f + 2.0f * p->bob);
 			/* the mids rock the pads, each on its own rhythm */
 			p->rock = us_approach(p->rock, a->mid * (0.6f + 0.4f * sinf(i * 2.1f)), 0.25f, rdt);
 			p->rph += dt * (2.0f + 0.25f * (i % 4) + 2.0f * p->rock);
-			float bobs = 1.0f + 0.05f * p->bob * sinf(p->bph) + 0.04f * p->rock * sinf(p->rph * 0.5f);
+			float bobs = 1.0f + 0.05f * p->bob * sinf(p->bph) + 0.04f * p->rock * sinf(p->rph * 0.5f) + 0.1f * p->jolt;
 			float R = p->R * bobs;
-			float v = padv * (1.0f - 0.4f * winter) + 0.25f * p->bob + 0.1f * p->rock;
+			float v = padv * (1.0f - 0.4f * winter) + 0.25f * p->bob + 0.1f * p->rock + 0.3f * p->jolt + 0.2f * st->lvl_env - 0.1f;
 			pad_t pd = *p;
-			pd.rot += 0.3f * p->rock * sinf(p->rph);
+			pd.rot += 0.12f * p->rock * sinf(p->rph) + 0.3f * p->jolt * p->jdir;
 			draw_pad(c, ctx->crisp, &pd, x, y, R, v, pm);
 			/* lotus flower in summer / spring */
 			float bloom = p->flower * us_sat(1.2f - autumn - winter * 1.5f);
@@ -1848,7 +2077,9 @@ caustics_done:
 		if (st->frog_jt < 0) {
 			st->frog_x = fx;
 			st->frog_y = fy;
-			if (a->beat && a->onset > 0.8f && st->frog_cool <= 0 && us_rand(r) < 0.45f) {
+			/* the snare sends it off its pad with a splash; in quiet music it still hops now and then */
+			int want = (snare_go && st->frog_cool <= 0) || (st->frog_cool <= -3.0f && us_rand(r) < dt * 0.12f);
+			if (want) {
 				/* the nearest pad that is not too near */
 				int best = -1;
 				float bd = 1e9f;
@@ -1866,7 +2097,11 @@ caustics_done:
 					st->frog_to = best;
 					st->frog_jt = 0;
 					st->frog_hd = atan2f(st->pad[best].y - fy, st->pad[best].u * A - fx);
-					fp->bob = us_sat(fp->bob + 0.5f);
+					fp->bob = us_sat(fp->bob + 0.6f);
+					if (snare_go) {
+						add_splash(st, fx, fy, 0.75f + 0.25f * a->snare);
+						splashed = 1;
+					}
 				}
 			}
 		}
@@ -1876,7 +2111,7 @@ caustics_done:
 				st->frog_to = st->frog_pad;
 			pad_t *tp = &st->pad[st->frog_to];
 			float tx = tp->u * A + cosf(tp->rot) * tp->R * 0.3f, ty = tp->y + sinf(tp->rot) * tp->R * 0.3f;
-			st->frog_jt += dt / 0.5f;
+			st->frog_jt += dt / 0.42f;
 			float f = us_sat(st->frog_jt), e = f * f * (3.0f - 2.0f * f);
 			fsx = us_lerp(st->frog_x, tx, e);
 			fsy = us_lerp(st->frog_y, ty, e);
@@ -1889,14 +2124,21 @@ caustics_done:
 			if (st->frog_jt >= 1.0f) {
 				st->frog_pad = st->frog_to;
 				st->frog_jt = -1.0f;
-				st->frog_cool = us_randr(r, 2.0f, 5.0f);
+				st->frog_cool = us_randr(r, 0.25f, 0.9f);
 				tp->bob = us_sat(tp->bob + 0.9f);
-				add_ring(st, tx, ty, 0.6f, 0.06f, 1.8f, 0);
+				add_ring(st, tx, ty, 0.45f, 0.06f, 1.4f, 0);
 			}
 		}
 		float throat = 0.5f + 0.5f * sinf(st->frog_ph);
 		draw_frog(c, ctx->crisp, fsx, fsy, st->frog_hd, sc, leap, throat, 0.8f, ctx->crisp ? US_MAT_EARTH : US_MAT_STEM);
 	}
+	/* no frog free to jump: a fish breaks the surface instead */
+	if (snare_go && !splashed) {
+		float x, y;
+		random_water_point(st, npads, &x, &y);
+		add_splash(st, x, y, 0.6f + 0.4f * a->snare);
+	}
+	draw_splashes(c, st, ctx, FW, npads);
 
 	/* ---- autumn leaves on the surface ---- */
 	{
@@ -1943,7 +2185,7 @@ caustics_done:
 			strider_t *s = &st->sd[i];
 			float x = s->u * A, y = s->y;
 			s->stroke_t -= dt * restless;
-			int stroke = s->stroke_t <= 0;
+			int stroke = s->stroke_t <= 0 || (hat_go && (unsigned)i == st->hat_i % (unsigned)ns);
 			/* startled by a fresh ring nearby */
 			for (int k = 0; k < st->nrg && !stroke; k++) {
 				ring_t *g = &st->rg[k];
@@ -1989,6 +2231,8 @@ caustics_done:
 		}
 	}
 
+	if (hat_go)
+		st->hat_i++;
 	draw_overhang(c, st, ctx, wind);
 
 	/* ---- leaves falling from the tree: the low mids rustle the crown loose; they spin down and settle ---- */
@@ -2050,7 +2294,7 @@ caustics_done:
 		for (int i = 0; i < nfly; i++) {
 			fly_t *f = &st->df[i];
 			f->hover_t -= dt;
-			int go = f->hover_t <= 0 || (mid_hit && us_rand(r) < 0.6f);
+			int go = f->hover_t <= 0 || (mid_hit && us_rand(r) < 0.4f) || (snare_go && i == (int)(st->fly_i % (unsigned)nfly));
 			if (go) {
 				/* a new perch over the water, or along the reeds */
 				float th = us_rand(r) * US_TAU;
@@ -2086,13 +2330,15 @@ caustics_done:
 			float wv = 0.3f + 0.35f * a->centroid + 0.15f * us_sat(sp * 3.0f);
 			draw_dragonfly(c, ctx->crisp, f, wv, 0.4f + a->centroid);
 		}
+		if (snare_go)
+			st->fly_i++;
 	}
 
 	/* ---- ice skin: frost rim, crack lines that creak further on heavy hits ---- */
 	if (ice > 0.02f) {
 		for (int i = 0; i < MAX_CRACKS; i++) {
 			crack_t *k = &st->ck[i];
-			if (a->beat && a->kick > 0.4f && us_rand(r) < 0.25f)
+			if (a->kick_hit && us_rand(r) < 0.3f)
 				k->grown = us_sat(k->grown + 0.06f * a->kick);
 			int n = (int)(k->n * k->grown * ice);
 			for (int j = 0; j + 1 < n; j++) {
