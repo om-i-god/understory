@@ -1,29 +1,38 @@
 /* Understory scene: Rain — rain over a wet meadow at eye level; snow in winter.
  *
- * Back to front: drifting rain clouds (soft in Ink, ordered-dither in Pixel), a far ridge, a treeline of
- * conifers and round-headed trees along the horizon with a farmhouse whose lit windows glow (and shine
- * back from the puddles) and whose smoke leans with the wind, a hedgerow across the middle distance, then
- * the meadow running toward us in perspective: a farm track whose wheel ruts hold rainwater, a fence whose
- * wires bead with drops that drip off, wildflowers that nod when drops strike them, and puddles. Every drop has a depth: far drops are short faint hairlines that vanish just under
- * the horizon, near drops are long bright streaks that fall the whole height of the frame. Where a drop
- * lands in a puddle it opens a ripple ring (two crests, flattened by perspective, clipped by the puddle);
- * on open ground it throws up a little crown of droplets. Sheets of heavier rain sweep across with the
- * gusts. The puddles grow and merge as the world gets wetter and shrink as it dries.
+ * Back to front: drifting rain clouds (soft in Ink, posterised tone bands in Pixel), a far ridge with fog
+ * banks along it, a treeline of conifers and round-headed trees along the horizon with a farmhouse whose lit
+ * windows glow (and shine back from the puddles) and whose smoke leans with the wind, a hedgerow across the
+ * middle distance, then the meadow running toward us in perspective: a farm track whose wheel ruts hold
+ * rainwater, stones kicked to its edges, a fence whose wires bead with drops that drip off, grass in
+ * tussocks, wildflowers in drifts along the verge and round the puddles that nod when drops strike them, and
+ * puddles holding the pale sky. Every drop has a depth: far drops are short faint hairlines that vanish just
+ * under the horizon, near drops are long bright streaks that fall the whole height of the frame. Where a
+ * drop lands in a puddle it opens a ripple ring (two crests, flattened by perspective, clipped by the
+ * puddle); on open ground it throws up a little crown of droplets. The puddles grow and merge as the world
+ * gets wetter and shrink as it dries.
  * Winter turns the drops into slow flakes that whiten the meadow, freeze the puddles, cap the trees and
  * build a drift along the foreground that buries the grass.
  *
  * Living detail: a crow on a fence post, a frog on the lip of the near puddle, an orb web in the corner of
  * the fence beaded with rain, rainwater running down the ruts, mist lying along the horizon.
  *
- * Audio: level -> steady rain; onsets -> bursts; highs (+ world wind) -> wind slant + gusts;
- *        bass -> heavier, faster near drops; kick -> a gust that throws the rain, grass and flowers sideways
- *        and a heavy drop (crown + jet) into the near puddle; beats -> the crow shuffles its wings, the
- *        first hit after a lull startles it into a loop over the meadow; hat bands 24..29 -> crowns of
- *        spray off the near fence posts (one band per post); bands 10..19 -> slow triple-crest rings, one
- *        puddle per band, so a melody rings across the field; low mids -> the frog's throat sac, a low-mid
- *        hit off the kick sends it leaping in; sub -> the horizon mist; swell -> lamplight in the farmhouse
- *        (a gable window lights), stoked smoke, thicker mist; centroid -> light in the clouds; width -> the
- *        slant; air -> drops glinting on the wire and the web; level -> the rut streams run faster.
+ * Audio — each drum has its own answer:
+ *        kick  -> a sheet of heavy near rain sweeps across, the rain is driven hard for a moment (longer,
+ *                 brighter streaks), a gust throws grass and flowers sideways, a heavy drop (crown + jet)
+ *                 falls into the near puddle and a big double ring opens on every other puddle;
+ *        snare -> a burst of drops: crowns of spray splay up all over the meadow, every puddle is pocked
+ *                 with quick rings, the grass shudders, the crow throws up its wings, the frog may leap in;
+ *        hats  -> the drizzle glints (a scatter of bright droplets for an instant), the spray knocks off the
+ *                 next fence post along, the fattest bead drips off the wire, the web and wet stones catch
+ *                 the light.
+ *        level -> steady rain, a heavier, lighter sky and brighter water; highs (+ world wind) -> wind slant +
+ *        gusts; bass -> heavier, faster near drops; bands 10..19 -> slow triple-crest rings, one puddle per
+ *        band, so a melody rings across the field; hat bands 24..29 also spray the posts; the first beat
+ *        after a lull startles the crow into a loop over the meadow; low mids -> the frog's throat sac;
+ *        sub -> the horizon mist; swell -> lamplight in the farmhouse (a gable window lights), stoked smoke,
+ *        thicker mist; centroid -> light in the clouds; width -> the slant; air -> glints on the wire and
+ *        the web; level -> the rut streams run faster.
  *        Silence keeps a light drizzle / a few flakes, a breathing frog, drifting mist.
  * Density: 0 = a sparse drizzle even at the loudest, 1 = a downpour.
  * World: reads season (snow), wind, moisture (puddle size), daylight; writes moisture + water_level.
@@ -45,6 +54,9 @@
 #define NSMOKE 26
 #define MAX_BLADES 110
 #define NDRIFT 160
+#define MAX_CROWN 128 /* snare: crowns of spray thrown up off the meadow */
+#define MAX_GLINT 160 /* hats: drizzle catching the light */
+#define NSTONE 14     /* stones along the track and by the puddles */
 #define CFW 96
 #define CFH 26
 #define HZ 0.47f      /* horizon */
@@ -71,6 +83,14 @@ typedef struct {
 typedef struct {
 	float u, z, size, ph; /* a hollow in the ground where water collects */
 } pud_t;
+
+typedef struct {
+	float u, z, age, life, size; /* a crown of spray off the ground (snare) */
+} crown_t;
+
+typedef struct {
+	float u, y, z, life; /* a drizzle droplet catching the light (hats) */
+} glint_t;
 
 typedef struct {
 	float u, h, lean;
@@ -119,6 +139,14 @@ typedef struct {
 	float bavg[US_NBANDS], bcool[US_NBANDS], pacc[MAX_PUD];
 	float crown[NPOST], crown_acc[NPOST];
 	float riv_t, mist_t;
+	/* drums: kick = a sheet of heavy rain + rings on every puddle; snare = crowns of spray off the meadow;
+	 * hats = drizzle glinting in the air + drips off the fence */
+	crown_t cw[MAX_CROWN];
+	int ncw;
+	glint_t gl[MAX_GLINT];
+	int ngl;
+	float lvl_s, kfast, post_rr, shiv;
+	float stu[NSTONE], stz[NSTONE], sts[NSTONE];
 	/* a crow on a fence post: shuffles its wings on hits, is startled into a loop by the drop */
 	float crow_flap, crow_fly, crow_cool, crow_wing, crow_fdir;
 	/* a frog at the near puddle: throat sac sings the low mids, leaps in on snare hits */
@@ -371,9 +399,16 @@ static void init_scene(st_t *st, const us_ctx *ctx)
 				break;
 		}
 	}
+	/* grass grows in tussocks and swathes, not an even scatter: keep a spot mostly where the noise is high */
 	for (int i = 0; i < MAX_TUFT; i++) {
-		st->tu[i] = us_rand(r);
-		st->tz[i] = us_rand(r);
+		for (int tries = 0; tries < 12; tries++) {
+			st->tu[i] = us_rand(r);
+			st->tz[i] = us_rand(r);
+			float zz = 0.02f + 0.98f * powf(st->tz[i], 1.35f);
+			float n = us_fbm2(st->tu[i] * 7.0f * A, zz * 9.0f + st->so, 2);
+			if (n > 0.05f || us_rand(r) < 0.12f)
+				break;
+		}
 	}
 	st->track_u0 = us_randr(r, 0.28f, 0.72f);
 	st->track_u1 = us_randr(r, 0.4f, 0.6f);
@@ -383,14 +418,52 @@ static void init_scene(st_t *st, const us_ctx *ctx)
 	st->house_u = st->track_u1 + (us_rand(r) < 0.5f ? -1.0f : 1.0f) * us_randr(r, 0.12f, 0.3f);
 	st->frog_side = us_rand(r) < 0.5f ? -1.0f : 1.0f;
 	st->crow_cool = 6.0f;
+	/* wildflowers in drifts: along the open verge of the track, round the near puddles, and a few patches;
+	 * each drift is mostly one kind */
+	float cu[6], cz[6];
+	uint8_t ck[6];
+	for (int k = 0; k < 6; k++) {
+		const pud_t *p = &st->pd[(k * 3 + 1) % MAX_PUD];
+		cz[k] = k < 3 ? us_clampf(p->z + us_randr(r, -0.04f, 0.06f), 0.15f, 0.95f) : us_randr(r, 0.25f, 0.95f);
+		cu[k] = k < 3 ? p->u + (us_rand(r) < 0.5f ? -1.0f : 1.0f) * (0.06f + 0.2f * cz[k]) : us_rand(r);
+		ck[k] = (uint8_t)(us_rand(r) * 3.0f);
+	}
 	for (int i = 0; i < MAX_FLW; i++) {
 		flw_t *f = &st->fw[i];
-		f->u = us_rand(r);
-		f->z = 0.12f + 0.86f * sqrtf(us_rand(r));
+		int grp = i % 10;
+		if (grp < 4) { /* the verge away from the fence */
+			f->z = 0.12f + 0.86f * sqrtf(us_rand(r));
+			f->u = (track_x(st, A, f->z) - st->fence_side * track_w(f->z) * us_randr(r, 0.62f, 0.9f)) / A;
+			f->kind = (uint8_t)(us_rand(r) < 0.6f ? 2 : us_rand(r) * 3.0f);
+		} else if (grp < 9) {
+			int k = (int)(us_rand(r) * 6.0f) % 6;
+			f->z = us_clampf(cz[k] + us_randn(r) * 0.05f, 0.1f, 0.99f);
+			f->u = cu[k] + us_randn(r) * (0.02f + 0.05f * f->z);
+			f->kind = us_rand(r) < 0.8f ? ck[k] : (uint8_t)(us_rand(r) * 3.0f);
+		} else {
+			f->z = 0.12f + 0.86f * sqrtf(us_rand(r));
+			f->u = us_rand(r);
+			f->kind = (uint8_t)(us_rand(r) * 3.0f);
+		}
+		if (f->kind > 2)
+			f->kind = 2;
 		f->h = us_randr(r, 0.55f, 1.0f);
 		f->ph = us_rand(r) * US_TAU;
-		f->kind = (uint8_t)(us_rand(r) * 3.0f);
 		f->nod = f->nodv = 0;
+	}
+	/* stones: kicked to the edges of the track, and lying at the rims of the hollows */
+	for (int i = 0; i < NSTONE; i++) {
+		if (i < 8) {
+			float z = 0.15f + 0.85f * us_rand(r);
+			float sd = us_rand(r) < 0.5f ? -1.0f : 1.0f;
+			st->stz[i] = z;
+			st->stu[i] = (track_x(st, A, z) + sd * track_w(z) * us_randr(r, 0.5f, 0.62f)) / A;
+		} else {
+			const pud_t *p = &st->pd[i % MAX_PUD];
+			st->stz[i] = us_clampf(p->z + 0.02f, 0.1f, 1.0f);
+			st->stu[i] = p->u + (us_rand(r) < 0.5f ? -1.0f : 1.0f) * (0.045f + 0.25f * p->z) * p->size * 1.35f / A;
+		}
+		st->sts[i] = us_randr(r, 0.6f, 1.3f);
 	}
 	for (int i = 0; i < NSMOKE; i++) {
 		st->sx[i] = 0;
@@ -464,6 +537,12 @@ static void pud_ring(st_t *st, int k, float A, float size, uint8_t kind)
 	g->kind = kind;
 	if (kind == 1)
 		g->life = 1.3f + 0.9f * z;
+	else if (kind == 3)
+		g->life = 0.8f + 0.5f * z;
+	else if (kind == 4) { /* a snare dimple: quick, with its little crown */
+		g->life = 0.3f + 0.25f * z;
+		g->kind = 0;
+	}
 	else if (kind == 2) {
 		g->life = 1.1f + 0.9f * z;
 		if (st->nsp < MAX_SPL - 6)
@@ -512,8 +591,12 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 	 * low mids -> the frog's throat; sub -> the distant mist; swell -> lamplight + mist; centroid -> the cloud
 	 * light; width -> the slant; air -> drops glinting on the wire and the spider web. */
 	float rdt = ctx->real_dt;
-	int kick_hit = a->kick > 0.55f && st->kprev <= 0.55f;
+	int kick_hit = a->kick_hit, snare_hit = a->snare_hit, hat_hit = a->hat_hit;
 	st->kprev = a->kick;
+	/* the kick's gust: rain driven hard for a moment (snaps up, falls back over ~0.25 s) */
+	st->kfast = kick_hit ? 1.0f : us_approach(st->kfast, 0.0f, 0.12f, rdt);
+	st->lvl_s = us_approach(st->lvl_s, a->level, 0.35f, rdt);
+	st->shiv = snare_hit ? us_sat(0.6f + 0.4f * a->snare) : us_approach(st->shiv, 0.0f, 0.055f, rdt);
 	st->kg = us_approach(st->kg, 0.0f, 0.4f, rdt);
 	if (kick_hit)
 		st->kg = us_sat(st->kg + 0.5f + 0.5f * a->kick);
@@ -571,10 +654,44 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 		spawn_drop(st, A, slant, sheet_t, 1);
 		st->spawn_acc -= 1.0f;
 	}
-	if (a->beat) {
-		int burst = (int)(maxrate * (0.03f + 0.1f * a->onset) * (1.0f - 0.6f * st->snowfrac));
-		for (int i = 0; i < burst; i++)
-			spawn_drop(st, A, slant, sheet_t, 1);
+	/* the kick: a sheet of heavy near rain sweeps across a broad stretch of the field */
+	if (kick_hit) {
+		int n = (int)((16.0f + 100.0f * dens) * (0.6f + 0.4f * a->kick));
+		float cx = us_randr(r, 0.2f, 0.8f) * A, hw = 0.45f * A;
+		for (int i = 0; i < n && st->nd < MAX_DROPS; i++) {
+			spawn_drop(st, A, slant, sheet_t, 0);
+			drop_t *d = &st->d[st->nd - 1];
+			d->z = us_randr(r, 0.3f, 1.0f);
+			d->u = (cx + hw * us_randr(r, -1.0f, 1.0f)) / A;
+			d->land = ground_y(d->z);
+			d->y = us_randr(r, -0.05f, d->land - 0.05f);
+			d->vy = d->snow ? (0.06f + 0.14f * d->z) : (0.9f + 1.9f * d->z);
+		}
+	}
+	/* the snare: crowns of spray jump up all across the meadow at once */
+	if (snare_hit && st->freeze < 0.5f) {
+		int n = (int)((18.0f + 44.0f * dens) * (0.6f + 0.4f * a->snare));
+		for (int i = 0; i < n && st->ncw < MAX_CROWN; i++) {
+			crown_t *k = &st->cw[st->ncw++];
+			k->z = 0.12f + 0.88f * sqrtf(us_rand(r));
+			k->u = us_rand(r);
+			k->age = 0;
+			k->life = us_randr(r, 0.28f, 0.4f);
+			k->size = us_randr(r, 0.7f, 1.3f) * (0.75f + 0.25f * a->snare);
+			if (liquid > 0.5f)
+				splash(st, k->u, ground_y(k->z), k->z, 0.0f, 2);
+		}
+	}
+	/* hats: the drizzle catches the light, a scatter of bright droplets for an instant */
+	if (hat_hit) {
+		int n = (int)((25.0f + 75.0f * dens) * (0.6f + 0.4f * a->hat));
+		for (int i = 0; i < n && st->ngl < MAX_GLINT; i++) {
+			glint_t *g = &st->gl[st->ngl++];
+			g->z = 0.15f + 0.85f * us_rand(r);
+			g->u = us_rand(r);
+			g->y = us_randr(r, 0.02f, ground_y(g->z));
+			g->life = 1.0f;
+		}
 	}
 	/* when the scene opens, start mid-shower instead of an empty sky */
 	if (st->nd == 0)
@@ -612,10 +729,10 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 			}
 		}
 		/* bright music lifts the light in the clouds */
-		float gain = 0.22f + 0.1f * w->daylight + 0.1f * st->cent_s;
-		float cl = 0.85f + 0.35f * st->cent_s;
+		float gain = 0.2f + 0.1f * w->daylight + 0.1f * st->cent_s + 0.1f * st->lvl_s;
+		float cl = 0.75f + 0.3f * st->cent_s + 0.35f * st->lvl_s;
 		if (ctx->crisp) {
-			/* ordered dither: soft cloud edges without blobby 4-step bands; stops at the ridge */
+			/* posterised tone bands; stops at the ridge */
 			int yh = (int)(CLOUD_Y * c->s);
 			int W = c->w < SKY_WMAX ? c->w : SKY_WMAX;
 			for (int px = 0; px < W; px++)
@@ -632,8 +749,10 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 					float tx = us_clampf(fx - i, 0, 1);
 					const float *q = st->cloud + j * CFW + i;
 					float v = us_lerp(us_lerp(q[0], q[1], tx), us_lerp(q[CFW], q[CFW + 1], tx), ty);
-					float th = (bayer4[(py & 3) * 4 + (px & 3)] + 0.5f) / 16.0f;
-					float lv = v * 4.0f * cl; /* 0..~3 shade levels */
+					/* flat tone bands with smooth contours (pixel-art clouds, no checkerboard); a light
+					 * horizontal hatch only along the band edges */
+					float th = 0.5f + (((py + (px >> 2)) & 1) ? 0.12f : -0.12f);
+					float lv = v * 4.0f * (cl + 0.5f * st->lvl_s); /* 0..~3 shade levels; louder = a lighter, heavier sky */
 					int base = (int)lv;
 					if (lv - base > th)
 						base++;
@@ -675,22 +794,21 @@ if (ctx->crisp)
 			float by = mband[j], mv = m * (j == 2 ? 0.75f : 1.0f);
 			float drift = st->mist_t * (1.0f + 0.6f * j);
 			if (ctx->crisp) {
-				/* ordered-dither haze, a few rows thick, thinning at its edges */
-				int W = c->w, row = (int)(by * c->s), hr = 1 + (int)(0.008f * c->s);
-				for (int py = row - hr; py <= row + hr; py++) {
-					if (py < 0 || py >= c->h)
+				/* fog banks hugging the ridge against the sky (no dither): a wisp one row thick, two
+				 * over its densest part, so each tapers at both ends; swells with the sub and the swell */
+				if (j == 2)
+					continue;
+				int W = c->w < SKY_WMAX ? c->w : SKY_WMAX;
+				float thr = 0.66f - 1.6f * mv;
+				for (int px = 0; px < W; px++) {
+					float u = (px + 0.5f) / c->w;
+					float n = 0.5f + 0.5f * us_noise2(u * 3.0f * A - drift, j * 3.7f + st->so);
+					if (n < thr)
 						continue;
-					float rw = 1.0f - (float)abs(py - row) / (hr + 1);
-					for (int px0 = 0; px0 < W; px0 += 4) {
-						float u = (px0 + 2.0f) / c->w;
-						float n = us_smooth(0.15f, 0.8f, us_noise2(u * 2.5f * A - drift, j * 3.7f + st->so));
-						float d = mv * n * rw * 2.2f;
-						for (int px = px0; px < px0 + 4 && px < W; px++) {
-							float th = (bayer4[(py & 3) * 4 + (px & 3)] + 0.5f) / 16.0f;
-							if (d > th)
-								us_put(c, px, py, 0.22f, US_MAT_SNOW);
-						}
-					}
+					int pr = (int)st->ridge_row[px] - 1 - 2 * j - (int)(1.2f * (0.5f + 0.5f * us_noise2(u * 2.0f + j * 5.1f, st->so + 7.0f)));
+					us_put(c, px, pr, 0.75f, US_MAT_BG);
+					if (n > thr + 0.14f)
+						us_put(c, px, pr - 1, 0.6f, US_MAT_BG);
 				}
 				continue;
 			}
@@ -771,6 +889,7 @@ if (ctx->crisp)
 			float hv = st->tu[(i * 7 + 3) % MAX_TUFT]; /* a second per-tuft random */
 			float h = (0.003f + 0.03f * z * z * green) * (0.55f + 0.7f * hv);
 			float sw = (0.2f + st->wind_s + 0.8f * st->kgs) * h * 0.7f * (0.6f + 0.4f * us_noise2(x * 3.0f - st->gust_t, i * 0.3f));
+			sw += 0.7f * h * st->shiv * sinf(t * 47.0f + i * 2.1f); /* lashed by the snare's burst */
 			float v = (0.14f + 0.2f * z) * (ctx->crisp ? 0.8f : 1.0f);
 			float bend = (hv - 0.5f) * h * 0.5f;
 			hl(c, x, y, x + sw + bend, y - h, v, gm);
@@ -1033,6 +1152,30 @@ us_disc(c, cx, cy, cr, 0.45f, US_MAT_LEAF);
 						}
 				}
 			} else {
+				/* the water itself: it holds the pale sky (bright at the far side, darker toward us) */
+				{
+					int y0 = (int)floorf((y - ry) * c->s), y1 = (int)ceilf((y + ry) * c->s);
+					float sky = (0.07f + 0.08f * w->daylight + 0.06f * st->lvl_s + 0.04f * st->cent_s) * (1.0f - st->freeze * 0.5f);
+					for (int py = y0 < 0 ? 0 : y0; py <= y1 && py < c->h; py++) {
+						float fy = ((py + 0.5f) / c->s - y) / ry;
+						if (fy * fy >= 1.0f)
+							continue;
+						float hw = rx * sqrtf(1.0f - fy * fy);
+						int x0 = (int)floorf((x - hw) * c->s + 0.5f), x1 = (int)floorf((x + hw) * c->s - 0.5f);
+						if (x0 < 0)
+							x0 = 0;
+						if (x1 > c->w - 1)
+							x1 = c->w - 1;
+						float g = 0.5f - 0.5f * fy;
+						int iv = (int)(255.0f * sky * (0.35f + 0.65f * g * g));
+						uint8_t *ink = c->ink + (size_t)py * c->w, *mt = c->mat + (size_t)py * c->w;
+						for (int px = x0; px <= x1; px++)
+							if (iv > ink[px]) {
+								ink[px] = (uint8_t)iv;
+								mt[px] = US_MAT_WATER;
+							}
+					}
+				}
 				/* far rim only (the near rim is hidden by the lip of the hollow) + the near lip */
 				ellipse(c, x, y, rx, ry, US_PI, US_TAU, 0.3f + 0.15f * st->freeze, US_MAT_WATER);
 				ellipse(c, x, y, rx, ry, 0.15f, US_PI - 0.15f, 0.18f, US_MAT_EARTH);
@@ -1082,6 +1225,22 @@ us_disc(c, cx, cy, cr, 0.45f, US_MAT_LEAF);
 		}
 	}
 
+	/* ---- stones at the track's edges and the rims of the hollows; wet tops catch the light ---- */
+	for (int i = 0; i < NSTONE; i++) {
+		float z = st->stz[i], x = st->stu[i] * A, y = ground_y(z);
+		float sr = (0.003f + 0.012f * z) * st->sts[i];
+		float sv = 0.26f + 0.14f * z, hv = us_sat(0.2f + 0.45f * st->wet * liquid + 0.3f * a->hat) * (0.5f + 0.5f * z);
+		uint8_t sm = snowy > 0.5f ? US_MAT_SNOW : US_MAT_EARTH;
+		if (ctx->crisp) {
+			us_disc(c, x, y - sr * 0.3f, sr, 0.3f, sm);
+			us_put(c, (int)((x - sr * 0.3f) * c->s), (int)((y - sr * 0.9f) * c->s), hv + 0.2f, US_MAT_WATER);
+		} else {
+			ellipse(c, x, y - sr * 0.2f, sr, sr * 0.62f, US_PI, US_TAU, sv, sm);
+			hl(c, x - sr, y - sr * 0.2f, x + sr, y - sr * 0.2f, sv * 0.6f, sm);
+			ellipse(c, x - sr * 0.15f, y - sr * 0.45f, sr * 0.45f, sr * 0.2f, US_PI * 1.1f, US_PI * 1.6f, hv, US_MAT_WATER);
+		}
+	}
+
 	/* the nearest puddle: the frog's, and where the heavy drops fall */
 	int near_p = 0;
 	for (int k = 1; k < st->npud; k++)
@@ -1098,9 +1257,20 @@ us_disc(c, cx, cy, cr, 0.45f, US_MAT_LEAF);
 				pud_ring(st, k, A, 0.14f + 0.16f * bv, 1);
 			}
 		}
-		/* the kick: a heavy drop lets go into the near puddle */
-		if (kick_hit)
+		/* the kick: a heavy drop lets go into the near puddle, and a big ring opens on every other one */
+		if (kick_hit) {
 			pud_ring(st, near_p, A, 0.5f, 2);
+			for (int k = 0; k < st->npud; k++)
+				if (k != near_p)
+					pud_ring(st, k, A, 0.75f, 3);
+		}
+		/* the snare: a burst of drops pocks every puddle at once */
+		if (snare_hit)
+			for (int k = 0; k < st->npud; k++) {
+				int n = 3 + (int)((4.0f + 8.0f * dens) * st->pd[k].z);
+				for (int q = 0; q < n; q++)
+					pud_ring(st, k, A, us_randr(r, 0.08f, 0.2f), 4);
+			}
 	}
 
 	/* ---- ripple rings in the puddles (perspective ellipses, clipped to their puddle) ---- */
@@ -1129,6 +1299,17 @@ us_disc(c, cx, cy, cr, 0.45f, US_MAT_LEAF);
 					continue;
 				ellipse(c, x, g->y, rq, rq * g->flat, 0, US_TAU, fv * (1.0f - 0.25f * q), m);
 			}
+			i++;
+			continue;
+		}
+		if (g->kind == 3) {
+			/* a kick ring: a bold crest racing out with a second one behind it */
+			float fv = (1.0f - f) * (0.75f + 0.25f * g->z);
+			if (rr * c->s >= 1.0f)
+				ellipse(c, x, g->y, rr, rr * g->flat, 0, US_TAU, fv, m);
+			float r2 = rr * 0.6f;
+			if (r2 * c->s >= 1.0f)
+				ellipse(c, x, g->y, r2, r2 * g->flat, 0, US_TAU, fv * 0.6f, m);
 			i++;
 			continue;
 		}
@@ -1244,9 +1425,8 @@ us_disc(c, cx, cy, cr, 0.45f, US_MAT_LEAF);
 		float ex = st->px[near_p] + side * st->prx[near_p] * 0.45f, ey = st->py[near_p] - st->pry[near_p] * 0.1f;
 		st->frog_cool -= dt;
 		st->frog_t += dt;
-		/* a hit in the low mids that is not the kick (snare body, a bass stab, a tom) */
-		int lm_hit = (btrig & (0x3fu << 10)) && !kick_hit && a->kick < 0.4f;
-		if (st->frog_st == 0 && lm_hit && st->frog_cool <= 0.0f && us_rand(r) < 0.15f) {
+		/* the snare startles it: it leaps into the water */
+		if (st->frog_st == 0 && snare_hit && st->frog_cool <= 0.0f && us_rand(r) < 0.5f) {
 			st->frog_st = 1;
 			st->frog_t = 0;
 		}
@@ -1351,12 +1531,14 @@ us_disc(c, cx, cy, cr, 0.45f, US_MAT_LEAF);
 		}
 		/* hats: each near post answers its own band of the highs with a crown of spray off its cap */
 		const int CP = 2; /* the crow's post */
+		if (hat_hit) /* each hat knocks the spray off the next post along */
+			st->post_rr = (float)(1 + ((int)st->post_rr) % 6);
 		for (int k = 1; k <= 6; k++) {
 			int b = 23 + k;
 			float z = zp[k], top = yp[k] - hp[k];
 			/* busy hats keep the posts spraying; a sharp one fires at once */
 			st->crown_acc[k] += rdt * 3.0f * a->bands[b] * a->bands[b] * a->bands[b];
-			int fire = ((btrig >> b) & 1u) || st->crown_acc[k] >= 1.0f;
+			int fire = ((btrig >> b) & 1u) || st->crown_acc[k] >= 1.0f || (hat_hit && (int)st->post_rr == k);
 			if (fire)
 				st->crown_acc[k] = 0.0f;
 			if (fire && liquid > 0.5f && !(k == CP && st->crow_fly <= 0.0f)) {
@@ -1409,7 +1591,7 @@ us_disc(c, cx, cy, cr, 0.45f, US_MAT_LEAF);
 					float h1 = sinf(k * 12.9898f + 4.1f) * 43758.5f;
 					h1 -= floorf(h1);
 					float aa = US_TAU * (int)(h1 * NSP) / NSP + 0.2f, rr = R * (0.3f + 0.6f * (k / 14.0f));
-					float gl = st->air_s * us_sat(sinf(t * 1.9f + k * 2.3f) * 1.4f);
+					float gl = fmaxf(st->air_s, a->hat) * us_sat(sinf(t * 1.9f + k * 2.3f) * 1.4f);
 					us_point(c, cx0 + cosf(aa) * rr, cy0 + sinf(aa) * rr * 0.92f, 0.0011f + 0.0008f * gl,
 						 us_sat(0.3f + 0.7f * gl + 0.15f * st->wet), US_MAT_WATER);
 				}
@@ -1444,6 +1626,14 @@ us_disc(c, cx, cy, cr, 0.45f, US_MAT_LEAF);
 		}
 		if (st->bead_acc > 1.0f)
 			st->bead_acc = 1.0f;
+		if (hat_hit && st->nbd > 0) { /* a hat shakes the fattest bead off the wire */
+			int bi = 0;
+			for (int i = 1; i < st->nbd; i++)
+				if (st->bd[i].size > st->bd[bi].size)
+					bi = i;
+			if (st->bd[bi].size > 0.4f)
+				st->bd[bi].size = 1.0f;
+		}
 		for (int i = 0; i < st->nbd;) {
 			bead_t *b = &st->bd[i];
 			int k = b->span;
@@ -1470,7 +1660,7 @@ us_disc(c, cx, cy, cr, 0.45f, US_MAT_LEAF);
 			}
 			float br = (0.0007f + 0.0026f * z) * (0.5f + 0.5f * b->size);
 			/* the air band catches them: a glint runs along the wire */
-			float glint = st->air_s * (0.5f + 0.5f * sinf(t * 2.7f + i * 1.9f));
+			float glint = fmaxf(st->air_s, a->hat) * (0.5f + 0.5f * sinf(t * 2.7f + i * 1.9f));
 			us_point(c, x, y + br * 0.6f, ctx->crisp ? 0.001f : br, us_sat(0.5f + 0.35f * b->size + 0.5f * glint), US_MAT_WATER);
 			i++;
 		}
@@ -1483,8 +1673,11 @@ us_disc(c, cx, cy, cr, 0.45f, US_MAT_LEAF);
 			st->crow_cool -= dt;
 			st->crow_flap = us_approach(st->crow_flap, 0.0f, 0.22f, rdt);
 			if (st->crow_fly <= 0.0f) {
-				if (a->beat)
-					st->crow_flap = us_sat(st->crow_flap + 0.3f + 0.4f * a->onset);
+				/* the snare makes it throw up its wings; the kick only rocks it */
+				if (snare_hit)
+					st->crow_flap = 1.0f;
+				else if (kick_hit)
+					st->crow_flap = us_sat(st->crow_flap + 0.25f);
 				if (a->beat && st->crow_cool <= 0.0f && (lull > 2.5f || (a->onset > 0.95f && us_rand(r) < 0.02f))) {
 					st->crow_fly = 1e-4f;
 					st->crow_cool = 20.0f;
@@ -1618,7 +1811,8 @@ us_disc(c, cx, cy, cr, 0.45f, US_MAT_LEAF);
 			*d = st->d[--st->nd];
 			continue;
 		}
-		if (d->y > -0.02f) {
+		/* a pixel canvas: only one far drop in five, or the distance boils */
+		if (d->y > -0.02f && !(ctx->crisp && d->z < 0.22f && d->ph < US_TAU * 0.8f)) {
 			if (d->snow) {
 					float sz = 0.001f + 0.004f * d->z * d->z;
 					float v = 0.62f + 0.38f * d->z;
@@ -1640,9 +1834,10 @@ us_disc(c, cx, cy, cr, 0.45f, US_MAT_LEAF);
 				}
 			} else {
 				/* streak = distance travelled in a short exposure, along the wind */
-				float ex = 0.014f + 0.022f * d->z;
+				/* the kick's gust drives the near rain hard: longer, brighter streaks for a moment */
+				float ex = (0.014f + 0.022f * d->z) * (1.0f + 1.1f * st->kfast * d->z);
 				float len_x = vx * ex, len_y = d->vy * ex;
-				float v = 0.18f + 0.65f * d->z * d->z;
+				float v = us_sat((0.18f + 0.65f * d->z * d->z) * (0.8f + 0.3f * st->lvl_s) + 0.25f * st->kfast * d->z);
 				if (d->z > 0.7f && !ctx->crisp)
 					us_line(c, x - len_x, d->y - len_y, x, d->y, 0.0011f + 0.0009f * d->z, v, US_MAT_WATER);
 				else
@@ -1669,6 +1864,67 @@ us_disc(c, cx, cy, cr, 0.45f, US_MAT_LEAF);
 		else
 			hl(c, s->u * A, s->y, s->u * A - s->vx * 0.02f, s->y - s->vy * 0.02f, v, US_MAT_WATER);
 		i++;
+	}
+
+	/* ---- snare crowns: a fan of spray rising off the ground, beads at the tips ---- */
+	for (int i = 0; i < st->ncw;) {
+		crown_t *k = &st->cw[i];
+		k->age += rdt;
+		float f = k->age / k->life;
+		if (f >= 1.0f || k->u * A < -0.05f || k->u * A > A + 0.05f) {
+			*k = st->cw[--st->ncw];
+			continue;
+		}
+		float x = k->u * A, y = ground_y(k->z), z = k->z;
+		/* a sheet of spray splays up and out from where the burst struck; past half-life only the
+		 * droplets it threw are left, arcing back down */
+		float H = (0.005f + 0.032f * z) * k->size, R = (0.006f + 0.034f * z) * k->size;
+		float arc = 4.0f * f * (1.0f - f) + 0.15f * (1.0f - f);
+		float v = (1.0f - f) * (0.55f + 0.35f * z);
+		int sheet = f < 0.45f;
+		uint8_t km = snowy > 0.5f ? US_MAT_SNOW : US_MAT_WATER; /* in snow: puffs of powder */
+		for (int q = 0; q < 6; q++) {
+			float aa = US_PI * (0.12f + 0.76f * q / 5.0f) + 0.15f * sinf(k->size * 40.0f + q * 2.3f);
+			float tx = x - cosf(aa) * R * (0.25f + 0.75f * f), ty = y - H * sinf(aa) * arc;
+			if (ctx->crisp) {
+				if (sheet && z > 0.5f)
+					us_line(c, x - cosf(aa) * R * 0.15f, y, tx, ty, 0.001f, v * 0.75f, km);
+				us_put(c, (int)(tx * c->s), (int)(ty * c->s), v, km);
+			} else {
+				if (sheet)
+					hl(c, x - cosf(aa) * R * 0.15f, y, tx, ty, v * (1.0f - f), km);
+				if (z > 0.4f)
+					us_point(c, tx, ty, 0.0007f + 0.001f * z, v, km);
+			}
+		}
+		i++;
+	}
+
+	/* ---- hat glints: drizzle droplets catching the light, short dashes along the fall ---- */
+	{
+		float gx = slant, gy = 1.0f, gn = 1.0f / sqrtf(gx * gx + gy * gy);
+		gx *= gn;
+		gy *= gn;
+		for (int i = 0; i < st->ngl;) {
+			glint_t *g = &st->gl[i];
+			g->life -= rdt / 0.09f;
+			if (g->life <= 0.0f) {
+				*g = st->gl[--st->ngl];
+				continue;
+			}
+			float x = g->u * A, y = g->y, v = us_sat(0.55f + 0.45f * g->life) * (0.6f + 0.4f * g->z);
+			if (ctx->crisp) {
+				us_put(c, (int)(x * c->s), (int)(y * c->s), v, US_MAT_WATER);
+				if (g->z > 0.6f)
+					us_put(c, (int)(x * c->s), (int)(y * c->s) + 1, v * 0.8f, US_MAT_WATER);
+			} else {
+				float L = 0.003f + 0.011f * g->z;
+				hl(c, x - gx * L, y - gy * L, x, y, v, US_MAT_WATER);
+				if (g->z > 0.7f)
+					us_point(c, x, y, 0.0009f + 0.0008f * g->z, v, US_MAT_WATER);
+			}
+			i++;
+		}
 	}
 
 	/* ---- the snow drift along the foreground: settles, smooths, melts out of winter ---- */
@@ -1717,6 +1973,8 @@ us_disc(c, cx, cy, cr, 0.45f, US_MAT_LEAF);
 			if (h < 0.006f)
 				continue;
 			float sw = (0.12f + 1.1f * st->wind_s * (0.5f + gust) + 0.9f * st->kgs) * (0.6f + 0.4f * us_noise2(x * 3.0f - st->gust_t, st->bp[i]));
+			/* the snare's burst of heavy drops lashes the grass: the blades shudder */
+			sw += 0.8f * st->shiv * sinf(t * 47.0f + st->bp[i] * 7.0f);
 			float pts[10];
 			for (int k = 0; k < 5; k++) {
 				float f = k / 4.0f;
