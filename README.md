@@ -14,19 +14,21 @@ breathing.
 
 | Scene | What the music does |
 |---|---|
-| Meadow | bass grows stems and opens flowers; highs are wind; petals and seeds drift off on hits |
-| Wind | highs drive gust fronts across a grass field; strong gusts shake seeds loose |
-| River | mids/level set the flow; hits shed eddies behind stones |
-| Rain | hits bring bursts of drops, level sets the drizzle; winter turns it to snow |
-| Storm Front | long loud passages charge the clouds; the biggest hits release lightning |
-| Pond | every hit drops a ripple; bass swells the caustic light underneath |
-| Fireflies | quiet brings a few; dense music makes the swarm synchronise its flashing |
-| Mycelium | bass lines spread the network; kicks send nutrient pulses through it |
-| Murmuration | melody steers the flock; big transients scatter it |
-| Tide | phrase-length swells roll waves in; highs lace the foam |
-| Pollen & Seeds | highs lift seeds, sub-bass turns slow vortices |
-| Coral | low-mids feed a slowly creeping reaction-diffusion reef |
-| Aurora | stereo width and shimmer ripple the curtains; bass surges their light |
+| Meadow | bass grows stems and opens flowers; a row of daisies each opens to its own frequency; kicks roll gusts and burst seed heads; hats send bees darting; the swell flares the sun |
+| Wind | kicks sweep gust fronts and bow the poplars one by one; each depth row of grass flutters to its own band; the melody lifts the kite and the swallows |
+| River | kicks make trout leap; reed clumps nod along the bank to the melody; highs bring dancing mayflies and rises; big hits startle the sheep; width fans the ducklings out |
+| Rain | kicks throw gusts and heavy eave drops; each puddle rings to its own band; hats splash off the fence posts; the swell warms the farmhouse windows |
+| Storm Front | long loud passages charge the clouds; the biggest hits release lightning; sub rolls thunder along the cloud base; kicks push gust fronts through the oak; highs hang virga |
+| Pond | every hit drops a ripple; kicks flick the koi; big hits make the frog leap; reeds and lotus each answer one band; width is the wind on the water |
+| Fireflies | six colonies each flash on their own part of the spectrum; quiet brings a few; dense music synchronises the swarm; kicks ring the pool and shiver the web |
+| Mycelium | bass lines spread the network; kicks send nutrient pulses and squash the caps; regions glow with the melody; hats make springtails leap; sub drives the mole |
+| Murmuration | melody steers the flock; kicks ripple density waves through it; hats shimmer the wingbeats; width splits it in two; big transients scatter it |
+| Tide | phrase-length swells roll waves in; kicks burst breakers on the rocks; mids shimmer the moon path; crabs scuttle to their own bands |
+| Pollen & Seeds | highs lift seeds, sub-bass turns slow vortices; hits release the clocks; each clock fluffs to its band; hoverflies dart on the melody |
+| Coral | low-mids feed a slowly creeping reaction-diffusion reef; kicks dart the fish; hats flinch the polyps; anemones open to the mids; snares puff bubbles |
+| Aurora | stereo width and shimmer ripple the curtains; bass surges their light; kicks run pulses along them; each stretch of curtain answers a band; hits throw shooting stars |
+
+In Ink looks the glow itself breathes with the music: kicks flare it, the phrase swell lifts it.
 
 ### Follow the music
 
