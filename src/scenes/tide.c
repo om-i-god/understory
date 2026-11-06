@@ -431,7 +431,7 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 		st->crash_k = us_sat(0.4f + 0.7f * a->kick);
 		st->crash_age = 0.0f;
 		st->crash_n += 1.0f;
-		st->crash_cd = 0.22f;
+		st->crash_cd = 0.9f; /* breakers need time to gather: at most one burst every ~2 beats */
 		st->crash_spawn = 10 + (int)(26.0f * st->crash_k);
 		st->pool_t[0] = st->pool_t[1] = -0.35f; /* the spray lands in the rock pools a moment later */
 	}
