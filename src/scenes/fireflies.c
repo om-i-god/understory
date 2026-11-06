@@ -10,6 +10,13 @@
  * Each flash glows in additive halos with a faint ring that widens as it fades, and every firefly keeps a
  * ~1.2 s flight-path history drawn as a long-exposure trail lit wherever it flashed. Low fireflies are mirrored
  * as broken streaks in a still pool, and flash light pools on the grass below (so sync waves sweep the bank).
+ * The swarm is six colonies by depth, each listening to its own slice of the spectrum (sub low in the grass ..
+ * air up by the treeline): a rise in its band makes the members that were about to flash flash now, and the
+ * band's level sets how bright the colony burns. Around them: moths chase the light (hats quicken their wings),
+ * an owl on a dead snag turns its head with the spectral centroid and its eyes catch the mids, kicks raise
+ * fish rings on the pool and shiver an orb-web strung off a cattail, sub thickens the ground mist, air makes the
+ * stars scintillate, glitters the moon path and (on a hit) sends a shooting star, swell brightens the milky way
+ * and stereo width loosens the moths' orbits.
  * World: reads calm, insects (population at open), daylight (by day far fewer and dimmer), season;
  *        writes insects (calm, dark music breeds them).
  */
@@ -33,6 +40,10 @@
 #define NMW 460   /* milky-way stars */
 #define LGX 64    /* coarse flash-light grid (halo tinting) */
 #define LGY 36
+#define NCOL 6    /* colonies: each listens to its own slice of the spectrum */
+#define NMOTH 4
+#define NPR 6     /* rising-fish rings on the pool (kicks) */
+#define NDEW 7
 
 #define POOL_Y 0.885f
 #define FLY_TOP 0.36f
@@ -51,6 +62,7 @@ typedef struct {
 	float nz;     /* noise offset */
 	int state;    /* 0 dead, 1 alive, 2 leaving */
 	int cell;
+	int col;      /* colony 0 (sub, low in the grass) .. NCOL-1 (air, up by the treeline) */
 	float hx[NHIST], hy[NHIST], hb[NHIST]; /* ring buffer: x (already * aspect), y, flash brightness */
 	int hh;
 } fly_t;
@@ -82,7 +94,26 @@ typedef struct {
 	float mw_x[NMW], mw_y[NMW], mw_b[NMW];
 	float lg[LGX * LGY], lg_s[LGX * LGY], lcov[LGX * LGY];
 	float lwt[LGX * LGY];
+	/* colonies: band envelope, slow average, refractory timer, phase kick for this frame */
+	float col_env[NCOL], col_avg[NCOL], col_cd[NCOL], col_kick[NCOL];
+	/* smoothed region features (each has its own job) */
+	float sub_s, mid_s, air_s, high_s, swell_s, width_s, cent_s, web_sh;
+	/* moths chasing the light */
+	float mo_x[NMOTH], mo_y[NMOTH], mo_vx[NMOTH], mo_vy[NMOTH], mo_ph[NMOTH], mo_orb[NMOTH], mo_tt[NMOTH];
+	int mo_tgt[NMOTH];
+	/* the owl on the dead snag */
+	float owl_xf, owl_turn, owl_look, owl_look_t, owl_blink, owl_blink_t;
+	/* rising-fish rings */
+	float pr_x[NPR], pr_y[NPR], pr_age[NPR], pr_amp[NPR];
+	/* shooting star */
+	float met_x, met_y, met_dx, met_dy, met_age, met_cd;
+	/* the orb-web between the reeds */
+	float web_x, web_y, web_r;
 } st_t;
+
+/* colony band slices (bands are log-spaced 30 Hz..16 kHz). The lowest bands can hold no FFT bin at all and read
+ * as a flat 1, so the two bass colonies listen to the sub / bass features instead and the rest start at ~175 Hz */
+static const int col_band[NCOL + 1] = {0, 0, 9, 15, 21, 26, 32};
 
 static void *create(uint32_t seed)
 {
@@ -92,6 +123,69 @@ static void *create(uint32_t seed)
 }
 
 static void destroy(void *p) { free(p); }
+
+/* an axis-aligned hairline ellipse as splats (pool rings); crisp canvases get hard pixels */
+static void hellipse(us_canvas *c, float x, float y, float rx, float ry, float v, uint8_t m)
+{
+	float rp = rx * c->s, rq = ry * c->s;
+	int n = (int)(US_TAU * rp * 0.8f) + 8;
+	if (n > 1500)
+		n = 1500;
+	float cx = x * c->s - 0.5f, cy = y * c->s - 0.5f;
+	float ca = cosf(US_TAU / n), sa = sinf(US_TAU / n), dx = 1, dy = 0;
+	for (int i = 0; i < n; i++) {
+		float fx = cx + dx * rp, fy = cy + dy * rq;
+		/* the ring is brightest at its near and far sides, like light on a real ripple */
+		float vv = v * (0.45f + 0.55f * dy * dy);
+		int ix = (int)floorf(fx), iy = (int)floorf(fy);
+		if (c->crisp)
+			us_put(c, (int)(fx + 0.5f), (int)(fy + 0.5f), vv, m);
+		else {
+			float ax = fx - ix, ay = fy - iy;
+			us_put(c, ix, iy, vv * (1 - ax) * (1 - ay), m);
+			us_put(c, ix + 1, iy, vv * ax * (1 - ay), m);
+			us_put(c, ix, iy + 1, vv * (1 - ax) * ay, m);
+			us_put(c, ix + 1, iy + 1, vv * ax * ay, m);
+		}
+		float ndx = dx * ca - dy * sa;
+		dy = dx * sa + dy * ca;
+		dx = ndx;
+	}
+}
+
+/* knock ink out of a disc (silhouettes in front of the sky glow) */
+static void carve_disc(us_canvas *c, float x, float y, float r)
+{
+	int x0 = (int)floorf((x - r) * c->s), x1 = (int)ceilf((x + r) * c->s);
+	int y0 = (int)floorf((y - r) * c->s), y1 = (int)ceilf((y + r) * c->s);
+	float r2 = r * c->s * r * c->s;
+	float cx = x * c->s, cy = y * c->s;
+	if (x0 < 0)
+		x0 = 0;
+	if (y0 < 0)
+		y0 = 0;
+	if (x1 > c->w)
+		x1 = c->w;
+	if (y1 > c->h)
+		y1 = c->h;
+	for (int py = y0; py < y1; py++)
+		for (int px = x0; px < x1; px++) {
+			float ddx = px + 0.5f - cx, ddy = py + 0.5f - cy;
+			if (ddx * ddx + ddy * ddy <= r2)
+				c->ink[(size_t)py * c->w + px] = 0;
+		}
+}
+
+static void carve_line(us_canvas *c, float ax, float ay, float bx, float by, float r)
+{
+	float len = sqrtf((bx - ax) * (bx - ax) + (by - ay) * (by - ay)) * c->s;
+	int n = (int)(len / 1.5f) + 1;
+	for (int i = 0; i <= n; i++) {
+		float u = (float)i / n;
+		carve_disc(c, ax + (bx - ax) * u, ay + (by - ay) * u, r);
+	}
+}
+
 
 /* a hairline circle drawn as bilinear splats around the circumference (much cheaper than us_ring) */
 static void hring(us_canvas *c, float x, float y, float r, float v)
@@ -335,8 +429,12 @@ static void spawn_fly(st_t *st, fly_t *f, float A, float life0)
 	/* far ones hug the treeline, near ones roam low over the field */
 	float ylo = us_lerp(0.50f, 0.66f, f->z), yhi = us_lerp(0.70f, FLY_BOT, f->z);
 	f->y = us_randr(r, ylo, yhi);
-	if (us_rand(r) < 0.15f) /* a few up in the trees */
+	/* colony by depth: the bass colonies hang low and near in the grass, the treble ones far and high */
+	f->col = (int)((1.0f - f->z) * (NCOL - 1) + 0.5f);
+	if (us_rand(r) < 0.15f) { /* a few up in the trees: the air colony */
 		f->y = us_randr(r, FLY_TOP + 0.04f, 0.6f);
+		f->col = NCOL - 1;
+	}
 	f->th = us_randr(r, -US_PI, US_PI);
 	f->dev = us_randn(r);
 	f->life = life0;
@@ -415,6 +513,32 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 		int n0 = (int)(nmax * frac);
 		for (int i = 0; i < n0 && i < MAXF; i++)
 			spawn_fly(st, &st->f[i], A, 1.0f);
+		for (int k = 0; k < NMOTH; k++) {
+			st->mo_x[k] = us_randr(r, 0.1f, 0.9f) * A;
+			st->mo_y[k] = us_randr(r, 0.5f, 0.8f);
+			st->mo_ph[k] = us_rand(r) * US_TAU;
+			st->mo_tgt[k] = -1;
+		}
+		for (int k = 0; k < NPR; k++)
+			st->pr_age[k] = -1;
+		/* the owl's snag stands in the lowest stretch of canopy on the right, so it reads against the sky */
+		{
+			float best = -1;
+			for (int k = 0; k <= 24; k++) {
+				float xf = 0.70f + 0.22f * k / 24.0f;
+				float tp = tree_at(st, xf);
+				if (tp > best)
+					best = tp, st->owl_xf = xf;
+			}
+		}
+		st->owl_look_t = 2.0f;
+		st->owl_blink_t = 3.0f;
+		st->met_age = -1;
+		st->met_cd = 4.0f;
+		/* the orb-web hangs off the first cattail, toward the open water */
+		st->web_r = 0.026f;
+		st->web_x = st->cat_x[0] + (st->cat_x[0] < 0.5f ? 0.03f : -0.03f); /* fraction of width */
+		st->web_y = POOL_Y - st->cat_h[0] * 0.5f;
 		st->omega = US_TAU / 1.7f;
 		st->beat_iv = 0.5f;
 		st->inited = 1;
@@ -435,6 +559,42 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 		float w_nat = US_TAU / 1.7f;
 		float target = us_lerp(w_nat, US_TAU / P, us_sat(E * 1.4f));
 		st->omega = us_approach(st->omega, target, 4.0f, dt);
+	}
+
+	/* ---- the music, region by region ---- */
+	{
+		st->sub_s = us_approach(st->sub_s, a->sub, a->sub > st->sub_s ? 0.15f : 0.9f, rdt);
+		st->mid_s = us_approach(st->mid_s, a->mid, a->mid > st->mid_s ? 0.12f : 0.6f, rdt);
+		st->high_s = us_approach(st->high_s, a->high, a->high > st->high_s ? 0.06f : 0.35f, rdt);
+		st->air_s = us_approach(st->air_s, a->air, a->air > st->air_s ? 0.06f : 0.4f, rdt);
+		st->swell_s = us_approach(st->swell_s, a->swell, 1.5f, rdt);
+		st->width_s = us_approach(st->width_s, a->width, 1.2f, rdt);
+		st->cent_s = us_approach(st->cent_s, a->centroid, 0.9f, rdt);
+		/* the web shivers with each kick and settles in ~0.4 s */
+		st->web_sh = a->kick > st->web_sh ? a->kick : us_approach(st->web_sh, 0, 0.18f, rdt);
+		/* colonies: each one's slice of the spectrum. A rise above its own recent average is that colony's
+		 * "hit": fireflies that were about to flash flash now (pulse-coupled, like the real ones) */
+		for (int k = 0; k < NCOL; k++) {
+			float e = 0;
+			if (k == 0)
+				e = a->sub;
+			else if (k == 1)
+				e = a->bass;
+			else {
+				for (int b = col_band[k]; b < col_band[k + 1]; b++)
+					e += a->bands[b];
+				e /= (float)(col_band[k + 1] - col_band[k]);
+			}
+			st->col_env[k] = us_approach(st->col_env[k], e, e > st->col_env[k] ? 0.04f : 0.45f, rdt);
+			float rise = e - st->col_avg[k];
+			st->col_avg[k] = us_approach(st->col_avg[k], e, 0.22f, rdt);
+			st->col_cd[k] -= rdt;
+			st->col_kick[k] = 0;
+			if (rise > 0.09f && st->col_cd[k] <= 0) {
+				st->col_kick[k] = us_sat(0.3f + rise * 3.0f);
+				st->col_cd[k] = 0.14f;
+			}
+		}
 	}
 
 	/* ---- world ---- */
@@ -556,7 +716,7 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 					} else {
 						float band = (y > top + 0.01f) * us_smooth(0.57f, 0.645f, y) * (1.0f - us_smooth(0.68f, 0.79f, y));
 						float n = us_fbm2(xf * 5.0f - t * 0.012f, y * 14.0f + t * 0.004f, 2);
-						v = band * (0.05f + 0.25f * us_sat(0.5f + n)) * (0.5f + 0.8f * w->calm);
+						v = band * (0.05f + 0.25f * us_sat(0.5f + n)) * (0.5f + 0.8f * w->calm + 0.9f * st->sub_s);
 					}
 					st->field[j * FW + i] = v;
 				}
@@ -608,7 +768,7 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 					float n = us_fbm2(xf * 5.0f - t * 0.012f * (1.0f + 0.2f * u), y * 14.0f + t * 0.004f, 2);
 					float open = y > tree_at(st, xf) + 0.01f;
 					/* the field's air, faintly lit by the swarm */
-					prof[i] = open * band * us_smooth(0.25f, 0.75f, 0.5f + n) * (0.04f + 0.05f * w->calm + 0.14f * st->glow);
+					prof[i] = open * band * us_smooth(0.25f, 0.75f, 0.5f + n) * (0.04f + 0.05f * w->calm + 0.14f * st->glow + 0.11f * st->sub_s);
 				}
 				float fy = y * c->s - 0.5f;
 				int iy = (int)floorf(fy);
@@ -636,7 +796,8 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 				float xf = st->star_x[k];
 				if (st->star_y[k] > tree_at(st, xf) - 0.01f)
 					continue;
-				float tw = 0.7f + 0.3f * sinf(t * (0.7f + k % 5 * 0.3f) + st->star_ph[k]);
+				float twa = 0.3f + 0.45f * st->air_s; /* air (cymbals, breath) makes the stars scintillate */
+				float tw = 0.75f + twa * sinf(t * (0.7f + k % 5 * 0.3f) * (1.0f + 2.0f * st->air_s) + st->star_ph[k]);
 				float sb = sv * st->star_b[k] * tw * (ctx->crisp ? 0.6f : 1.0f);
 				if (ctx->crisp && st->star_b[k] < 0.4f)
 					continue;
@@ -656,7 +817,7 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 				float y = st->mw_y[k] + 0.03f * sinf(xf * 3.0f);
 				if (y > tree_at(st, xf) - 0.015f || y < 0.005f)
 					continue;
-				float b = 2.4f * st->mw_b[k] * sv * (0.85f + 0.15f * sinf(t * (0.5f + (k % 7) * 0.2f) + k));
+				float b = 2.4f * st->mw_b[k] * sv * (0.65f + 0.7f * st->swell_s) * (0.85f + 0.15f * sinf(t * (0.5f + (k % 7) * 0.2f) + k));
 				if (ctx->crisp) {
 					if (st->mw_b[k] < 0.2f)
 						continue;
@@ -702,6 +863,132 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 		}
 		if (!ctx->crisp)
 			us_polyline(c, pts, 161, 0.0011f, 0.16f + 0.1f * day, US_MAT_LEAF);
+	}
+
+	float night = 1.0f - us_smooth(0.15f, 0.55f, w->daylight);
+
+	/* a shooting star now and then, when the air (crashes, breath) is open on a hit */
+	{
+		st->met_cd -= rdt;
+		if (st->met_age < 0 && a->beat && st->air_s > 0.45f && st->met_cd <= 0 && night > 0.3f &&
+		    us_rand(&st->rng) < 0.5f) {
+			st->met_age = 0;
+			st->met_x = us_randr(&st->rng, 0.15f, 0.85f) * A;
+			st->met_y = us_randr(&st->rng, 0.04f, 0.2f);
+			float ang = us_randr(&st->rng, 0.25f, 0.6f);
+			float dir = us_rand(&st->rng) < 0.5f ? -1.0f : 1.0f;
+			st->met_dx = dir * cosf(ang) * 0.55f;
+			st->met_dy = sinf(ang) * 0.55f;
+			st->met_cd = us_randr(&st->rng, 7.0f, 14.0f);
+		}
+		if (st->met_age >= 0) {
+			st->met_age += rdt;
+			const float dur = 0.65f;
+			if (st->met_age > dur)
+				st->met_age = -1;
+			else {
+				float u = st->met_age / dur;
+				float hx = st->met_x + st->met_dx * st->met_age, hy = st->met_y + st->met_dy * st->met_age;
+				float tl = 0.05f + 0.12f * us_smooth(0.0f, 0.4f, u);
+				float tx = hx - st->met_dx * tl / 0.55f, ty = hy - st->met_dy * tl / 0.55f;
+				float mv = night * 0.7f * us_smooth(0.0f, 0.1f, u) * (1.0f - u) * (1.0f - u);
+				if (hy < tree_at(st, hx / A) - 0.01f) {
+					if (ctx->crisp)
+						us_line(c, tx, ty, hx, hy, 0.003f, mv, US_MAT_ACCENT);
+					else {
+						/* a fading streak: brighter toward the head */
+						float mx = (tx + hx) * 0.5f, my = (ty + hy) * 0.5f;
+						wline(c, tx, ty, mx, my, mv * 0.35f, US_MAT_ACCENT);
+						wline(c, mx, my, hx, hy, mv, US_MAT_ACCENT);
+						us_point(c, hx, hy, 0.0012f, mv, US_MAT_ACCENT);
+					}
+				}
+			}
+		}
+	}
+
+	/* the owl on a dead snag above the trees: turns its head to follow the melody's brightness, its eyes
+	 * catch the light with the mids, and it blinks */
+	{
+		float xf = st->owl_xf, sx = xf * A;
+		float top = tree_at(st, xf);
+		for (int k = -3; k <= 3; k++) {
+			float tk = tree_at(st, xf + k * 0.006f);
+			if (tk < top)
+				top = tk;
+		}
+		float yb = tree_at(st, xf) + 0.02f, yt = top - 0.075f;
+		float kx = sx + 0.003f, ky = us_lerp(yb, yt, 0.45f);
+		float py = yt + 0.022f;                       /* perch branch height */
+		float bx0 = sx, bx1 = sx - 0.034f, by1 = py - 0.005f;
+		float u = ctx->crisp ? 0.016f : 0.0125f;      /* owl scale */
+		float ox = sx - 0.02f, oy = by1 + 0.0025f - 1.6f * u; /* owl centre, feet on the branch */
+		/* behaviour */
+		st->owl_look_t -= rdt;
+		if (st->owl_look_t <= 0) {
+			st->owl_look = us_randr(&st->rng, -1.0f, 1.0f);
+			st->owl_look_t = us_randr(&st->rng, 2.5f, 7.0f);
+		}
+		float tgt = us_clampf(0.45f * st->owl_look + 2.6f * (st->cent_s - 0.45f) * a->active, -1.0f, 1.0f);
+		st->owl_turn = us_approach(st->owl_turn, tgt, 0.35f, rdt);
+		st->owl_blink_t -= rdt;
+		if (st->owl_blink_t <= 0) {
+			st->owl_blink = 1;
+			st->owl_blink_t = us_randr(&st->rng, 3.0f, 8.0f);
+		}
+		st->owl_blink = us_approach(st->owl_blink, 0, 0.08f, rdt);
+		float tn = st->owl_turn;
+		/* silhouette: knock the sky out, then draw the edge */
+		float cr = ctx->crisp ? 1.0f / c->s : 0.0016f;
+		carve_line(c, sx, yb, kx, ky, cr);
+		carve_line(c, kx, ky, sx - 0.001f, yt, cr);
+		carve_line(c, bx0, py, bx1, by1, cr * 0.8f);
+		carve_disc(c, ox, oy + 0.35f * u, 0.95f * u);
+		carve_disc(c, ox + 0.1f * tn * u, oy - 0.65f * u, 0.8f * u);
+		float sv = 0.15f + 0.1f * day;
+		uint8_t sm = US_MAT_STEM;
+		if (ctx->crisp) {
+			/* pixel: a dim solid shape against the sky glow */
+			us_line(c, sx, yb, kx, ky, 0.004f, 0.16f, sm);
+			us_line(c, kx, ky, sx, yt, 0.004f, 0.16f, sm);
+			us_line(c, bx0, py, bx1, by1, 0.004f, 0.14f, sm);
+			us_disc(c, ox, oy + 0.35f * u, 0.95f * u, 0.2f, US_MAT_EARTH);
+			us_disc(c, ox + 0.1f * tn * u, oy - 0.65f * u, 0.8f * u, 0.2f, US_MAT_EARTH);
+			for (int k = -1; k <= 1; k += 2) /* ear tufts */
+				us_put(c, (int)((ox + (0.6f * k + 0.3f * tn) * u) * c->s), (int)((oy - 1.5f * u) * c->s), 0.2f, US_MAT_EARTH);
+		} else {
+			wline(c, sx, yb, kx, ky, sv, sm);
+			wline(c, kx, ky, sx - 0.001f, yt, sv, sm);
+			wline(c, bx0, py, bx1, by1, sv, sm);
+			wline(c, sx - 0.001f, yt + 0.035f, sx + 0.016f, yt + 0.022f, sv * 0.8f, sm);
+			wline(c, sx + 0.016f, yt + 0.022f, sx + 0.022f, yt + 0.014f, sv * 0.6f, sm);
+			/* owl outline in owl units: egg body, shoulders, ear tufts that swing with the head */
+			static const float ol[17][2] = {{0, 1.6f}, {0.75f, 1.4f}, {1.0f, 0.8f}, {0.95f, 0.0f}, {0.8f, -0.6f},
+							{0.75f, -1.0f}, {0.85f, -1.55f}, {0.45f, -1.25f}, {0, -1.2f}, {-0.45f, -1.25f},
+							{-0.85f, -1.55f}, {-0.75f, -1.0f}, {-0.8f, -0.6f}, {-0.95f, 0.0f},
+							{-1.0f, 0.8f}, {-0.75f, 1.4f}, {0, 1.6f}};
+			float pts[34];
+			for (int k = 0; k < 17; k++) {
+				float hx = ol[k][0], hy = ol[k][1];
+				if (hy < -0.7f) /* head points follow the turn */
+					hx = hx * (1.0f - 0.25f * fabsf(tn)) + 0.3f * tn;
+				pts[2 * k] = ox + hx * u;
+				pts[2 * k + 1] = oy + hy * u;
+			}
+			us_polyline(c, pts, 17, 0.0011f, 0.24f + 0.1f * day, US_MAT_ACCENT);
+		}
+		/* eyes: two points that shift (and one hides) as the head turns */
+		float ev = (0.1f + 0.75f * st->mid_s) * (1.0f - st->owl_blink) * (0.4f + 0.6f * night);
+		if (ev > 0.02f)
+			for (int k = -1; k <= 1; k += 2) {
+				float ex = k * 0.38f * (1.0f - 0.3f * fabsf(tn)) + 0.42f * tn;
+				if (fabsf(ex) > 0.62f)
+					continue; /* turned away */
+				if (ctx->crisp)
+					us_put(c, (int)((ox + ex * u) * c->s), (int)((oy - 0.75f * u) * c->s), ev, US_MAT_LIGHT);
+				else
+					us_point(c, ox + ex * u, oy - 0.75f * u, 0.0011f, ev, US_MAT_LIGHT);
+			}
 	}
 
 	/* ================= fireflies: simulate ================= */
@@ -778,11 +1065,29 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 		 * travelling front), a hint of body glow otherwise */
 		float lag = wave_k * ((f->x - 0.5f) * A * wdx + (f->y - 0.62f) * wdy);
 		float ph = f->th - lag;
+		/* this colony's band just rose: whoever was close to flashing flashes now */
+		{
+			float ck = st->col_kick[f->col];
+			if (ck > 0) {
+				float pw0 = ph;
+				while (pw0 > US_PI)
+					pw0 -= US_TAU;
+				while (pw0 < -US_PI)
+					pw0 += US_TAU;
+				if (pw0 < 0 && pw0 > -1.7f) {
+					float j = -pw0 * ck * 0.85f;
+					f->th += j;
+					ph += j;
+					if (f->th > US_PI)
+						f->th -= US_TAU;
+				}
+			}
+		}
 		float cth = cosf(ph);
 		float b = cth > 0 ? cth * cth : 0;
 		b = b * b * b; /* cos^6 */
 		float x = f->x * A, y = f->y;
-		float vis = f->life * lum;
+		float vis = f->life * lum * (0.7f + 0.55f * st->col_env[f->col]);
 		float size = 0.65f + 0.75f * f->z;
 		float v = b * vis;
 
@@ -882,6 +1187,77 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 						  : us_approach(st->gbin_s[k], g, 0.35f, rdt);
 	}
 
+	/* moths: each chases a firefly's light for a few seconds, wings beating faster and flight more
+	 * skittish with the hats; stereo width loosens their orbits */
+	if (night > 0.05f)
+		for (int m = 0; m < NMOTH; m++) {
+			st->mo_tt[m] -= dt;
+			int tg = st->mo_tgt[m];
+			if (st->mo_tt[m] <= 0 || tg < 0 || st->f[tg].state != 1) {
+				int k0 = (int)(us_rand(&st->rng) * MAXF);
+				st->mo_tgt[m] = -1;
+				for (int j = 0; j < MAXF; j++) {
+					const fly_t *ff = &st->f[(k0 + j) % MAXF];
+					if (ff->state == 1 && ff->life > 0.5f && ff->y > 0.45f) {
+						st->mo_tgt[m] = (k0 + j) % MAXF;
+						break;
+					}
+				}
+				st->mo_tt[m] = us_randr(&st->rng, 2.5f, 6.0f);
+				st->mo_orb[m] = us_randr(&st->rng, 0.015f, 0.04f);
+				tg = st->mo_tgt[m];
+			}
+			float tx = tg >= 0 ? st->f[tg].x * A : 0.5f * A, ty = tg >= 0 ? st->f[tg].y : 0.62f;
+			float ph2 = t * (1.4f + 0.37f * m) + m * 2.1f;
+			float orb = st->mo_orb[m] * (0.7f + 0.9f * st->width_s);
+			tx += cosf(ph2) * orb;
+			ty += sinf(ph2 * 1.3f) * orb * 0.6f;
+			float jit = 0.06f + 0.3f * st->high_s;
+			float nx = us_noise2(t * 2.7f + m * 7.1f, 1.3f), ny = us_noise2(t * 2.9f + m * 3.7f, 8.1f);
+			st->mo_vx[m] = us_approach(st->mo_vx[m], (tx - st->mo_x[m]) * 1.2f + jit * nx, 0.25f, dt);
+			st->mo_vy[m] = us_approach(st->mo_vy[m], (ty - st->mo_y[m]) * 1.2f + jit * ny, 0.25f, dt);
+			{ /* moths flutter, they don't dart: cap the cruising speed */
+				float sp2 = st->mo_vx[m] * st->mo_vx[m] + st->mo_vy[m] * st->mo_vy[m], vmax = 0.09f + 0.08f * st->high_s;
+				if (sp2 > vmax * vmax) {
+					float k = vmax / sqrtf(sp2);
+					st->mo_vx[m] *= k;
+					st->mo_vy[m] *= k;
+				}
+			}
+			st->mo_x[m] += st->mo_vx[m] * dt;
+			st->mo_y[m] = us_clampf(st->mo_y[m] + st->mo_vy[m] * dt, 0.3f, POOL_Y - 0.01f);
+			if (st->mo_x[m] < -0.05f || st->mo_x[m] > A + 0.05f)
+				st->mo_x[m] = us_clampf(st->mo_x[m], -0.05f, A + 0.05f);
+			st->mo_ph[m] += dt * (28.0f + 50.0f * st->high_s);
+			float mx = st->mo_x[m], my = st->mo_y[m];
+			int gb = (int)(mx / A * NGB);
+			float lit = st->gbin_s[gb < 0 ? 0 : (gb >= NGB ? NGB - 1 : gb)];
+			float mv = night * (0.11f + 0.6f * lit);
+			float fl = sinf(st->mo_ph[m]);
+			float sp = 0.0048f;
+			if (ctx->crisp) {
+				int ix = (int)(mx * c->s), iy = (int)(my * c->s);
+				us_put(c, ix, iy, mv * 1.3f, US_MAT_ACCENT);
+				if (fl > 0) {
+					us_put(c, ix - 1, iy - 1, mv, US_MAT_ACCENT);
+					us_put(c, ix + 1, iy - 1, mv, US_MAT_ACCENT);
+				} else {
+					us_put(c, ix - 1, iy, mv * 0.8f, US_MAT_ACCENT);
+					us_put(c, ix + 1, iy, mv * 0.8f, US_MAT_ACCENT);
+				}
+			} else {
+				/* a bow-tie of two soft wings whose width beats (seen from behind), a speck of body */
+				float wd = sp * (0.2f + 0.8f * fabsf(fl));
+				for (int sd = -1; sd <= 1; sd += 2) {
+					float ax = mx + sd * wd, ay = my - sp * 0.45f, bx = mx + sd * wd * 0.75f, by = my + sp * 0.5f;
+					wline(c, mx, my - sp * 0.1f, ax, ay, mv, US_MAT_ACCENT);
+					wline(c, ax, ay, bx, by, mv * 0.8f, US_MAT_ACCENT);
+					wline(c, bx, by, mx, my + sp * 0.15f, mv * 0.6f, US_MAT_ACCENT);
+				}
+				us_point(c, mx, my, 0.001f, mv, US_MAT_ACCENT);
+			}
+		}
+
 	/* ================= foreground: pool, cattails, grass ================= */
 	{
 		/* shoreline */
@@ -909,6 +1285,60 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 			else
 				hline(c, x0, x0 + len, yy, (0.10f + 0.12f * depth) * (1.0f + st->glow), US_MAT_WATER);
 		}
+		/* a fish rising (or a frog) on the kick: slow widening rings on the still water; now and then in
+		 * silence too, so the pool keeps breathing */
+		{
+			int spawn = (a->beat && a->kick > 0.45f) ||
+				    us_rand(&st->rng) < dt * 0.12f; /* ~ one every 8 s on its own */
+			if (spawn)
+				for (int k = 0; k < NPR; k++)
+					if (st->pr_age[k] < 0) {
+						st->pr_age[k] = 0;
+						st->pr_x[k] = us_randr(&st->rng, 0.06f, 0.94f) * A;
+						st->pr_y[k] = us_randr(&st->rng, POOL_Y + 0.025f, 0.975f);
+						st->pr_amp[k] = 0.45f + 0.55f * (a->beat ? a->kick : 0.4f);
+						break;
+					}
+			for (int k = 0; k < NPR; k++) {
+				if (st->pr_age[k] < 0)
+					continue;
+				st->pr_age[k] += dt;
+				const float dur = 2.4f;
+				float u = st->pr_age[k] / dur;
+				if (u >= 1.0f) {
+					st->pr_age[k] = -1;
+					continue;
+				}
+				float depth = (st->pr_y[k] - POOL_Y) / (1.0f - POOL_Y);
+				float rx = (0.004f + 0.075f * sqrtf(u)) * (0.6f + 0.6f * depth);
+				float rv = st->pr_amp[k] * (0.32f + 0.3f * st->glow) * (1.0f - u) * (1.0f - u) * us_smooth(0.0f, 0.04f, u);
+				float ry = rx * 0.14f;
+				if (st->pr_y[k] + ry > 0.998f)
+					continue;
+				hellipse(c, st->pr_x[k], st->pr_y[k], rx, ry, rv, US_MAT_WATER);
+				if (u > 0.1f && !ctx->crisp)
+					hellipse(c, st->pr_x[k], st->pr_y[k], rx * 0.62f, ry * 0.62f, rv * 0.55f, US_MAT_WATER);
+			}
+		}
+		/* moon glitter: sparks on the moon's path that come and go with the air band */
+		if (moon_v > 0.02f && moon_x > 0 && st->air_s > 0.05f)
+			for (int k = 0; k < 9; k++) {
+				float slot = floorf(t * 6.0f + k * 0.37f);
+				float hsh = sinf(slot * 12.9898f + k * 78.233f) * 43758.5453f;
+				hsh -= floorf(hsh);
+				float hs2 = sinf(slot * 39.346f + k * 11.135f) * 24634.6345f;
+				hs2 -= floorf(hs2);
+				float ph = t * 6.0f + k * 0.37f - slot; /* 0..1 within its slot */
+				float gv = st->air_s * moon_v * 0.8f * sinf(ph * US_PI) * (hsh > 0.35f);
+				float gy = POOL_Y + 0.012f + hs2 * 0.09f;
+				float gx = moon_x + (hsh - 0.5f) * (0.03f + 0.25f * (gy - POOL_Y));
+				if (gv > 0.02f) {
+					if (ctx->crisp)
+						us_put(c, (int)(gx * c->s), (int)(gy * c->s), gv, US_MAT_WATER);
+					else
+						us_point(c, gx, gy, 0.0011f, gv, US_MAT_WATER);
+				}
+			}
 		/* moon reflection */
 		if (moon_v > 0.02f && moon_x > 0)
 			for (int k = 0; k < 6; k++) {
@@ -937,6 +1367,46 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 			lp[2 * q + 1] = POOL_Y - h * 0.7f * u;
 		}
 		us_polyline(c, lp, 4, ctx->crisp ? 0.003f : 0.0012f, 0.3f + 0.2f * st->glow, US_MAT_LEAF);
+	}
+
+	/* an orb-web strung off the first cattail: lit by nearby flashes, dew beads glinting, shivering on kicks */
+	if (!ctx->crisp) {
+		enum { NSP = 9, NRING = 6 };
+		float wx = st->web_x * A, wy = st->web_y, wr = st->web_r;
+		int gb = (int)(st->web_x * NGB);
+		float lit = st->gbin_s[gb < 0 ? 0 : (gb >= NGB ? NGB - 1 : gb)];
+		float sh = st->web_sh * (1.0f - winter);
+		float wv = (0.06f + 0.45f * lit + 0.08f * sh) * (1.0f - 0.5f * day);
+		float vx[NRING + 1][NSP], vy[NRING + 1][NSP];
+		for (int j = 0; j <= NRING; j++) {
+			float rr = j == 0 ? wr * 0.08f : wr * (0.22f + 0.78f * (float)(j - 1) / (NRING - 1));
+			for (int k = 0; k < NSP; k++) {
+				float an = k * (US_TAU / NSP) + 0.3f;
+				float wob = 0.06f * sinf(k * 2.7f + j * 1.3f); /* hand-spun, not machine-perfect */
+				float q = rr * (1.0f + wob);
+				float d = sh * 0.0035f * sinf(t * 34.0f + k * 1.9f + j * 0.8f) * (0.3f + (float)j / NRING);
+				vx[j][k] = wx + cosf(an) * q;
+				vy[j][k] = wy + sinf(an) * q * 1.08f + d + 0.0015f * sinf(t * 0.6f) * (float)j / NRING;
+			}
+		}
+		for (int k = 0; k < NSP; k++)
+			wline(c, vx[0][k], vy[0][k], vx[NRING][k], vy[NRING][k], wv * 0.8f, US_MAT_ACCENT);
+		for (int j = 1; j <= NRING; j++)
+			for (int k = 0; k < NSP; k++) {
+				int k1 = (k + 1) % NSP;
+				wline(c, vx[j][k], vy[j][k], vx[j][k1], vy[j][k1], wv * (j == NRING ? 0.9f : 0.6f), US_MAT_ACCENT);
+			}
+		/* anchor threads: one to the cattail stem, one up and one down into the grass */
+		float sx = st->cat_x[0] * A;
+		int ks = st->web_x > st->cat_x[0] ? NSP / 2 : 0;
+		wline(c, vx[NRING][ks], vy[NRING][ks], sx, wy - wr * 0.2f, wv * 0.7f, US_MAT_ACCENT);
+		wline(c, vx[NRING][2], vy[NRING][2], wx + wr * 0.4f, POOL_Y - 0.004f, wv * 0.6f, US_MAT_ACCENT);
+		wline(c, vx[NRING][6], vy[NRING][6], wx - wr * 0.3f, wy - wr * 2.4f, wv * 0.5f, US_MAT_ACCENT);
+		for (int k = 0; k < NDEW; k++) {
+			int j = 2 + (k * 3) % (NRING - 1), kk = (k * 4 + 1) % NSP;
+			float dv = (0.1f + 1.2f * lit) * (0.6f + 0.4f * sinf(t * 0.9f + k * 2.3f)) * (1.0f - 0.5f * day);
+			us_point(c, vx[j][kk], vy[j][kk], 0.0011f, dv, US_MAT_LIGHT);
+		}
 	}
 
 	/* grass silhouettes along the near bank */
