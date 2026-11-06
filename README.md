@@ -82,6 +82,27 @@ sh tools/install.sh        # fetches headers, builds, copies understory.plugin i
 
 Restart OBS, then **Sources → + → Understory (living nature)**.
 
+## Install (Windows x64, OBS 32)
+
+Download `understory-windows-x64.zip` from the latest
+[build](https://github.com/om-i-god/understory/actions/workflows/build.yml) (or a release), unzip it, then in
+an administrator PowerShell in that folder:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File install.ps1   # copies understory\ into C:\ProgramData\obs-studio\plugins\
+```
+
+Or copy the `understory` folder into `C:\ProgramData\obs-studio\plugins\` by hand. Restart OBS, then
+**Sources → + → Understory (living nature)**.
+
+Every push builds the Windows plugin with MSVC on GitHub Actions, runs the core tests, renders every
+scene in every look, and loads the DLL into the real OBS for Windows headless (checking frames, lag and
+the saved world). To build it yourself: Visual Studio 2022, `sh tools/fetch-deps.sh` (Git Bash), then
+in a Developer PowerShell
+`tools/make-obs-lib.ps1 -Dll "C:\Program Files\obs-studio\bin\64bit\obs.dll" -Out deps\obs.lib` and
+`cmake -S . -B build -A x64 -DOBS_LIB="$PWD\deps\obs.lib"; cmake --build build --config Release` — the
+plugin is staged in `build\stage\understory`.
+
 ## Develop
 
 ```sh
