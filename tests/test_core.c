@@ -108,6 +108,32 @@ static void test_audio(void)
 	us_analyzer_destroy(an);
 }
 
+/* the narrow lowest log bands must follow a low tone switching on and off (not sit stuck at a constant) */
+static void test_low_bands(void)
+{
+	us_analyzer *an = us_analyzer_create();
+	us_audio a;
+	float L[800];
+	double t = 0;
+	float on[4] = {0}, off[4] = {0};
+	for (int f = 0; f < 600; f++) {
+		int tone = (f / 60) % 2; /* 1 s on, 1 s off */
+		for (int i = 0; i < 800; i++) {
+			L[i] = 0.05f * sinf(US_TAU * 2000.0f * (float)t) +
+			       (tone ? 0.6f * sinf(US_TAU * 38.0f * (float)t) : 0.0f);
+			t += 1.0 / 48000;
+		}
+		us_analyzer_push(an, L, L, 800, 48000);
+		us_analyzer_update(an, 1.0f / 60, 1, 1, 1, 1, &a);
+		if (f >= 240 && f % 60 >= 40)
+			for (int b = 0; b < 4; b++)
+				(tone ? on : off)[b] += a.bands[b] / 100.0f;
+	}
+	for (int b = 0; b < 4; b++)
+		CHECK(on[b] - off[b] > 0.25f, "band %d doesn't follow a 38 Hz tone: on %.2f off %.2f", b, on[b], off[b]);
+	us_analyzer_destroy(an);
+}
+
 static void test_world(void)
 {
 	us_world w;
@@ -225,6 +251,7 @@ int main(void)
 	test_raster();
 	test_compose();
 	test_audio();
+	test_low_bands();
 	test_world();
 	test_scenes();
 	test_journey();

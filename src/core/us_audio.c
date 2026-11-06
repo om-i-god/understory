@@ -185,9 +185,12 @@ void us_analyzer_update(us_analyzer *an, float dt, float sens, float bass_gain, 
 	float e[6] = {0};
 	float flux = 0, kflux = 0, csum = 0, cw = 0;
 	float bandE[US_NBANDS] = {0};
+	float pw[FFT_N / 2];
+	pw[0] = 0;
 	for (int k = 1; k < FFT_N / 2; k++) {
 		float f = k * binhz;
 		float p = an->re[k] * an->re[k] + an->im[k] * an->im[k];
+		pw[k] = p;
 		for (int b = 0; b < 6; b++)
 			if (f >= edges[b] && f < edges[b + 1]) {
 				e[b] += p;
@@ -210,6 +213,21 @@ void us_analyzer_update(us_analyzer *an, float dt, float sens, float bass_gain, 
 			csum += lf * p;
 			cw += p;
 		}
+	}
+
+	/* the lowest log bands are narrower than one FFT bin and catch no bins: give them the spectrum's
+	 * power interpolated at their centre, scaled by their width, so they track the music like the rest */
+	for (int b = 0; b < US_NBANDS; b++) {
+		if (bandE[b] > 0)
+			continue;
+		float r = 16000.0f / 30.0f;
+		float f0 = 30.0f * powf(r, (float)b / US_NBANDS), f1 = 30.0f * powf(r, (float)(b + 1) / US_NBANDS);
+		float x = sqrtf(f0 * f1) / binhz;
+		int k0 = (int)x;
+		if (k0 < 1 || k0 + 1 >= FFT_N / 2)
+			continue;
+		float fr = x - k0;
+		bandE[b] = (pw[k0] * (1 - fr) + pw[k0 + 1] * fr) * (f1 - f0) / binhz;
 	}
 
 	float gains[6] = {bass_gain, bass_gain, mid_gain, mid_gain, high_gain, high_gain};
