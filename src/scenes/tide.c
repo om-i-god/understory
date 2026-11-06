@@ -1,28 +1,34 @@
 /* Understory scene: Tide — a moonlit shoreline at a low angle.
  *
- * The sea is a height field drawn as a stack of ridge lines (rows of constant depth z, nearest first)
- * with hidden-line removal, so incoming swells rise as real 3D humps that hide the water behind them.
- * Perspective: y = HORIZON + K/z for still water, and a surface height h lifts a point by K*h/z.
+ * Composition: a wide beach in the foreground, a calm open sea above it, a headland with a red-and-white
+ * lighthouse across the bay, the moon and its glitter path. Under the lines lies a ground-plane tone (the sea
+ * glowing toward the horizon and under the moon, dark wet sand holding the moon, pale dry sand sinking into
+ * shadow toward the viewer) — two coarse fields in Ink, solid areas through an ordered dither in Pixel.
+ * The sea is a height field drawn near -> far with hidden-line removal: a few perspective swell lines
+ * (denser toward the horizon, broken into long strokes) and the waves themselves, so incoming swells rise
+ * as 3D humps that hide the water behind them. Perspective: y = HORIZON + K/z, a height h lifts by K*h/z.
  * Each wave is born far out as a low hump, grows and steepens as it shoals (speed ~ depth, so it slows
- * near shore), breaks (bigger waves break farther out) into a band of foam lace — iso-lines around the
- * ridges of a noise field, i.e. organic loops and holes — then runs up the sand as a lacy swash front,
- * stalls, slides back and leaves a dotted wet line that slowly dries. At night the moon (phase from the
- * world's season clock, position from the time of day) lays a twinkling glitter path; by day the sun.
+ * near shore): a moonlit crest over a face hatched in fine vertical strokes. It breaks (bigger waves break
+ * farther out) and the break peels along the crest from one point, a lip curling over at the peel; behind
+ * it a wall of whitewater billows and tumbles down the face, foam trailing on the water it passed. Then it
+ * runs up the sand as a lacy swash front, stalls, slides back and leaves a wet band that slowly dries.
+ * At night the moon (phase from the world's season clock, position from the time of day) lays a twinkling
+ * glitter path; by day the sun.
  * Above: the Milky Way, a haloed moon, banks of cumulus lit on the moon's side, horizon haze. On the beach:
  * long ripple marks catching the moonlight, shells and pebbles, a driftwood log, and marram grass on the
  * dunes framing the foreground corners, combed by the wind. Small lives: a rock outcrop at the waterline with
- * rock pools at its foot, a lighthouse on a far headland sweeping its beam, sandpipers sprinting ahead of each
+ * rock pools at its foot, the lighthouse sweeping its beam, sandpipers sprinting ahead of each
  * uprush and probing the wet sand behind the backwash, ghost crabs scuttling sideways on the dry sand.
  *
  * Audio: each drum has its own answer. Kick -> a wave breaks on the shore: the water just off the beach heaves
- *        and a tongue of whitewater races up the sand (a harder kick breaks along more of the beach and runs
- *        farther), stalls and soaks in, wetting the sand. Snare -> the shore break bursts white and throws spray
+ *        and lights up, the wet sand flashes, and a tongue of whitewater races up the sand (a harder kick
+ *        breaks along more of the beach and runs farther), stalls and soaks in, wetting the sand. Snare -> the shore break bursts white and throws spray
  *        plumes, a breaker bursts on the rocks (spray fan, drips ringing the rock pools), the lighthouse lamp
  *        flares and its beam sweeps a pale swath across the swells. Hats -> the moon path glitters (glints
  *        re-roll and flare) and foam fizzes along the water's edge. Loudness lights the water (louder = brighter
  *        sea, foam and moon path; quiet sinks to a dim flat calm with small lapping) and stirs the chop; phrase
  *        loudness + a slow ~50 s set rhythm -> wave size, how often they come, how far up the beach the tide
- *        sits. Sub lifts the long ground swell; mids make the moon path shimmer and widen; highs -> foam lace +
+ *        sits. Sub lifts the long ground swell; mids make the moon path shimmer and widen; highs -> foam +
  *        spindrift; air -> the swash sheet fizzes; single bands set individual ghost crabs scuttling; stereo
  *        width is the wind in the marram; centroid clears the sky (moon halo, Milky Way). Silence = small lapping
  *        waves still rolling in, the beam still turning, birds still working the wash line, crabs darting.
@@ -42,8 +48,8 @@
 #define N_CLOUDS 5
 #define N_SHELLS 46
 #define N_DUNE 70  /* marram grass blades framing the foreground corners */
-#define FW 220 /* foam lace grid */
-#define FH 22
+#define FLW 128 /* ground-plane tone grid (ink) */
+#define FLH 72
 #define TW 192 /* per-column crest tables */
 #define LXN 176 /* sand lace grid: columns x rows (shore -> reach) */
 #define LZN 24
@@ -57,6 +63,9 @@
 #define KP 0.38f  /* perspective constant: z = 1 -> y = HOR + KP */
 #define Z_FAR 16.0f
 #define Z_SPAWN 9.0f
+#define Z_HD 7.0f  /* the headland's foot, out across the bay */
+#define HD_W 0.26f /* its width (screen fraction) */
+#define HD_H 0.085f
 
 enum { ROLL = 0, BREAK, SWASH, DONE };
 
@@ -70,6 +79,7 @@ typedef struct {
 	float steep;
 	float reach;          /* swash reach, frozen when the swash starts */
 	int rock_hit;         /* already broke over the rocks */
+	float pd, xp0;        /* the break peels along the crest: direction (+-1) and where it starts (screen fraction) */
 } wave_t;
 
 /* foam lace left on the sand by one swash: a cellular web of thin lines that rides the sheet up the beach,
@@ -110,7 +120,7 @@ typedef struct {
 	float cusp_tab[LXN + 1];
 	int32_t llab[(LXN + 1) * LZN];
 	float lu[(LXN + 1) * LZN], lv[(LXN + 1) * LZN], lsx[(LXN + 1) * LZN], lsy[(LXN + 1) * LZN], lal[(LXN + 1) * LZN];
-	float lx[FH][FW + 1], ly[FH][FW + 1], lf[FH][FW + 1]; /* foam lace scratch */
+	float fsea[FLW * FLH], fsand[FLW * FLH];               /* ground-plane tone + material (ink) */
 	float cl_x[N_CLOUDS], cl_y[N_CLOUDS], cl_w[N_CLOUDS], cl_s[N_CLOUDS];
 	float sh_x[N_SHELLS], sh_z[N_SHELLS], sh_a[N_SHELLS], sh_k[N_SHELLS];
 	float du_x[N_DUNE], du_h[N_DUNE], du_p[N_DUNE];
@@ -129,7 +139,7 @@ typedef struct {
 	float pool_t[2];
 	float ntile[NT * NT];
 	burst_t sg[MAX_SURGE], pl[MAX_PLUME];
-	float lvl_env, lvl_slow, hat_env, snare_env, kick_env, heave, beam_sw;
+	float lvl_env, lvl_slow, hat_env, snare_env, kick_env, heave, beam_sw, beam_x, beam_v;
 	uint32_t hat_seed;
 } st_t;
 
@@ -184,6 +194,43 @@ static inline float bayer4(int x, int y)
 	static const uint8_t m[16] = {0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5};
 	return (m[(y & 3) * 4 + (x & 3)] + 0.5f) / 16.0f;
 }
+
+/* overwrite a pixel (pixel styles: solid silhouettes must hide the tone painted under them) */
+static inline void put_set(us_canvas *c, int px, int py, float v, uint8_t mat)
+{
+	if ((unsigned)px >= (unsigned)c->w || (unsigned)py >= (unsigned)c->h)
+		return;
+	size_t i = (size_t)py * c->w + px;
+	c->ink[i] = (uint8_t)(us_sat(v) * 255.0f + 0.5f);
+	c->mat[i] = mat;
+}
+
+/* pixel art: ordered-dither a continuous shade (0..4 palette steps) onto the 4 ramp steps */
+static inline float pix_step(float s, int px, int py)
+{
+	static const float rep[5] = {0.0f, 0.17f, 0.4f, 0.62f, 0.9f};
+	int k = (int)(s + bayer4(px, py));
+	return rep[k < 0 ? 0 : k > 4 ? 4 : k];
+}
+/* the same for broad areas: mostly solid bands, dithering only across narrow transitions */
+static inline float pix_fill(float s, int px, int py)
+{
+	float k = floorf(s), f = s - k;
+	return pix_step(k + us_smooth(0.35f, 0.65f, f), px, py);
+}
+
+/* the far headland, out across the bay on the side opposite the rock: its top y at screen fraction xf
+ * (2 where there is no headland). u runs from the cliff at its seaward tip to the frame edge. */
+static float hd_top(const st_t *st, float xf)
+{
+	float u = st->rk_side ? (HD_W - xf) / HD_W : (xf - (1.0f - HD_W)) / HD_W;
+	if (u <= 0.0f)
+		return 2.0f;
+	float ft = us_sat(u) * RKN;
+	int i0 = (int)ft < RKN ? (int)ft : RKN - 1;
+	return proj_y(Z_HD) - HD_H * us_lerp(st->hd_prof[i0], st->hd_prof[i0 + 1], ft - i0);
+}
+static inline float lh_xf(const st_t *st) { return st->rk_side ? HD_W * 0.8f : 1.0f - HD_W * 0.8f; }
 
 /* fast sine (parabolic, ~0.1% error) for the per-sample surface chop */
 static inline float fsin(float x)
@@ -292,18 +339,21 @@ static void spawn_wave(st_t *st, const us_ctx *ctx)
 	memset(wv, 0, sizeof(*wv));
 	/* sets: every ~50 s a group of bigger waves rolls through, even in silence */
 	float sets = 0.5f + 0.5f * sinf(st->t * US_TAU / 52.0f);
-	float a = 0.18f + 0.45f * st->swell_env + 0.4f * w->storm_charge + 0.2f * sets * sets + 0.12f * st->bass_env;
+	float a = 0.3f + 0.4f * st->swell_env + 0.4f * w->storm_charge + 0.2f * sets * sets + 0.12f * st->bass_env;
 	wv->amp = us_clampf(a * us_randr(r, 0.8f, 1.15f), 0.12f, 1.0f);
 	wv->z = Z_SPAWN;
 	wv->seed = us_rand(r) * 100.0f;
 	wv->state = ROLL;
 	wv->zb = st->tide_s * (1.15f + 1.1f * wv->amp);
 	wv->run_max = 0.08f + 0.22f * wv->amp;
+	wv->pd = us_rand(r) < 0.5f ? -1.0f : 1.0f;
+	wv->xp0 = us_randr(r, 0.3f, 0.7f) - 0.15f * wv->pd;
 }
 
 static void init_scene(st_t *st, const us_ctx *ctx)
 {
 	us_rng *r = &st->rng;
+	st->tide_s = 1.6f - 0.35f * ctx->w->water_level;
 	for (int i = 0; i < MAX_WAVES; i++)
 		st->wv[i].state = DONE;
 	/* stars: a third scattered, the rest crowded into a Milky Way band slanting across the sky */
@@ -352,10 +402,10 @@ static void init_scene(st_t *st, const us_ctx *ctx)
 		}
 	/* rock outcrop on one side at the waterline, the lighthouse headland on the far horizon opposite */
 	st->rk_side = us_rand(r) < 0.5f;
-	st->rk_w = us_randr(r, 0.1f, 0.14f);
+	st->rk_w = us_randr(r, 0.12f, 0.16f);
 	st->rk_x = st->rk_side ? us_randr(r, 0.8f, 0.86f) : us_randr(r, 0.14f, 0.2f);
-	st->rk_h = us_randr(r, 0.12f, 0.16f);
-	st->rk_z = us_randr(r, 0.98f, 1.06f);
+	st->rk_h = us_randr(r, 0.2f, 0.26f);
+	st->rk_z = (1.6f - 0.35f * ctx->w->water_level) * us_randr(r, 1.06f, 1.1f); /* in the shallows */
 	{
 		float lc[4], lw[4], lh[4];
 		for (int j = 0; j < 4; j++) {
@@ -376,9 +426,9 @@ static void init_scene(st_t *st, const us_ctx *ctx)
 			float crag = 0.08f * us_noise2(u * 9.0f, 5.1f) + 0.04f * us_noise2(u * 23.0f, 2.3f);
 			float env = us_smooth(0.0f, 0.12f, u) * us_smooth(1.0f, 0.88f, u);
 			st->rk_prof[k] = fmaxf(0.0f, (hmax + crag * hmax) * env);
-			/* headland: rises from its tip toward the frame edge, a low crumpled ridge */
-			float hu = us_smooth(0.0f, 0.7f, u);
-			st->hd_prof[k] = hu * (0.75f + 0.25f * us_noise2(u * 6.0f, 9.3f)) + 0.08f * us_noise2(u * 19.0f, 1.7f) * hu;
+			/* headland: a sheer cliff at its seaward tip, then a rolling top climbing toward the frame edge */
+			float hu = us_smooth(0.0f, 0.06f, u);
+			st->hd_prof[k] = hu * (0.42f + 0.58f * us_smooth(0.12f, 0.75f, u) + 0.06f * us_noise2(u * 5.0f, 9.3f)) + 0.03f * us_noise2(u * 19.0f, 1.7f) * hu;
 		}
 	}
 	for (int i = 0; i < N_BIRDS; i++) {
@@ -395,7 +445,6 @@ static void init_scene(st_t *st, const us_ctx *ctx)
 		st->cr_dir[i] = us_rand(r) < 0.5f ? -1.0f : 1.0f;
 		st->cr_idle[i] = us_randr(r, 1.0f, 6.0f);
 	}
-	st->tide_s = 1.15f - 0.4f * ctx->w->water_level;
 	for (int k = 0; k <= TW; k++)
 		st->shore_n[k] = us_noise2((float)k / TW * 3.0f, 7.7f);
 	for (int i = 0; i < NX; i++) {
@@ -414,6 +463,252 @@ static void init_scene(st_t *st, const us_ctx *ctx)
 	}
 	st->next_wave = 2.0f;
 	st->inited = 1;
+}
+
+/* ground-plane tone at (x, y) below the horizon on an ink scale (~0..0.25), 0 where an object stands;
+ * *m gets the material. pl = how lit the water is (loudness). */
+static float plane_tone(const st_t *st, const float *ysh, const float *ywt, const float *wab, float x, float y, float A, float bx, float bv,
+			float pl, uint8_t *m)
+{
+	float xf = x / A, fc = us_clampf(xf * NX - 0.5f, 0.0f, NX - 1.001f);
+	int col = (int)fc, c1 = col + 1 < NX ? col + 1 : col;
+	float ct = fc - col;
+	float ys = us_lerp(ysh[col], ysh[c1], ct), yw = us_lerp(ywt[col], ywt[c1], ct), wa = us_lerp(wab[col], wab[c1], ct);
+	*m = US_MAT_EARTH;
+	if (y <= HOR || (y < proj_y(Z_HD) && y > hd_top(st, xf)))
+		return 0.0f;
+	if (rock_prof(st, xf) > 0.0f && y > rock_top(st, xf) && y < rock_base(st))
+		return 0.0f;
+	float dm = bx >= 0.0f ? x - bx : 1e3f;
+	if (y < ys) {
+		/* the sea: brighter toward the horizon (the sky in it), a broad soft column under the moon */
+		float d = us_sat((y - HOR) / (ys - HOR));
+		float v = (0.045f + 0.06f * (1.0f - d) * (1.0f - d)) * pl + 0.06f * st->lvl_slow;
+		float gw = 0.012f + 0.3f * (y - HOR);
+		v += 0.13f * bv * expf(-dm * dm / (gw * gw)) * pl;
+		/* a kick: the shore break lights the water just off the beach */
+		v += 0.2f * st->kick_env * us_smooth(0.5f, 1.0f, d);
+		/* a snare: the lighthouse beam sweeps a pale swath across the water */
+		if (st->beam_v > 0.02f) {
+			float bw = 0.05f + 0.5f * (y - HOR), dx = (x - st->beam_x) / bw;
+			v += 0.2f * st->beam_v * expf(-dx * dx);
+		}
+		*m = US_MAT_WATER;
+		return v;
+	}
+	float sd = us_sat((y - ys) / (1.02f - ys));
+	if (y < yw) {
+		/* wet sand: dark glass with the moon in it */
+		float gw = 0.05f + 0.12f * sd;
+		*m = US_MAT_WATER;
+		return 0.04f + 0.14f * bv * expf(-dm * dm / (gw * gw)) * wa * pl + 0.12f * st->kick_env;
+	}
+	/* dry sand: pale under the moon near the water, sinking into shadow toward the viewer */
+	return (0.1f - 0.05f * sd + 0.02f * bv) * (0.55f + 0.5f * pl) + 0.03f * st->lvl_slow;
+}
+
+/* one wave, drawn when the near->far sea march reaches its crest (so nearer water and waves hide it and it
+ * hides what lies behind). Unbroken: a moonlit crest line over a glassy face. Breaking: the break peels
+ * along the crest from where it began, a lip curling over at the peel point; behind the peel a wall of
+ * whitewater tumbles down the face, and foam trails on the water it has passed. */
+static void draw_wave(st_t *st, const us_ctx *ctx, us_canvas *c, int wi, int ns, float lk, float bx, float bv)
+{
+	const wave_t *wv = &st->wv[wi];
+	float A = ctx->aspect, t = st->t;
+	int crisp = ctx->crisp;
+	float yt[NS + 1], yb[NS + 1], sv[NS + 1], br[NS + 1], fp[NS + 1], ocv[NS + 1], hsa[NS + 1];
+	int brk = wv->state == BREAK;
+	float xp = brk ? wv->xp0 + wv->pd * (0.05f + 0.1f * wv->amp) * wv->brk_age : -9.0f;
+	float wf = brk ? us_sat(wv->foam * 1.2f) : 0.0f;
+	float pl = 0.5f + 0.6f * lk;
+	for (int i = 0; i <= ns; i++) {
+		float xf = (float)i / ns, ft = xf * TW;
+		int k0 = (int)ft < TW ? (int)ft : TW - 1;
+		float zc = us_lerp(st->cz_tab[wi][k0], st->cz_tab[wi][k0 + 1], ft - k0);
+		float al = us_lerp(st->al_tab[wi][k0], st->al_tab[wi][k0 + 1], ft - k0);
+		float X = (xf - 0.5f) * A * zc / KP;
+		float zf = fmaxf(zc - 0.8f * (0.2f + 0.16f * zc), 0.3f);
+		float Xf = (xf - 0.5f) * A * zf / KP;
+		yt[i] = proj_y(zc) - KP * sea_h(st, xf, zc, X, st->lvl_env) / zc;
+		yb[i] = proj_y(zf) - KP * sea_h(st, xf, zf, Xf, st->lvl_env) / zf;
+		float hs = KP * wv->hf * al / zc; /* how tall this stretch of crest stands on screen */
+		hsa[i] = hs;
+		sv[i] = us_smooth(0.0015f, crisp ? 0.016f : 0.012f, hs);
+		br[i] = brk ? us_smooth(-0.02f, 0.02f, wv->pd * (xp - xf)) * (0.3f + 0.7f * us_smooth(0.1f, 0.5f, al)) : 0.0f;
+		/* whitewater piles up above the old crest line */
+		fp[i] = br[i] * KP * wv->amp * 0.5f * (0.4f + 0.6f * al) / zc * (0.25f + 0.2f * fabsf(us_noise2(X * 4.0f + wv->seed, t * 0.4f)));
+		ocv[i] = st->occ[i];
+	}
+	if (crisp) {
+		float sc = c->s;
+		for (int px = 0; px < c->w; px++) {
+			float xf = (px + 0.5f) / sc / A;
+			int i = (int)(xf * ns + 0.5f);
+			if (i > ns)
+				i = ns;
+			float w = br[i] * wf, s = sv[i] * (1.0f - br[i]);
+			if (s < 0.08f && w < 0.05f)
+				continue;
+			int top = (int)((yt[i] - fp[i]) * sc), bot = (int)(yb[i] * sc), oc = (int)(ocv[i] * sc);
+			float x = (px + 0.5f) / sc;
+			float rim = bx >= 0.0f ? bv * expf(-(x - bx) * (x - bx) / (0.09f * A * A)) : 0.0f;
+			for (int py = top; py <= bot && py < oc; py++) {
+				float f = bot > top ? (float)(py - top) / (bot - top) : 0.0f;
+				if (w > 0.05f) {
+					/* whitewater: solid at the top, breaking into dither down the face */
+					float n = st->ntile[((py * 2) & (NT - 1)) * NT + ((px + (int)(t * 6.0f)) & (NT - 1))];
+					us_put(c, px, py, pix_step(w * pl * (4.2f - 2.6f * f + 1.2f * n), px, py), US_MAT_WATER);
+				} else if (py == top) {
+					us_put(c, px, py, pix_fill(s * pl * (2.8f + 2.0f * rim), px, py), rim > 0.4f ? US_MAT_LIGHT : US_MAT_WATER);
+				} else {
+					/* the glassy face: lit through the lip, darkening into the trough */
+					us_put(c, px, py, pix_fill(s * pl * (2.3f - 1.1f * f), px, py), US_MAT_WATER);
+				}
+			}
+		}
+	} else {
+		/* unbroken stretches: the crest line, the lip just under it, and the steep face hatched in fine
+		 * vertical strokes (an engraver's wall of water, against the horizontal sea) */
+		for (int j = 0; j < 2; j++) {
+			float px = 0, py = 0, pv = 0;
+			int pvis = 0;
+			for (int i = 0; i <= ns; i++) {
+				float x = (float)i / ns * A;
+				float y = yt[i] + (yb[i] - yt[i]) * (j ? 0.14f : 0.0f);
+				int vis = y < ocv[i];
+				float s = sv[i] * (1.0f - br[i]);
+				float rim = bx >= 0.0f ? bv * expf(-(x - bx) * (x - bx) / (0.09f * A * A)) : 0.0f;
+				float v = j == 0 ? (0.2f + 0.6f * s + 0.4f * rim * s) * s * pl : 0.3f * s * pl;
+				if (i && vis && pvis && (v > 0.01f || pv > 0.01f))
+					wu_line(c, px, py, x, y, 0.5f * (v + pv), j == 0 && rim > 0.45f && s > 0.4f ? US_MAT_LIGHT : US_MAT_WATER);
+				px = x, py = y, pv = v, pvis = vis;
+			}
+		}
+		{
+			const int NH = 80;
+			for (int q = 0; q < NH; q++) {
+				float hq = hash1(q * 0.613f + wv->seed * 0.17f), hl = hash1(hq * 37.1f + 0.3f);
+				float xf = (q + 0.1f + 0.8f * hq) / NH;
+				int i = (int)(xf * ns + 0.5f);
+				float s = sv[i] * (1.0f - br[i]) * us_smooth(0.3f, 0.8f, wv->steep);
+				if (s < 0.2f || hl < 0.35f || yt[i] >= ocv[i])
+					continue;
+				if (hsa[i] < 0.008f)
+					continue;
+				float face = fminf(yb[i] - yt[i], 1.5f * hsa[i]);
+				float y0 = yt[i] + face * (0.04f + 0.1f * hq), y1 = yt[i] + face * (0.3f + 0.7f * hl * hl);
+				if (y1 >= ocv[i])
+					y1 = ocv[i];
+				float x = xf * A;
+				wu_line(c, x, y0, x - wv->pd * face * 0.06f, y1, 0.26f * s * pl, US_MAT_WATER);
+			}
+		}
+		/* broken stretches: whitewater as billows (rows of rounded bumps), streaks of foam falling down the
+		 * face, and a broken skirt of foam spreading in front */
+		if (brk) {
+			for (int row = 0; row < 2; row++) {
+				float xa = 0.0f;
+				for (int q = 0; xa < A && q < 400; q++) {
+					float hq = hash1(q * 0.731f + row * 3.3f + wv->seed * 0.29f);
+					float wb = A * (row ? 0.009f + 0.012f * hq : 0.012f + 0.018f * hq);
+					float xb = xa + wb, xm = 0.5f * (xa + xb);
+					int im = (int)us_clampf(xm / A * ns + 0.5f, 0, ns);
+					float w = br[im] * wf;
+					if (w > 0.05f && !(row && hq < 0.3f)) {
+						float face = yb[im] - yt[im];
+						float bh = (row ? 0.25f : 0.45f) * (0.5f + 0.5f * hq) * fmaxf(fp[im] * 2.0f, 0.003f) *
+							   (0.85f + 0.15f * us_noise2(xm * 9.0f, t * 0.8f + row));
+						float v = (row ? 0.5f : 0.95f) * w * pl;
+						float qx = 0, qy = 0;
+						int qvis = 0;
+						for (int k = 0; k <= 6; k++) {
+							float u = k / 6.0f, x = xa + wb * u;
+							int i = (int)us_clampf(x / A * ns + 0.5f, 0, ns);
+							float y = yt[i] - fp[i] * (row ? 0.0f : 0.5f) + (row ? face * 0.42f : 0.0f) - bh * sinf(US_PI * u);
+							int vis = y < ocv[i];
+							if (k && vis && qvis)
+								wu_line(c, qx, qy, x, y, v, US_MAT_WATER);
+							qx = x, qy = y, qvis = vis;
+						}
+						/* foam falling down the face below this billow */
+						if (!row && hq > 0.7f && face > 0.012f && fp[im] > 0.003f && yt[im] < ocv[im]) {
+							float y0 = yt[im] + face * 0.05f, y1 = yt[im] + face * (0.4f + 1.6f * (hq - 0.7f));
+							float mx = xm + wv->pd * face * 0.04f, my = 0.5f * (y0 + y1);
+							wu_line(c, xm, y0, mx, my, 0.45f * w * pl, US_MAT_WATER);
+							wu_line(c, mx, my, xm + wv->pd * face * 0.05f, fminf(y1, ocv[im]), 0.3f * w * pl, US_MAT_WATER);
+						}
+					}
+					xa = xb;
+				}
+			}
+			float px = 0, py = 0, pv = 0;
+			int pvis = 0;
+			for (int i = 0; i <= ns; i++) {
+				float x = (float)i / ns * A;
+				float n = us_noise2(x * 21.0f + wv->seed, t * 0.35f);
+				float y = yb[i] + 0.002f + 0.003f * n;
+				float v = 0.4f * br[i] * wf * us_smooth(-0.1f, 0.2f, n) * pl;
+				int vis = y < ocv[i];
+				if (i && vis && pvis && (v > 0.02f || pv > 0.02f))
+					wu_line(c, px, py, x, y, 0.5f * (v + pv), US_MAT_WATER);
+				px = x, py = y, pv = v, pvis = vis;
+			}
+		}
+	}
+	/* the curl at the peel point: the lip pitching over, seen side-on as a hook into the barrel */
+	if (brk && xp > 0.01f && xp < 0.99f) {
+		int i = (int)(xp * ns + 0.5f);
+		float R0 = 0.6f * fminf(yb[i] - yt[i], 1.5f * hsa[i]) * us_sat(1.2f - wv->brk_age / 5.0f);
+		if (R0 > 0.008f && yt[i] < ocv[i]) {
+			float cx = xp * A, cy = yt[i] + R0;
+			for (int ring = 0; ring < (crisp ? 1 : 2); ring++) {
+				float qx = 0, qy = 0;
+				const int NQ = 22;
+				for (int q = 0; q <= NQ; q++) {
+					float th = 1.75f * US_PI * q / NQ;
+					float R = R0 * (1.0f - 0.55f * th / (1.75f * US_PI)) * (ring ? 0.82f : 1.0f);
+					float x = cx + wv->pd * R * sinf(th), y = cy - R * cosf(th) + (ring ? R0 * 0.12f : 0.0f);
+					float v = (0.95f - 0.4f * q / NQ) * pl * (ring ? 0.55f : 1.0f);
+					if (q) {
+						if (crisp)
+							us_line(c, qx, qy, x, y, 1.0f / c->s, us_sat(v + 0.2f), US_MAT_WATER);
+						else
+							wu_line(c, qx, qy, x, y, v, US_MAT_WATER);
+					}
+					qx = x, qy = y;
+				}
+			}
+		}
+	}
+	/* this wave now hides what lies behind it */
+	for (int i = 0; i <= ns; i++)
+		if (yt[i] - fp[i] < st->occ[i])
+			st->occ[i] = yt[i] - fp[i];
+	/* foam left on the water the break has passed over: broken dotted bands trailing behind */
+	if (brk) {
+		for (int j = 0; j < 3; j++) {
+			float px = 0, py = 0;
+			int pvis = 0;
+			for (int i = 0; i <= ns; i++) {
+				float xf = (float)i / ns, ft = xf * TW;
+				int k0 = (int)ft < TW ? (int)ft : TW - 1;
+				float zc = us_lerp(st->cz_tab[wi][k0], st->cz_tab[wi][k0 + 1], ft - k0);
+				float z = zc * (1.12f + (0.08f + 0.06f * wv->amp) * j * (1.0f + 0.4f * us_sat(wv->brk_age * 0.3f)));
+				float X = (xf - 0.5f) * A * z / KP;
+				float x = xf * A, y = proj_y(z) - KP * sea_h(st, xf, z, X, st->lvl_env) / z;
+				float n = us_noise2(X * 2.2f + wv->seed + j * 5.0f, z * 3.0f);
+				float v = (0.42f - 0.1f * j) * wf * br[i] * pl * us_smooth(0.0f, 0.25f, n);
+				int vis = y < st->occ[i];
+				if (i && vis && pvis && v > 0.02f) {
+					if (crisp)
+						us_line(c, px, py, x, y, 1.0f / c->s, us_sat(v + 0.15f), US_MAT_WATER);
+					else
+						wu_line(c, px, py, x, y, v, US_MAT_WATER);
+				}
+				px = x, py = y, pvis = vis;
+			}
+		}
+	}
 }
 
 static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
@@ -450,7 +745,7 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 	st->cent_env = us_approach(st->cent_env, us_sat(a->centroid), 2.5f, rdt);
 	st->gs_t += dt * (0.55f + 0.35f * st->sub_env);
 	/* tide: world water level + a slow tidal breath; loud phrases push the sea up the beach */
-	float tide_target = 1.15f - 0.4f * w->water_level + 0.04f * sinf(t * US_TAU / 200.0f) - 0.06f * st->swell_env;
+	float tide_target = 1.6f - 0.35f * w->water_level + 0.05f * sinf(t * US_TAU / 200.0f) - 0.08f * st->swell_env;
 	st->tide_s = us_approach(st->tide_s, tide_target, 10.0f, dt);
 	/* kick: a wave breaks on the shore and its whitewater surges up the sand (bigger kick, farther run) */
 	if (a->kick_hit) {
@@ -500,6 +795,12 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 	}
 	st->hat_env = fmaxf(a->hat, us_approach(st->hat_env, 0.0f, 0.08f, rdt));
 	st->snare_env = fmaxf(a->snare, us_approach(st->snare_env, 0.0f, 0.1f, rdt));
+	{
+		float tx = lh_xf(st) * ctx->aspect, e = us_sat(st->beam_sw);
+		e = 1.0f - (1.0f - e) * (1.0f - e);
+		st->beam_x = us_lerp(tx, ctx->aspect - tx, 0.15f + 0.7f * e);
+		st->beam_v = st->snare_env * (0.5f + 0.5f * us_sat(1.0f - ctx->w->daylight * 2.2f));
+	}
 	/* the heave: lifts on the kick and settles quickly */
 	st->kick_env = a->kick_hit ? fmaxf(st->kick_env, us_sat(0.4f + 0.7f * a->kick)) : st->kick_env * expf(-rdt / 0.06f);
 	st->heave = (ctx->crisp ? 0.06f : 0.05f) * st->kick_env;
@@ -518,7 +819,6 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 	float storm = w->storm_charge;
 	float foam_k = 0.35f + 0.65f * st->hi_env;
 	float lk = 0.15f + 1.0f * st->lvl_slow; /* loudness lights the water: louder = brighter sea and foam */
-	float foam_ks = 0.35f + 0.65f * st->swell_env; /* lace shapes follow the phrase, not every tick */
 
 	/* ---- spawn waves on phrase-length swells ---- */
 	st->next_wave -= dt;
@@ -542,7 +842,7 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 			wv->steep = shoal * shoal;
 			float grow = us_sat(wv->age / 3.0f); /* rises out of the sea, no pop */
 			if (wv->state == ROLL) {
-				wv->hf = wv->amp * 0.5f * (0.25f + 0.75f * shoal) * grow;
+				wv->hf = wv->amp * 1.1f * (0.2f + 0.8f * shoal * shoal) * grow;
 				if (wv->z < wv->zb) {
 					wv->state = BREAK;
 					wv->foam = 1.0f;
@@ -550,7 +850,7 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 				}
 			} else {
 				wv->brk_age += dt;
-				wv->hf = wv->amp * 0.5f * expf(-wv->brk_age * 0.7f);
+				wv->hf = wv->amp * 1.1f * expf(-wv->brk_age * 0.5f);
 				wv->foam = us_approach(wv->foam, 0.5f, 5.0f, dt);
 			}
 			/* every sizeable wave also bursts on the rocks as it passes them (the surf breathes in silence) */
@@ -631,7 +931,7 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 		if (mt > 0.0f && mt < 1.0f && night > 0.05f) {
 			float mx = A * (0.15f + 0.7f * mt);
 			float my = HOR - 0.05f - 0.2f * sinf(US_PI * mt);
-			float mr = 0.034f;
+			float mr = 0.042f;
 			float mv = night * (0.75f + 0.25f * illum);
 			us_ring(c, mx, my, mr, 0.001f, 0.14f * night, US_MAT_LIGHT); /* earthshine */
 			/* a soft halo in the thin high haze */
@@ -785,53 +1085,151 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 	}
 
 #undef NE
-	/* ---- a far headland with a lighthouse, its beam turning slowly over the sea ---- */
+	/* ---- the ground plane: a tone under the lines. The sea glows toward the horizon and under the moon,
+	 * wet sand is dark and holds the moon's reflection, dry sand is pale. Ink: two coarse fields; pixel
+	 * art: solid areas through an ordered dither. ---- */
+	{
+		/* the wet band, smoothed across columns so its edge is a soft wash line, not a comb */
+		float ysh[NX], ywt[NX], wd[NX], wab[NX];
+		for (int i = 0; i < NX; i++) {
+			float xf = (i + 0.5f) / NX, zs = shore_z(st, xf);
+			ysh[i] = proj_y(zs);
+			int wet = st->wet_a[i] > 0.02f && st->wet_z[i] < zs;
+			wd[i] = wet ? (proj_y(st->wet_z[i]) - ysh[i]) * us_sat(st->wet_a[i] * 3.0f) : 0.0f;
+			wab[i] = wet ? st->wet_a[i] : 0.0f;
+		}
+		for (int pass = 0; pass < 3; pass++) {
+			float pd_ = wd[0], pa = wab[0];
+			for (int i = 0; i < NX; i++) {
+				float nd = i + 1 < NX ? wd[i + 1] : wd[i], na = i + 1 < NX ? wab[i + 1] : wab[i];
+				float cd = wd[i], ca = wab[i];
+				wd[i] = 0.25f * pd_ + 0.5f * cd + 0.25f * nd;
+				wab[i] = 0.25f * pa + 0.5f * ca + 0.25f * na;
+				pd_ = cd, pa = ca;
+			}
+		}
+		for (int i = 0; i < NX; i++)
+			ywt[i] = ysh[i] + wd[i];
+		float pl = 0.3f + 0.9f * lk;
+		if (ctx->crisp) {
+			int y0 = (int)(HOR * c->s) + 1;
+			for (int py = y0; py < c->h; py++) {
+				float y = (py + 0.5f) / c->s;
+				for (int px = 0; px < c->w; px++) {
+					float x = (px + 0.5f) / c->s;
+					uint8_t m;
+					float v = plane_tone(st, ysh, ywt, wab, x, y, A, body_x, body_v, pl, &m);
+					if (v > 0.0f)
+						us_put(c, px, py, pix_fill(m == US_MAT_EARTH ? v * 24.0f : fmaxf(v * 13.0f, 1.05f), px, py), m);
+				}
+			}
+		} else {
+			float y0 = HOR, y1 = 1.0f;
+			for (int j = 0; j < FLH; j++) {
+				float y = y0 + (y1 - y0) * (j + 0.5f) / FLH;
+				for (int i = 0; i < FLW; i++) {
+					float x = A * (i + 0.5f) / FLW;
+					/* three samples down the cell: thin bands (the wet sand) stay smooth */
+					float v = 0.0f, mw = 0.0f, hy = (y1 - y0) / FLH / 3.0f;
+					for (int q = -1; q <= 1; q++) {
+						uint8_t m;
+						v += plane_tone(st, ysh, ywt, wab, x, y + q * hy, A, body_x, body_v, pl, &m);
+						mw += m == US_MAT_WATER;
+					}
+					st->fsea[j * FLW + i] = v * (1.0f / 3.0f);
+					st->fsand[j * FLW + i] = mw >= 2.0f ? 1.0f : 0.0f;
+				}
+			}
+			/* one bilinear pass: tone interpolated, material from the nearest cell */
+			int py0 = (int)(y0 * c->s), py1 = c->h;
+			float sy = FLH / ((y1 - y0) * c->s), sx = FLW / (A * c->s);
+			for (int py = py0 < 0 ? 0 : py0; py < py1; py++) {
+				float fy = ((py + 0.5f) - y0 * c->s) * sy - 0.5f;
+				int iy = (int)floorf(fy);
+				float ty = fy - iy;
+				int r0 = iy < 0 ? 0 : iy >= FLH ? FLH - 1 : iy, r1 = iy + 1 >= FLH ? FLH - 1 : iy + 1 < 0 ? 0 : iy + 1;
+				const float *a0 = st->fsea + r0 * FLW, *a1 = st->fsea + r1 * FLW;
+				const float *mr = st->fsand + (ty < 0.5f ? r0 : r1) * FLW;
+				uint8_t *ink = c->ink + (size_t)py * c->w, *mat = c->mat + (size_t)py * c->w;
+				for (int px = 0; px < c->w; px++) {
+					float fx = (px + 0.5f) * sx - 0.5f;
+					int ix = (int)floorf(fx);
+					float tx = fx - ix;
+					int q0 = ix < 0 ? 0 : ix >= FLW ? FLW - 1 : ix, q1 = ix + 1 >= FLW ? FLW - 1 : ix + 1 < 0 ? 0 : ix + 1;
+					float v = (a0[q0] + (a0[q1] - a0[q0]) * tx) * (1.0f - ty) + (a1[q0] + (a1[q1] - a1[q0]) * tx) * ty;
+					int iv = (int)(v * 255.0f + 0.5f);
+					if (iv > ink[px]) {
+						ink[px] = (uint8_t)(iv > 255 ? 255 : iv);
+						mat[px] = mr[tx < 0.5f ? q0 : q1] > 0.5f ? US_MAT_WATER : US_MAT_EARTH;
+					}
+				}
+			}
+		}
+	}
+	/* ---- the headland across the bay, a lighthouse on it: the beam turning slowly over the sea ---- */
 	{
 		int right = !st->rk_side;
-		float hx0 = right ? 0.8f * A : 0.0f, hx1 = right ? A : 0.2f * A, hw = hx1 - hx0;
-		const float HH = 0.024f;
-		float tx = right ? A * 0.915f : A * 0.085f; /* tower */
-		float pu = (tx - hx0) / hw;
-		float pu_ = right ? pu : 1.0f - pu;
-		int ti = (int)(pu_ * RKN);
-		float ty = HOR - HH * st->hd_prof[ti < RKN ? ti : RKN] - 0.0005f;
-		float th = 0.034f, tw0 = 0.0045f, tw1 = 0.0028f;
-		float lx = tx, ly = ty - th - 0.003f;
-		float lv = 0.22f + 0.1f * day;
+		float hx0 = right ? (1.0f - HD_W) * A : 0.0f, hx1 = right ? A : HD_W * A;
+		float hb = proj_y(Z_HD);
+		float tx = lh_xf(st) * A; /* tower */
+		float ty = hd_top(st, lh_xf(st)) + 0.001f;
+		float th = 0.07f, tw0 = 0.0075f, tw1 = 0.0048f;
+		float lx = tx, ly = ty - th - 0.008f;
+		float lv = 0.3f + 0.1f * day + 0.1f * body_v;
 		if (ctx->crisp) {
-			int p0 = (int)(hx0 * c->s), p1 = (int)(hx1 * c->s);
-			for (int px = p0; px < p1 && px < c->w; px++) {
-				float u = ((px + 0.5f) / c->s - hx0) / hw;
-				float uu = right ? u : 1.0f - u;
-				float top = HOR - HH * st->hd_prof[(int)(us_sat(uu) * RKN)];
-				int y0 = (int)(top * c->s), y1 = (int)(HOR * c->s);
-				for (int py = y0; py < y1; py++)
-					us_put(c, px, py, py == y0 ? lv : (bayer4(px, py) < 0.35f ? 0.12f : 0.07f), US_MAT_EARTH);
+			int p0 = (int)(hx0 * c->s), p1 = (int)(hx1 * c->s) + 1;
+			int yb = (int)(hb * c->s);
+			for (int px = p0 < 0 ? 0 : p0; px < p1 && px < c->w; px++) {
+				float top = hd_top(st, (px + 0.5f) / c->s / A);
+				if (top > 1.5f)
+					continue;
+				int y0 = (int)(top * c->s);
+				for (int py = y0; py <= yb; py++) {
+					/* a moonlit rim, then a dark mass with a few dithered strata */
+					float n = st->ntile[((py * 3) & (NT - 1)) * NT + ((px + py / 2) & (NT - 1))];
+					float v = py == y0 ? 0.62f : py == y0 + 1 ? 0.4f : (n > 0.3f && bayer4(px, py) < 0.5f ? 0.4f : 0.17f);
+					put_set(c, px, py, v, US_MAT_EARTH);
+				}
 			}
-			us_line(c, tx, ty, tx, ly + 0.003f, 2.0f / c->s, 0.42f, US_MAT_STEM);
+			/* the tower: white with two dark bands, a gallery and a bright lantern */
+			int tp = (int)(tx * c->s), ty0 = (int)(ty * c->s), ty1 = (int)((ty - th) * c->s);
+			for (int py = ty1; py <= ty0; py++) {
+				float f = (float)(ty0 - py) / (ty0 - ty1 + 1);
+				int hw = f < 0.5f ? 1 : 0;
+				int band = (f > 0.3f && f < 0.45f) || (f > 0.65f && f < 0.8f);
+				for (int dx = -hw - 1; dx <= hw; dx++)
+					put_set(c, tp + dx, py, band ? (dx < 0 ? 0.62f : 0.4f) : (dx < 0 ? 0.9f : 0.62f), band ? US_MAT_BLOOM : US_MAT_ACCENT);
+			}
+			for (int dx = -2; dx <= 1; dx++)
+				put_set(c, tp + dx, ty1 - 1, 0.62f, US_MAT_ACCENT);
+			put_set(c, tp - 1, ty1 - 4, 0.62f, US_MAT_ACCENT);
 		} else {
 			float px = 0, py = 0;
-			for (int k = 0; k <= 40; k++) {
-				float u = k / 40.0f, uu = right ? u : 1.0f - u;
-				float x = hx0 + hw * u, y = HOR - HH * st->hd_prof[(int)(uu * RKN)];
+			for (int k = 0; k <= 60; k++) {
+				float x = hx0 + (hx1 - hx0) * k / 60.0f, y = fminf(hd_top(st, x / A), hb);
 				if (k)
 					wu_line(c, px, py, x, y, lv, US_MAT_EARTH);
-				/* a few strata hatched into the cliff face */
-				if (k % 3 == 1 && y < HOR - 0.004f)
-					wu_line(c, x, y + 0.003f, x + (right ? 0.006f : -0.006f), HOR - 0.001f, lv * 0.35f, US_MAT_EARTH);
+				/* strata hatched down the cliff and the slopes, shading away from the moon */
+				if (k % 3 == 1 && y < hb - 0.004f)
+					wu_line(c, x, y + 0.003f, x + (right ? 0.008f : -0.008f), hb - 0.001f, lv * 0.3f, US_MAT_EARTH);
 				px = x, py = y;
 			}
-			/* tapering tower, gallery and lantern */
-			wu_line(c, tx - tw0, ty, tx - tw1, ty - th, 0.4f, US_MAT_STEM);
-			wu_line(c, tx + tw0, ty, tx + tw1, ty - th, 0.4f, US_MAT_STEM);
-			for (int b = 1; b <= 2; b++) { /* painted bands */
-				float f = b / 3.0f;
-				float hwb = us_lerp(tw0, tw1, f);
-				wu_line(c, tx - hwb, ty - th * f, tx + hwb, ty - th * f, 0.25f, US_MAT_STEM);
+			wu_line(c, hx0, hb, hx1, hb, lv * 0.5f, US_MAT_WATER); /* where it meets the sea */
+			/* tapering tower with painted bands, gallery, lantern and cap */
+			wu_line(c, tx - tw0, ty, tx - tw1, ty - th, 0.55f, US_MAT_ACCENT);
+			wu_line(c, tx + tw0, ty, tx + tw1, ty - th, 0.55f, US_MAT_ACCENT);
+			for (int b = 0; b < 2; b++) {
+				float f0 = 0.3f + 0.35f * b, f1 = f0 + 0.15f;
+				for (float f = f0; f <= f1; f += 0.03f) {
+					float hwb = us_lerp(tw0, tw1, f);
+					wu_line(c, tx - hwb, ty - th * f, tx + hwb, ty - th * f, 0.4f, US_MAT_BLOOM);
+				}
 			}
-			wu_line(c, tx - tw1 * 1.6f, ty - th, tx + tw1 * 1.6f, ty - th, 0.4f, US_MAT_STEM);
-			wu_line(c, tx - tw1, ty - th - 0.006f, tx + tw1, ty - th - 0.006f, 0.35f, US_MAT_STEM);
-			wu_line(c, tx, ty - th - 0.006f, tx, ty - th - 0.009f, 0.35f, US_MAT_STEM);
+			wu_line(c, tx - tw1 * 1.8f, ty - th, tx + tw1 * 1.8f, ty - th, 0.55f, US_MAT_ACCENT);
+			wu_line(c, tx - tw1, ty - th, tx - tw1, ty - th - 0.009f, 0.45f, US_MAT_ACCENT);
+			wu_line(c, tx + tw1, ty - th, tx + tw1, ty - th - 0.009f, 0.45f, US_MAT_ACCENT);
+			wu_line(c, tx - tw1 * 1.2f, ty - th - 0.009f, tx, ty - th - 0.014f, 0.45f, US_MAT_ACCENT);
+			wu_line(c, tx + tw1 * 1.2f, ty - th - 0.009f, tx, ty - th - 0.014f, 0.45f, US_MAT_ACCENT);
 		}
 		/* the beam: a slow steady rotation (keeps turning in silence); phrases lengthen its reach */
 		st->lh_ph += dt * US_TAU / 11.0f;
@@ -885,7 +1283,7 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 	{
 		/* ripple marks: long wavy ridges across the beach, parallel to the water, breaking up and rejoining;
 		 * moonlight catches the crests */
-		int rows = ctx->crisp ? 9 + (int)(dens * 6) : 16 + (int)(dens * 14);
+		int rows = ctx->crisp ? 7 + (int)(dens * 4) : 10 + (int)(dens * 8);
 		const int NR = ctx->crisp ? 32 : 64;
 		for (int k = 0; k < rows; k++) {
 			float f = (k + 0.5f) / rows;
@@ -901,11 +1299,11 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 				float s = us_noise2(X * 0.7f + 11.0f, z * 4.0f + k * 0.37f);
 				float x = xf * A, yy = y + 0.006f * scale * us_noise2(X * 1.6f, z * 5.0f + k);
 				float shine = body_x >= 0 ? body_v * expf(-((x - body_x) * (x - body_x)) / (0.09f * A * A)) : 0.0f;
-				float v = us_smooth(-0.15f, 0.35f, s) * (0.14f + 0.12f * s + 0.05f * day + 0.15f * shine) * (0.6f + 0.4f * scale);
+				float v = us_smooth(-0.15f, 0.35f, s) * (0.2f + 0.16f * s + 0.05f * day + 0.25f * shine) * (0.6f + 0.4f * scale);
 				if (i > 0 && (v > 0.03f || pv > 0.03f)) {
 					if (ctx->crisp) {
-						if (v > 0.1f)
-							us_line(c, px, py, x, yy, 0.001f, v + 0.1f, US_MAT_EARTH);
+						if (v > 0.12f)
+							us_line(c, px, py, x, yy, 0.001f, pix_step(1.6f + 4.0f * v, (int)(x * c->s), k), US_MAT_EARTH);
 					} else
 						wu_line(c, px, py, x, yy, 0.5f * (v + pv), shine > 0.35f && s > 0.3f ? US_MAT_LIGHT : US_MAT_EARTH);
 				}
@@ -972,13 +1370,14 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 		}
 	}
 
-	/* ---- the sea: ridge lines near -> far with hidden-line removal ---- */
+	/* ---- the sea: a few perspective swell lines, denser toward the horizon, broken into long strokes,
+	 * and the waves; drawn near -> far with hidden-line removal ---- */
 	{
 		int ns = ctx->crisp ? NS / 2 : NS;
-		int rows = ctx->crisp ? 24 + (int)(dens * 14) : 24 + (int)(dens * 28);
+		int rows = ctx->crisp ? 8 + (int)(dens * 4) : 9 + (int)(dens * 8);
 		/* louder = brighter moonlit water; the hats make it flare */
 		float glit = body_x >= 0 ? (0.35f + 0.65f * body_v) * lk : 0.0f;
-		float gfl = 0.6f + 1.1f * st->hat_env;
+		float gfl = 0.6f + 1.5f * st->hat_env;
 		/* the melody (mids) makes the moon path shimmer: glints re-roll faster and the path widens */
 		st->gl_t += dt * (0.5f + 1.2f * st->mid_env);
 		float tq = floorf(st->gl_t);
@@ -987,19 +1386,31 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 		float sb = st->snare_env * (0.5f + 0.5f * night);
 		float bsx = 0;
 		if (sb > 0.02f) {
-			float tx = !st->rk_side ? A * 0.915f : A * 0.085f, e = us_sat(st->beam_sw);
+			float tx = lh_xf(st) * A, e = us_sat(st->beam_sw);
 			e = 1.0f - (1.0f - e) * (1.0f - e);
 			bsx = us_lerp(tx, A - tx, 0.15f + 0.7f * e);
 		}
 		for (int i = 0; i <= ns; i++)
 			st->occ[i] = proj_y(shore_z(st, (float)i / ns)) + 0.002f;
-		float zs0 = st->tide_s * 0.98f;
-		int rk_done = 0;
-		for (int k = 0; k < rows; k++) {
-			float f = (float)k / (rows - 1);
-			/* rows evenly spaced on screen (a ridge plot), from the shoreline up to just below the horizon */
-			float ys = proj_y(zs0), ye = HOR + 0.006f;
-			float z = KP / (us_lerp(ys, ye, f) - HOR);
+		float zs0 = st->tide_s * 1.3f, zfar = KP / 0.006f;
+		int rk_done = 0, hd_done = 0, wdone[MAX_WAVES] = {0};
+		for (int k = 0; k <= rows; k++) {
+			float f = (float)k / rows;
+			float z = k == rows ? 1e9f : zs0 * powf(zfar / zs0, powf(f, 0.85f));
+			/* the waves lying between the previous row and this one, nearest first */
+			for (;;) {
+				int best = -1;
+				for (int i = 0; i < MAX_WAVES; i++)
+					if (!wdone[i] && (st->wv[i].state == ROLL || st->wv[i].state == BREAK) && st->wv[i].z < z &&
+					    (best < 0 || st->wv[i].z < st->wv[best].z))
+						best = i;
+				if (best < 0)
+					break;
+				wdone[best] = 1;
+				draw_wave(st, ctx, c, best, ns, lk, body_x, body_v);
+			}
+			if (k == rows)
+				break;
 			if (!rk_done && z > st->rk_z) { /* the rock hides the water behind it */
 				rk_done = 1;
 				for (int i = 0; i <= ns; i++) {
@@ -1008,59 +1419,63 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 						st->occ[i] = fminf(st->occ[i], rock_top(st, xf));
 				}
 			}
-			float base = (0.18f + 0.14f * day) * lk * (1.0f - 0.75f * f * f);
-			float px = 0, py = 0;
+			if (!hd_done && z > Z_HD) { /* and the headland */
+				hd_done = 1;
+				for (int i = 0; i <= ns; i++)
+					st->occ[i] = fminf(st->occ[i], hd_top(st, (float)i / ns));
+			}
+			float base = (0.2f + 0.12f * day) * lk * (1.0f - 0.4f * f);
+			float px = 0, py = 0, pv = 0;
+			uint8_t pm = US_MAT_WATER;
 			int pvis = 0;
 			for (int i = 0; i <= ns; i++) {
 				float xf = (float)i / ns;
-				float zz = z;
-				float zsh = shore_z(st, xf);
-				if (zz < zsh) /* this row is on the sand at this column */
-					zz = zsh;
-				float X = (xf - 0.5f) * A * zz / KP;
-				float h = sea_h(st, xf, zz, X, st->lvl_env);
-				float x = xf * A, y = proj_y(zz) - KP * h / zz;
-				int vis = y < st->occ[i] && zz == z;
-				if (vis && pvis && i > 0) {
-					float v = base + 1.4f * fmaxf(h, 0.0f) * (1.0f - 0.5f * f);
-					uint8_t m = US_MAT_WATER;
-					if (sb > 0.02f) {
-						float bw = (0.05f + 0.12f * KP / zz) * A;
-						float dx = (x - bsx) / bw;
-						if (dx * dx < 9.0f) {
-							v += 0.45f * sb * expf(-dx * dx) * (1.0f - 0.3f * f);
-						}
-					}
-					/* glitter path: glints re-rolled ~7x a second, wider toward the viewer */
-					if (glit > 0) {
-						float gw = (0.015f + 0.22f * KP / zz) * gwk;
-						float dx = (x - body_x) / gw;
-						float pg = glit * expf(-dx * dx);
-						float hsh = hash1(tq * 0.131f + k * 1.37f + i * 0.711f);
-						if (hsh < pg * (0.12f + 0.2f * st->mid_env + 0.35f * st->hat_env)) {
-							v += pg * gfl * (0.5f + 0.5f * hash1(hsh * 17.0f));
-							m = US_MAT_LIGHT;
-						}
-					}
-					v = us_sat(v);
-					/* pixel art: dim water breaks into an ordered-dither dash pattern, so a quiet sea
-					 * goes sparse and dark and a loud one fills in */
-					if (ctx->crisp) {
-						if (m == US_MAT_LIGHT || v * 3.2f > bayer4(i, k) + 0.15f)
-							us_line(c, px, py, x, y, 0.002f, v, m);
-					} else
-						wu_line(c, px, py, x, y, v, m);
+				int sea = z > shore_z(st, xf) * 1.01f;
+				float X = (xf - 0.5f) * A * z / KP;
+				float h = sea ? sea_h(st, xf, z, X, st->lvl_env) : 0.0f;
+				float x = xf * A, y = proj_y(z) - KP * h / z;
+				int vis = sea && y < st->occ[i];
+				/* long strokes with gaps: an engraver's sea, not a ruled page; far rows run nearly unbroken */
+				float n = us_noise2(X * 0.3f + k * 7.31f, z * 0.4f + st->chop_t * 0.12f);
+				float on = us_smooth(0.12f - 0.45f * f, 0.3f - 0.45f * f, n);
+				float v = (base + 1.4f * fmaxf(h, 0.0f) * (1.0f - 0.5f * f)) * on;
+				uint8_t m = US_MAT_WATER;
+				if (sb > 0.02f) {
+					float bw = (0.05f + 0.12f * KP / z) * A;
+					float dx = (x - bsx) / bw;
+					if (dx * dx < 9.0f)
+						v += 0.45f * sb * expf(-dx * dx) * (1.0f - 0.3f * f);
 				}
-				if (y < st->occ[i])
+				/* glitter path: glints re-rolled ~7x a second, wider toward the viewer */
+				if (glit > 0) {
+					float gw = (0.015f + 0.22f * KP / z) * gwk;
+					float dx = (x - body_x) / gw;
+					float pg = glit * expf(-dx * dx);
+					float hsh = hash1(tq * 0.131f + k * 1.37f + i * 0.711f);
+					if (hsh < pg * (0.2f + 0.2f * st->mid_env + 0.35f * st->hat_env)) {
+						v += pg * gfl * (0.5f + 0.5f * hash1(hsh * 17.0f));
+						m = US_MAT_LIGHT;
+					}
+				}
+				v = us_sat(v);
+				if (i > 0 && vis && pvis && (v > 0.015f || pv > 0.015f)) {
+					float vv = fmaxf(v, pv) * (v > 0.015f && pv > 0.015f ? 1.0f : 0.5f);
+					uint8_t mm = m == US_MAT_LIGHT || pm == US_MAT_LIGHT ? US_MAT_LIGHT : US_MAT_WATER;
+					if (ctx->crisp) {
+						if (mm == US_MAT_LIGHT || vv > 0.06f)
+							us_line(c, px, py, x, y, 1.0f / c->s, pix_fill(vv * 6.0f + 0.9f, (int)(x * c->s), k), mm);
+					} else
+						wu_line(c, px, py, x, y, vv, mm);
+				}
+				if (vis)
 					st->occ[i] = y;
-				px = x, py = y;
-				pvis = vis;
+				px = x, py = y, pv = v, pm = m, pvis = vis;
 			}
 		}
 		/* glitter path: loose glints scattered over the water under the moon / sun, wider toward the viewer,
 		 * re-rolled ~7x a second; highs make it sparkle harder */
 		if (glit > 0) {
-			int ng = (int)(MAX_GLINT * (0.1f + 0.15f * dens + 0.3f * st->lvl_slow + 0.5f * us_sat(st->hat_env * 1.3f)) * us_sat(glit * 1.3f) * (ctx->crisp ? 0.35f : 1.0f));
+			int ng = (int)(MAX_GLINT * (0.15f + 0.15f * dens + 0.3f * st->lvl_slow + 0.7f * us_sat(st->hat_env * 1.3f)) * us_sat(glit * 1.3f) * (ctx->crisp ? 0.4f : 1.0f));
 			for (int g = 0; g < ng; g++) {
 				float h1 = hash1(tq * 0.173f + g * 0.618f + 0.11f), h2 = hash1(h1 * 91.3f + g * 0.37f);
 				float h3 = hash1(h2 * 53.7f + 0.5f), h4 = hash1(h3 * 17.1f + g * 0.07f);
@@ -1073,17 +1488,36 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 				if (x < 0 || x > A)
 					continue;
 				float xf = x / A;
-				if (z < shore_z(st, xf) * 1.01f)
+				if (z < shore_z(st, xf) * 1.01f || (y > hd_top(st, xf) && z > Z_HD))
 					continue;
 				float X = (xf - 0.5f) * A * z / KP;
 				float yy = y - KP * sea_h(st, xf, z, X, st->lvl_env) / z;
 				float pg = glit * expf(-gx * gx);
 				float len = (0.0015f + 0.009f * KP / z) * (0.4f + h4) * (0.8f + 0.9f * st->hat_env);
-				float v = us_sat(pg * gfl * (0.45f + 0.55f * h3) * (0.75f + 0.25f * st->hi_env + 0.3f * st->mid_env));
-				if (ctx->crisp)
-					us_put(c, (int)(x * c->s), (int)(yy * c->s), v, US_MAT_LIGHT);
-				else
+				float v = us_sat(pg * gfl * (0.5f + 0.55f * h3) * (0.8f + 0.25f * st->hi_env + 0.3f * st->mid_env));
+				if (ctx->crisp) {
+					int pxl = (int)(x * c->s), pyl = (int)(yy * c->s), nl = 1 + (int)(len * c->s * 0.8f);
+					for (int q = 0; q < nl; q++)
+						us_put(c, pxl + q - nl / 2, pyl, us_sat(v + 0.25f), US_MAT_LIGHT);
+				} else
 					wu_line(c, x - len, yy, x + len, yy, v, US_MAT_LIGHT);
+			}
+		}
+		/* the water's edge: a thin lapping line of foam along the sand, flaring on the kick */
+		{
+			float px = 0, py = 0;
+			for (int i = 0; i <= ns; i++) {
+				float xf = (float)i / ns, zs = shore_z(st, xf);
+				float lap = 0.5f + 0.5f * fsin(st->chop_t * 6.0f + xf * 13.0f + 0.7f * fsin(xf * 5.0f - st->chop_t * 2.0f));
+				float x = xf * A, y = proj_y(zs * (1.004f + 0.012f * lap));
+				float v = (0.22f + 0.14f * lap + 0.55f * st->kick_env) * (0.5f + 0.6f * lk);
+				if (i) {
+					if (ctx->crisp)
+						us_line(c, px, py, x, y, 1.0f / c->s, pix_step(v * 4.0f + 0.5f, (int)(x * c->s), 0), US_MAT_WATER);
+					else
+						wu_line(c, px, py, x, y, v, US_MAT_WATER);
+				}
+				px = x, py = y;
 			}
 		}
 		/* horizon */
@@ -1109,12 +1543,12 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 					float n = st->ntile[((py * 2 + 7) & (NT - 1)) * NT + ((px * 2 + 31) & (NT - 1))];
 					float v;
 					if (py == y0)
-						v = rv + 0.1f + 0.3f * body_v * us_sat(0.3f + side);
-					else if (n + 0.4f * us_sat(side) > 0.25f && bayer4(px, py) < 0.5f)
-						v = rv * (0.8f + 0.5f * us_sat(side) * body_v); /* crags catching light */
+						v = side > 0.0f && body_v > 0.3f ? 0.9f : 0.62f; /* moonlit crown */
+					else if (n + 0.5f * us_sat(side) > 0.2f && bayer4(px, py) < 0.5f)
+						v = 0.4f; /* crags catching light */
 					else
-						v = 0.09f; /* dark body hides the sand/sea behind */
-					us_put(c, px, py, v, US_MAT_EARTH);
+						v = 0.17f; /* dark body hides the sand/sea behind */
+					put_set(c, px, py, v, US_MAT_EARTH);
 				}
 			}
 		} else {
@@ -1256,73 +1690,17 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 		st->crash_spawn = 0;
 	}
 
-	/* ---- foam lace behind breaking crests ---- */
+	/* ---- spray off the breaking lips ---- */
 	for (int wi = 0; wi < MAX_WAVES; wi++) {
 		wave_t *wv = &st->wv[wi];
 		if (wv->state != BREAK)
 			continue;
-		/* iso-lines around the ridges of a noise field (|n| < thr): organic loops and holes like real
-		 * foam lace; dense at the broken front, thinning out behind it */
-		float(*lx)[FW + 1] = st->lx, (*ly)[FW + 1] = st->ly, (*lf)[FW + 1] = st->lf;
-		int fw = ctx->crisp ? 80 : 140, fh = ctx->crisp ? 10 : 12 + (int)(dens * (FH - 12));
-		float band = (0.06f + 0.25f * wv->amp) * (1.0f + 1.5f * us_sat(wv->brk_age * 0.15f));
-		for (int i = 0; i <= fw; i++) {
-			float xf = (float)i / fw;
-			float ft = xf * TW;
-			int k0 = (int)ft < TW ? (int)ft : TW - 1;
-			float zc = us_lerp(st->cz_tab[wi][k0], st->cz_tab[wi][k0 + 1], ft - k0);
-			float X = (xf - 0.5f) * A * zc / KP;
-			for (int j = 0; j < fh; j++) {
-				float fj = (float)j / (fh - 1);
-				float fz = zc * (1.0f + band * fj * fj);
-				float lace = us_noise2(X * 2.0f + 0.03f * t + wv->seed, fz * 8.0f - 0.08f * t);
-				float thr = (0.08f + 0.14f * foam_ks) * wv->foam * (1.2f - 0.8f * fj) + (j == 0 ? 0.6f : 0.0f);
-				float h = sea_h(st, xf, fz, X, st->lvl_env);
-				lx[j][i] = xf * A;
-				ly[j][i] = proj_y(fz) - KP * h / fz;
-				lf[j][i] = thr - fabsf(lace); /* > 0 inside the foam */
-			}
-		}
-		static const int8_t ms[16][4] = {
-			{-1, -1, -1, -1}, {3, 0, -1, -1}, {0, 1, -1, -1}, {3, 1, -1, -1},
-			{1, 2, -1, -1},   {3, 0, 1, 2},   {0, 2, -1, -1}, {3, 2, -1, -1},
-			{2, 3, -1, -1},   {2, 0, -1, -1}, {0, 1, 2, 3},   {2, 1, -1, -1},
-			{1, 3, -1, -1},   {1, 0, -1, -1}, {0, 3, -1, -1}, {-1, -1, -1, -1},
-		};
-		for (int j = 0; j + 1 < fh; j++) {
-			float fj = (float)j / (fh - 1);
-			float v = us_sat((1.0f - 0.55f * fj) * wv->foam * (0.5f + 0.3f * foam_k) * lk);
-			for (int i = 0; i < fw; i++) {
-				float a0 = lf[j][i], b0 = lf[j][i + 1], d0 = lf[j + 1][i], e0 = lf[j + 1][i + 1];
-				int cs = (a0 > 0) | ((b0 > 0) << 1) | ((e0 > 0) << 2) | ((d0 > 0) << 3);
-				if (cs == 0 || cs == 15)
-					continue;
-				float px[4], py[4];
-#define TT(p, q) us_clampf((p) / ((p) - (q) + 1e-9f), 0, 1)
-				px[0] = us_lerp(lx[j][i], lx[j][i + 1], TT(a0, b0));
-				py[0] = us_lerp(ly[j][i], ly[j][i + 1], TT(a0, b0));
-				px[1] = us_lerp(lx[j][i + 1], lx[j + 1][i + 1], TT(b0, e0));
-				py[1] = us_lerp(ly[j][i + 1], ly[j + 1][i + 1], TT(b0, e0));
-				px[2] = us_lerp(lx[j + 1][i], lx[j + 1][i + 1], TT(d0, e0));
-				py[2] = us_lerp(ly[j + 1][i], ly[j + 1][i + 1], TT(d0, e0));
-				px[3] = us_lerp(lx[j][i], lx[j + 1][i], TT(a0, d0));
-				py[3] = us_lerp(ly[j][i], ly[j + 1][i], TT(a0, d0));
-#undef TT
-				for (int q = 0; q < 4 && ms[cs][q] >= 0; q += 2) {
-					if (ctx->crisp)
-						us_line(c, px[ms[cs][q]], py[ms[cs][q]], px[ms[cs][q + 1]], py[ms[cs][q + 1]], 0.002f, v,
-							US_MAT_WATER);
-					else
-						wu_line(c, px[ms[cs][q]], py[ms[cs][q]], px[ms[cs][q + 1]], py[ms[cs][q + 1]], v,
-							US_MAT_WATER);
-				}
-			}
-		}
 		/* spray thrown off the broken crest on hits; spindrift on highs */
 		if (a->snare_hit || us_rand(r) < dt * (0.5f + 4.0f * st->hi_env)) {
 			int nsp = a->snare_hit ? 6 + (int)(18 * a->snare * wv->amp) : 1;
 			for (int k = 0; k < nsp && st->nsp < MAX_SPRAY; k++) {
-				float xf = us_rand(r);
+				float xp = wv->xp0 + wv->pd * (0.05f + 0.1f * wv->amp) * wv->brk_age;
+				float xf = us_clampf(xp - wv->pd * 0.5f * us_rand(r) * us_rand(r), 0.0f, 1.0f);
 				float zc = crest_z(wv, xf, t);
 				spray_t *s = &st->sp[st->nsp++];
 				float sc = KP / zc;
@@ -1343,8 +1721,8 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 			st->wet_a[i] = 0;
 	}
 	{
-		/* sheen: horizontal hairlines across the wet band; under the moon they become a soft reflected
-		 * column (steady, unlike the twinkling glitter on the water) */
+		/* sheen: under the moon, horizontal hairlines across the wet band make a soft reflected column
+		 * (steady, unlike the twinkling glitter on the water) */
 		int rows = ctx->crisp ? 4 : 7;
 		float gwid = 0.07f + 0.05f * day;
 		for (int k = 0; k < rows; k++) {
@@ -1362,7 +1740,7 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 					float dx = (x - body_x) / (gwid * (1.0f + 1.5f * f));
 					refl = body_v * expf(-dx * dx) * (0.75f + 0.25f * sinf(k * 1.7f + t * 0.6f + x * 9.0f));
 				}
-				float v = sqrtf(wa) * (0.06f + 0.06f * day + 1.1f * refl) * (1.0f - 0.3f * f) * lk;
+				float v = sqrtf(wa) * (0.04f * day + 1.1f * refl) * (1.0f - 0.3f * f) * lk;
 				if (i > 0 && (v > 0.02f || pv > 0.02f) && zw < zs - 0.002f) {
 					uint8_t m = refl > 0.25f ? US_MAT_LIGHT : US_MAT_WATER;
 					if (ctx->crisp)
@@ -1492,7 +1870,7 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 		}
 		if (!any)
 			continue;
-		float vbase = (0.5f + 0.35f * foam_k) * (0.6f + 0.4f * wv->amp) * lk;
+		float vbase = (0.2f + 0.15f * foam_k) * (0.6f + 0.4f * wv->amp) * lk;
 		for (int j = 0; j + 1 < nzl; j++)
 			for (int i = 0; i < nxl; i++) {
 				int id[4] = {j * (LXN + 1) + i, j * (LXN + 1) + i + 1, (j + 1) * (LXN + 1) + i + 1,
@@ -1808,7 +2186,7 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 		/* one scatter per hat (fixed until the next one), fading with it */
 		us_rng hr;
 		us_rng_seed(&hr, st->hat_seed);
-		int nf = (int)((ctx->crisp ? 24.0f : 70.0f + 60.0f * dens) * us_sat(st->hat_env));
+		int nf = (int)((ctx->crisp ? 32.0f : 100.0f + 80.0f * dens) * us_sat(st->hat_env));
 		for (int k = 0; k < nf; k++) {
 			float xf = us_rand(&hr), d = us_rand(&hr) * us_rand(&hr), jy = us_rand(&hr), vb = us_rand(&hr);
 			int col = (int)us_clampf(xf * NX, 0, NX - 1);
@@ -1834,7 +2212,7 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 			float dz = zt - st->bd_z[i];
 			float vmax = (dz < 0 ? 0.22f : 0.08f) * dt; /* flee the uprush, saunter after the backwash */
 			float step = us_clampf(dz, -vmax, vmax);
-			st->bd_z[i] = us_clampf(st->bd_z[i] + step, 0.62f, 1.3f);
+			st->bd_z[i] = us_clampf(st->bd_z[i] + step, 0.62f, 1.8f);
 			float spd = dt > 0 ? fabsf(step) / dt : 0.0f;
 			st->bd_turn[i] -= dt;
 			if (st->bd_turn[i] <= 0) {
