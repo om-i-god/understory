@@ -3,6 +3,13 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* Scenes pass floats straight from their simulations. A NaN, an infinity or an absurd size must never
+ * reach an int conversion (undefined behaviour) or turn a loop into billions of iterations, so every
+ * primitive checks its inputs and clips its loops to the canvas. */
+static inline int fin(float x) { return x - x == 0.0f; } /* false for NaN and +-inf */
+static inline int fin3(float a, float b, float c) { return fin(a) && fin(b) && fin(c); }
+#define US_MAX_EXTENT 8.0f /* normalized units: nothing a scene draws needs to be wider than 8 canvas heights */
+
 int us_canvas_init(us_canvas *c, int w, int h, int crisp)
 {
 	memset(c, 0, sizeof(*c));
@@ -48,7 +55,7 @@ void us_canvas_fade(us_canvas *c, float keep)
 
 void us_put(us_canvas *c, int px, int py, float v, uint8_t mat)
 {
-	if ((unsigned)px >= (unsigned)c->w || (unsigned)py >= (unsigned)c->h || v <= 0.0f)
+	if ((unsigned)px >= (unsigned)c->w || (unsigned)py >= (unsigned)c->h || !(v > 0.0f))
 		return;
 	size_t i = (size_t)py * c->w + px;
 	int iv = (int)(v * 255.0f + 0.5f);
@@ -72,7 +79,14 @@ void us_put(us_canvas *c, int px, int py, float v, uint8_t mat)
 
 void us_disc(us_canvas *c, float x, float y, float r, float v, uint8_t mat)
 {
+	if (!fin3(x, y, r) || !(v > 0) || r < 0)
+		return;
+	if (r > US_MAX_EXTENT)
+		r = US_MAX_EXTENT;
 	float px = x * c->s, py = y * c->s, rp = r * c->s;
+	/* entirely off the canvas (also keeps the int conversions below in range) */
+	if (px + rp < -2 || py + rp < -2 || px - rp > c->w + 2 || py - rp > c->h + 2)
+		return;
 	if (c->crisp) {
 		if (rp < 0.75f) {
 			us_put(c, (int)floorf(px), (int)floorf(py), v, mat);
@@ -80,6 +94,10 @@ void us_disc(us_canvas *c, float x, float y, float r, float v, uint8_t mat)
 		}
 		int x0 = (int)floorf(px - rp), x1 = (int)ceilf(px + rp);
 		int y0 = (int)floorf(py - rp), y1 = (int)ceilf(py + rp);
+		if (x0 < 0) x0 = 0;
+		if (y0 < 0) y0 = 0;
+		if (x1 >= c->w) x1 = c->w - 1;
+		if (y1 >= c->h) y1 = c->h - 1;
 		float r2 = rp * rp;
 		for (int j = y0; j <= y1; j++)
 			for (int i = x0; i <= x1; i++) {
@@ -172,6 +190,12 @@ static int clip_seg(float *x0, float *y0, float *x1, float *y1, float xmin, floa
 
 void us_line(us_canvas *c, float ax, float ay, float bx, float by, float width, float v, uint8_t mat)
 {
+	if (!fin3(ax, ay, bx) || !fin3(by, width, v) || !(v > 0))
+		return;
+	if (width < 0)
+		width = 0;
+	if (width > US_MAX_EXTENT)
+		width = US_MAX_EXTENT;
 	float x0 = ax * c->s, y0 = ay * c->s, x1 = bx * c->s, y1 = by * c->s;
 	float wp = width * c->s;
 	float r = wp * 0.5f;
@@ -203,12 +227,22 @@ void us_line(us_canvas *c, float ax, float ay, float bx, float by, float width, 
 		t = b0; b0 = b1; b1 = t;
 	}
 	int ia0 = (int)floorf(a0 - r - 1), ia1 = (int)ceilf(a1 + r + 1);
+	int amax = steep ? c->h - 1 : c->w - 1; /* the major axis: clip to the canvas too */
+	if (ia0 < 0)
+		ia0 = 0;
+	if (ia1 > amax)
+		ia1 = amax;
 	float slope = (a1 - a0) > 1e-6f ? (b1 - b0) / (a1 - a0) : 0.0f;
 	float spread = r * sqrtf(1 + slope * slope) + 1.5f;
 	for (int ia = ia0; ia <= ia1; ia++) {
 		float ac = ia + 0.5f;
 		float bc = b0 + slope * us_clampf(ac - a0, 0, a1 - a0);
 		int ib0 = (int)floorf(bc - spread), ib1 = (int)ceilf(bc + spread);
+		int bmax = steep ? c->w - 1 : c->h - 1; /* the minor axis: clip the scan to the canvas */
+		if (ib0 < 0)
+			ib0 = 0;
+		if (ib1 > bmax)
+			ib1 = bmax;
 		for (int ib = ib0; ib <= ib1; ib++) {
 			int px = steep ? ib : ia, py = steep ? ia : ib;
 			if ((unsigned)px >= (unsigned)c->w || (unsigned)py >= (unsigned)c->h)
@@ -237,6 +271,10 @@ void us_polyline(us_canvas *c, const float *xy, int n, float width, float v, uin
 
 void us_arc(us_canvas *c, float x, float y, float r, float a0, float a1, float width, float v, uint8_t mat)
 {
+	if (!fin3(x, y, r) || !fin3(a0, a1, width) || !(v > 0))
+		return;
+	if (r > US_MAX_EXTENT)
+		r = US_MAX_EXTENT;
 	float rp = r * c->s;
 	if (rp <= 0)
 		return;
@@ -263,6 +301,15 @@ void us_ring(us_canvas *c, float x, float y, float r, float width, float v, uint
 
 void us_tri(us_canvas *c, float ax, float ay, float bx, float by, float cx_, float cy_, float v, uint8_t mat)
 {
+	if (!fin3(ax, ay, bx) || !fin3(by, cx_, cy_) || !(v > 0))
+		return;
+	float lim = US_MAX_EXTENT * 2.0f; /* keep vertices near the canvas so the int box below stays sane */
+	ax = us_clampf(ax, -lim, lim);
+	ay = us_clampf(ay, -lim, lim);
+	bx = us_clampf(bx, -lim, lim);
+	by = us_clampf(by, -lim, lim);
+	cx_ = us_clampf(cx_, -lim, lim);
+	cy_ = us_clampf(cy_, -lim, lim);
 	float x0 = ax * c->s, y0 = ay * c->s, x1 = bx * c->s, y1 = by * c->s, x2 = cx_ * c->s, y2 = cy_ * c->s;
 	float area = (x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0);
 	if (fabsf(area) < 1e-6f)
@@ -314,6 +361,13 @@ void us_tri(us_canvas *c, float ax, float ay, float bx, float by, float cx_, flo
 void us_field(us_canvas *c, const float *f, int fw, int fh, float gain, uint8_t mat, float rx0, float ry0,
 	      float rx1, float ry1)
 {
+	if (!f || !fin3(rx0, ry0, rx1) || !fin3(ry1, gain, 0) || !(gain > 0))
+		return;
+	float lim = US_MAX_EXTENT * 2.0f;
+	rx0 = us_clampf(rx0, -lim, lim);
+	ry0 = us_clampf(ry0, -lim, lim);
+	rx1 = us_clampf(rx1, -lim, lim);
+	ry1 = us_clampf(ry1, -lim, lim);
 	int x0 = (int)floorf(rx0 * c->s), x1 = (int)ceilf(rx1 * c->s);
 	int y0 = (int)floorf(ry0 * c->s), y1 = (int)ceilf(ry1 * c->s);
 	if (x0 < 0) x0 = 0;
@@ -338,7 +392,7 @@ void us_field(us_canvas *c, const float *f, int fw, int fh, float gain, uint8_t 
 			float a = us_lerp(f[iy0 * fw + ix0], f[iy0 * fw + ix1], tx);
 			float b = us_lerp(f[iy1 * fw + ix0], f[iy1 * fw + ix1], tx);
 			float val = us_lerp(a, b, ty) * gain;
-			if (val > 0.004f)
+			if (val > 0.004f) /* false for NaN too */
 				us_put(c, i, j, val, mat);
 		}
 	}

@@ -34,7 +34,10 @@ void us_world_init(us_world *w)
 
 void us_world_add(us_world *w, float *field, float rate, float dt)
 {
-	*field = us_sat(*field + rate * dt);
+	float v = *field + rate * dt;
+	if (!(v - v == 0.0f)) /* a NaN / inf contribution must never reach the shared (and saved) world */
+		return;
+	*field = us_sat(v);
 	w->dirty = 1;
 }
 
@@ -169,13 +172,22 @@ int us_world_load(us_world *w, const char *path)
 	double v;
 	if (find_num(buf, "age", &v)) tmp.age = v;
 	if (find_num(buf, "energy", &v)) tmp.energy = v;
-#define R(n)                                  \
-	if (find_num(buf, #n, &v) && v == v) \
+#define R(n)                                                \
+	if (find_num(buf, #n, &v) && v - v == 0.0) /* finite */ \
 		tmp.n = (float)v;
 	FIELDS(R)
 #undef R
+	/* a hand-edited or damaged file must not push the world out of its ranges */
+#define CL(n) tmp.n = us_sat(tmp.n);
+	CL(moisture) CL(water_level) CL(storm_charge) CL(calm) CL(growth) CL(bloom) CL(mycelium) CL(pollen)
+	CL(insects) CL(flock) CL(reef) CL(daylight) CL(wind)
+#undef CL
 	tmp.season = fmodf(fabsf(tmp.season), 4.0f);
 	tmp.day_phase = fmodf(fabsf(tmp.day_phase), 1.0f);
+	if (!(tmp.age >= 0 && tmp.age < 1e12))
+		tmp.age = 0;
+	if (!(tmp.energy >= 0 && tmp.energy < 1e12))
+		tmp.energy = 0;
 	tmp.last_step_t = -1;
 	*w = tmp;
 	return 1;

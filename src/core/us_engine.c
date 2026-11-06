@@ -146,7 +146,7 @@ void us_engine_frame(us_engine *e, const us_audio *a_in, float dt, double clock_
 {
 	if (!e->scene || !e->canvas.ink || !e->rgba)
 		return;
-	if (dt <= 0)
+	if (!(dt > 0)) /* also NaN */
 		dt = 1.0f / 60.0f;
 	if (dt > 0.1f)
 		dt = 0.1f;

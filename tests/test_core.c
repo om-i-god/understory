@@ -3,6 +3,7 @@
 #include "../src/core/us_scene.h"
 #include "../src/core/us_math.h"
 #include <stdio.h>
+#include <time.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -205,6 +206,74 @@ static void test_drums(void)
 	count_drums(PAT_NAN, &k, &s, &h);
 }
 
+/* hostile inputs: every primitive must survive NaN / inf / huge / negative values quickly */
+static float nasty(us_rng *r)
+{
+	switch (us_rng_u32(r) % 8) {
+	case 0: return NAN;
+	case 1: return INFINITY;
+	case 2: return -INFINITY;
+	case 3: return 1e30f;
+	case 4: return -1e30f;
+	case 5: return us_randr(r, -3, 3);
+	case 6: return us_randr(r, -1e6f, 1e6f);
+	default: return us_rand(r);
+	}
+}
+
+static void test_canvas_torture(void)
+{
+	for (int crisp = 0; crisp < 2; crisp++) {
+		us_canvas c;
+		us_canvas_init(&c, 320, 180, crisp);
+		us_rng r;
+		us_rng_seed(&r, 99);
+		float field[16] = {0.5f, NAN, 1, INFINITY, 0.2f, 0.3f, -1, 2, 0, 0, 1, 1, 0.5f, 0.5f, 0.5f, 0.5f};
+		clock_t t0 = clock();
+		for (int i = 0; i < 4000; i++) {
+			float a = nasty(&r), b = nasty(&r), d = nasty(&r), e = nasty(&r), f = nasty(&r), g = nasty(&r);
+			float v = (i & 3) ? us_rand(&r) : nasty(&r);
+			us_disc(&c, a, b, d, v, 1);
+			us_line(&c, a, b, d, e, f, v, 2);
+			us_arc(&c, a, b, d, e, f, g, v, 3);
+			us_ring(&c, a, b, d, e, v, 3);
+			us_tri(&c, a, b, d, e, f, g, v, 4);
+			us_field(&c, field, 4, 4, v, 5, a, b, d, e);
+			float xy[6] = {a, b, d, e, f, g};
+			us_polyline(&c, xy, 3, us_rand(&r) * 0.01f, v, 6);
+			us_put(&c, (int)(us_rand(&r) * 400) - 40, (int)(us_rand(&r) * 300) - 60, v, 7);
+		}
+		double secs = (double)(clock() - t0) / CLOCKS_PER_SEC;
+		CHECK(secs < 5.0, "hostile draws took %.1f s on a %s canvas (something loops on bad input)", secs,
+		      crisp ? "crisp" : "ink");
+		us_canvas_free(&c);
+	}
+}
+
+static void test_world_corrupt(void)
+{
+	const char *path = "us_world_corrupt.json";
+	FILE *f = fopen(path, "w");
+	CHECK(f != NULL, "write corrupt world");
+	if (!f)
+		return;
+	fprintf(f, "{ \"age\": nan, \"energy\": -5, \"moisture\": 1e30, \"water_level\": -inf, \"season\": 9.5,"
+		   " \"day_phase\": -0.25, \"growth\": \"oops\", \"bloom\": 0.4");
+	fclose(f);
+	us_world w;
+	CHECK(us_world_load(&w, path), "load corrupt world");
+	CHECK(w.age == 0 && w.energy == 0, "age/energy not sanitised: %f %f", w.age, w.energy);
+	CHECK(w.moisture >= 0 && w.moisture <= 1, "moisture out of range: %f", w.moisture);
+	CHECK(w.water_level >= 0 && w.water_level <= 1, "water_level out of range: %f", w.water_level);
+	CHECK(w.season >= 0 && w.season < 4, "season out of range: %f", w.season);
+	CHECK(w.day_phase >= 0 && w.day_phase < 1, "day_phase out of range: %f", w.day_phase);
+	CHECK(fabsf(w.bloom - 0.4f) < 1e-4f, "a good field next to bad ones was lost: %f", w.bloom);
+	float before = w.growth;
+	us_world_add(&w, &w.growth, NAN, 0.1f);
+	CHECK(w.growth == before, "NaN reached the world through us_world_add");
+	remove(path);
+}
+
 static void test_world(void)
 {
 	us_world w;
@@ -324,6 +393,8 @@ int main(void)
 	test_audio();
 	test_low_bands();
 	test_drums();
+	test_canvas_torture();
+	test_world_corrupt();
 	test_world();
 	test_scenes();
 	test_journey();
