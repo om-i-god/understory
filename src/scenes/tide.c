@@ -57,6 +57,8 @@
 #define RKN 64     /* rock outcrop profile samples */
 #define N_BIRDS 5  /* sandpipers working the wash line */
 #define N_CRABS 3  /* ghost crabs on the dry sand */
+#define N_GULLS 4  /* herring gulls: standing on the rock, or wheeling over the bay */
+#define N_KELP 9   /* wrack: kelp and bladderwrack stranded along the high-water line */
 #define NT 64      /* tileable noise table for per-pixel pixel-art textures (clouds, rock) */
 
 #define HOR 0.34f /* horizon y */
@@ -141,12 +143,26 @@ typedef struct {
 	burst_t sg[MAX_SURGE], pl[MAX_PLUME];
 	float lvl_env, lvl_slow, hat_env, snare_env, kick_env, heave, beam_sw, beam_x, beam_v;
 	uint32_t hat_seed;
+	/* ghost crabs' burrows: where each one bolts on a snare, and how far down it is */
+	float cr_bx[N_CRABS], cr_hide[N_CRABS], cr_wait[N_CRABS];
+	/* gulls: a perch on the rock (fraction of its width), a wheel over the bay, a state and its clock */
+	int gu_st[N_GULLS];
+	float gu_u[N_GULLS], gu_dir[N_GULLS], gu_cx[N_GULLS], gu_cy[N_GULLS], gu_r[N_GULLS], gu_a[N_GULLS], gu_w[N_GULLS];
+	float gu_x[N_GULLS], gu_y[N_GULLS], gu_lt[N_GULLS], gu_t[N_GULLS], gu_ph[N_GULLS], gu_flap[N_GULLS], gu_hop[N_GULLS], gu_look[N_GULLS];
+	float gu_x0[N_GULLS], gu_y0[N_GULLS];
+	/* a grey seal hauled out on the rock: head and tail lift into the banana, the head turns */
+	float se_u, se_head, se_tail, se_ht, se_tt, se_t, se_jolt, se_look;
+	/* wrack on the sand */
+	float kp_x[N_KELP], kp_z[N_KELP], kp_s[N_KELP], kp_a[N_KELP];
+	us_rng lr; /* the shore life's own dice, so the sea's own random stream is untouched */
+	float gu_cool; /* gulls only flush now and then: the sky stays quiet */
 } st_t;
 
 static void *create(uint32_t seed)
 {
 	st_t *s = calloc(1, sizeof(*s));
 	us_rng_seed(&s->rng, seed ^ 0x74696465u);
+	us_rng_seed(&s->lr, seed ^ 0x6c696665u);
 	return s;
 }
 
@@ -352,7 +368,7 @@ static void spawn_wave(st_t *st, const us_ctx *ctx)
 
 static void init_scene(st_t *st, const us_ctx *ctx)
 {
-	us_rng *r = &st->rng;
+	us_rng *r = &st->rng, *lr = &st->lr;
 	st->tide_s = 1.6f - 0.35f * ctx->w->water_level;
 	for (int i = 0; i < MAX_WAVES; i++)
 		st->wv[i].state = DONE;
@@ -444,6 +460,44 @@ static void init_scene(st_t *st, const us_ctx *ctx)
 		st->cr_z[i] = us_randr(r, 0.6f, 0.82f);
 		st->cr_dir[i] = us_rand(r) < 0.5f ? -1.0f : 1.0f;
 		st->cr_idle[i] = us_randr(r, 1.0f, 6.0f);
+		st->cr_bx[i] = st->cr_x[i] + us_randr(lr, -0.05f, 0.05f);
+	}
+	/* gulls start on the rock, spread along its crown, one already up and wheeling */
+	for (int i = 0; i < N_GULLS; i++) {
+		st->gu_u[i] = 0.22f + 0.56f * (i + us_randr(lr, 0.1f, 0.9f)) / N_GULLS;
+		st->gu_dir[i] = us_rand(lr) < 0.5f ? -1.0f : 1.0f;
+		st->gu_r[i] = us_randr(lr, 0.07f, 0.13f);
+		st->gu_w[i] = us_randr(lr, 0.16f, 0.26f) * (us_rand(lr) < 0.5f ? -1.0f : 1.0f);
+		st->gu_a[i] = us_rand(lr) * US_TAU;
+		st->gu_cy[i] = us_randr(lr, 0.16f, 0.26f);
+		st->gu_t[i] = us_randr(lr, 3.0f, 20.0f);
+		st->gu_ph[i] = us_rand(lr) * US_TAU;
+		st->gu_look[i] = us_randr(lr, 1.0f, 6.0f);
+		st->gu_st[i] = (i == 1 && !ctx->crisp) ? 2 : 0;
+	}
+	/* the seal lies along the rock's lower shoulder */
+	{
+		float bu = 0.5f, bp = 10.0f;
+		for (int k = 0; k <= 10; k++) {
+			float u = 0.2f + 0.6f * k / 10.0f, p = st->rk_prof[(int)(u * RKN)];
+			if (p > 0.25f && p < bp) {
+				bp = p;
+				bu = u;
+			}
+		}
+		st->se_u = bu;
+		st->se_t = us_randr(lr, 2.0f, 6.0f);
+		st->se_look = us_rand(lr) < 0.5f ? -1.0f : 1.0f;
+		for (int i = 0; i < N_GULLS; i++) /* the gulls keep their distance */
+			if (fabsf(st->gu_u[i] - bu) < 0.15f)
+				st->gu_u[i] = us_clampf(bu + (st->gu_u[i] < bu ? -0.15f : 0.15f) - 0.03f * i, 0.12f, 0.88f);
+	}
+	/* wrack stranded along the high-water line */
+	for (int i = 0; i < N_KELP; i++) {
+		st->kp_x[i] = 0.08f + 0.84f * (i + us_randr(lr, 0.1f, 0.9f)) / N_KELP;
+		st->kp_z[i] = us_randr(lr, 0.8f, 0.93f); /* above the reach of most run-ups */
+		st->kp_s[i] = us_randr(lr, 0.7f, 1.3f);
+		st->kp_a[i] = us_rand(lr) * 40.0f;
 	}
 	for (int k = 0; k <= TW; k++)
 		st->shore_n[k] = us_noise2((float)k / TW * 3.0f, 7.7f);
@@ -711,12 +765,129 @@ static void draw_wave(st_t *st, const us_ctx *ctx, us_canvas *c, int wi, int ns,
 	}
 }
 
+/* one stroke: AA hairline in Ink, a 1px line when crisp */
+static inline void ln(us_canvas *c, float x0, float y0, float x1, float y1, float v, uint8_t mat)
+{
+	if (c->crisp)
+		us_line(c, x0, y0, x1, y1, 1.0f / c->s, v, mat);
+	else
+		wu_line(c, x0, y0, x1, y1, v, mat);
+}
+
+/* tiny hand-placed sprites for the pixel looks (a few pixels must still read as a gull or a seal):
+ * rows of characters, anchored at (ax, ay) in sprite pixels, mirrored when facing left. Each character is a
+ * shade of the creature (bright / mid / dark), its bill, or empty */
+static void sprite(us_canvas *c, float x, float y, int ax, int ay, const char *const *rows, int nr, float D, float v)
+{
+	int x0 = (int)floorf(x * c->s), y0 = (int)floorf(y * c->s);
+	for (int j = 0; j < nr; j++)
+		for (int i = 0; rows[j][i]; i++) {
+			char ch = rows[j][i];
+			if (ch == '.')
+				continue;
+			int px = D > 0 ? x0 + i - ax : x0 - i + ax, py = y0 + j - ay;
+			if (px < 0 || py < 0 || px >= c->w || py >= c->h)
+				continue;
+			switch (ch) {
+			case 'W': put_set(c, px, py, v, US_MAT_ACCENT); break;
+			case 'G': put_set(c, px, py, v * 0.62f, US_MAT_ACCENT); break;
+			case 'K': put_set(c, px, py, v * 0.32f, US_MAT_ACCENT); break;
+			case 'Y': put_set(c, px, py, 0.95f, US_MAT_LIGHT); break;
+			default: break;
+			}
+		}
+}
+
+static const char *const GULL_STAND[] = {"....WY", ".GGGW.", "KGGWW.", "..G..."};
+static const char *const GULL_CALL[] = {"....Y.", "....W.", ".GGGW.", "KGGWW.", "..G..."};
+static const char *const GULL_HOP[] = {".G..WY", "GGGGW.", "KGGWW."};
+static const char *const GULL_GLIDE[] = {".WW...WW.", "W..WWW..W"};
+static const char *const GULL_UP[] = {"W.......W", ".W.....W.", "..WWWWW.."};
+static const char *const GULL_DOWN[] = {"...WWW...", "..W...W..", ".W.....W."};
+static const char *const SEAL_FLAT[] = {"..........WG.", ".GGGGGGGGWWWK", "KGGGGGGGGGGG."};
+static const char *const SEAL_UP[] = {"..........WG", ".........WWWK", "..GGGGGGGW..", "KGGGGGGGGG.."};
+static const char *const SEAL_BANANA[] = {"K.........WG", ".G.......WWWK", ".GGGGGGGGW..", "..GGGGGGG..."};
+
+/* a herring gull standing, side on: white head and breast, the grey mantle, black wingtips crossed over the
+ * tail, yellow bill. D = facing (+-1), L = body length, hop lifts it and half-opens the wings, call throws the
+ * head back with the bill open */
+static void gull_stand(us_canvas *c, float x, float y, float D, float L, float hop, float call, float v)
+{
+	y -= hop * L * 0.5f;
+	if (c->crisp) {
+		if (hop > 0.3f)
+			sprite(c, x, y - 1.0f / c->s, 3, 2, GULL_HOP, 3, D, v);
+		else if (call > 0.3f)
+			sprite(c, x, y, 3, 4, GULL_CALL, 5, D, v);
+		else
+			sprite(c, x, y, 3, 3, GULL_STAND, 4, D, v);
+		return;
+	}
+	/* body: breast curve, back, the long primaries to a point past the tail */
+	float bp[] = {x + D * L * 0.32f, y - L * 0.62f, x + D * L * 0.38f, y - L * 0.45f, x + D * L * 0.2f, y - L * 0.28f,
+		      x - D * L * 0.2f, y - L * 0.27f, x - D * L * 0.55f, y - L * 0.38f, x - D * L * 0.85f, y - L * 0.5f,
+		      x - D * L * 0.4f, y - L * 0.62f, x + D * L * 0.05f, y - L * 0.66f, x + D * L * 0.32f, y - L * 0.62f};
+	for (int k = 0; k < 8; k++)
+		ln(c, bp[2 * k], bp[2 * k + 1], bp[2 * k + 2], bp[2 * k + 3], v, US_MAT_ACCENT);
+	/* the folded wing's edge, the black tips */
+	ln(c, x + D * L * 0.15f, y - L * 0.58f, x - D * L * 0.5f, y - L * 0.48f, v * 0.5f, US_MAT_ACCENT);
+	ln(c, x - D * L * 0.5f, y - L * 0.48f, x - D * L * 0.85f, y - L * 0.5f, v * 0.3f, US_MAT_EARTH);
+	/* head and neck */
+	float hx = x + D * L * (0.4f - 0.15f * call), hy = y - L * (0.82f + 0.12f * call);
+	ln(c, x + D * L * 0.32f, y - L * 0.62f, hx - D * L * 0.05f, hy + L * 0.1f, v, US_MAT_ACCENT);
+	ln(c, x + D * L * 0.05f, y - L * 0.66f, hx - D * L * 0.12f, hy + L * 0.05f, v * 0.8f, US_MAT_ACCENT);
+	us_ring(c, hx, hy, L * 0.12f, 0.0011f, v, US_MAT_ACCENT);
+	us_point(c, hx + D * L * 0.04f, hy - L * 0.03f, 0.0009f, v, US_MAT_ACCENT);
+	/* the bill: open and raised in a call */
+	float ba = call * 0.9f;
+	float bx = hx + D * L * 0.12f, by = hy + L * 0.02f;
+	ln(c, bx, by, bx + D * L * 0.28f * cosf(ba), by - L * 0.28f * sinf(ba), 0.9f, US_MAT_LIGHT);
+	if (call > 0.2f)
+		ln(c, bx, by + L * 0.03f, bx + D * L * 0.25f * cosf(ba * 0.4f), by + L * 0.03f - L * 0.25f * sinf(ba * 0.4f), 0.8f, US_MAT_LIGHT);
+	/* legs */
+	ln(c, x, y - L * 0.28f, x - D * L * 0.04f, y, v * 0.6f, US_MAT_ACCENT);
+	ln(c, x + D * L * 0.08f, y - L * 0.28f, x + D * L * 0.1f, y, v * 0.6f, US_MAT_ACCENT);
+	/* wings half open as it hops */
+	if (hop > 0.1f) {
+		float wy = y - L * (0.9f + 0.6f * hop);
+		ln(c, x - D * L * 0.05f, y - L * 0.62f, x - D * L * 0.3f, wy, v * 0.8f, US_MAT_ACCENT);
+		ln(c, x - D * L * 0.3f, wy, x - D * L * 0.7f, wy + L * 0.15f, v * 0.7f, US_MAT_ACCENT);
+	}
+}
+
+/* a gull in flight, from below/behind: the crooked wings (arm up to the wrist, hand angled down), the body
+ * a short stroke between them, the head toward its heading. f: wingbeat phase, flap: 0 glide .. 1 beating */
+static void gull_fly(us_canvas *c, float x, float y, float D, float S, float f, float flap, float v)
+{
+	float up = flap * sinf(f);
+	if (c->crisp) {
+		if (up > 0.35f)
+			sprite(c, x, y, 4, 2, GULL_UP, 3, D, v);
+		else if (up < -0.35f)
+			sprite(c, x, y, 4, 0, GULL_DOWN, 3, D, v);
+		else
+			sprite(c, x, y, 4, 1, GULL_GLIDE, 2, D, v);
+		return;
+	}
+	float wy = -S * (0.12f + 0.2f * up), ty = S * (0.05f - 0.32f * up) + S * 0.04f * (1.0f - flap);
+	for (int sd = -1; sd <= 1; sd += 2) {
+		float wx = x + sd * S * 0.2f, tx = x + sd * S * (0.48f - 0.06f * fabsf(up));
+		ln(c, x + sd * S * 0.03f, y, wx, y + wy, v, US_MAT_ACCENT);
+		ln(c, wx, y + wy, tx, y + ty, v * 0.85f, US_MAT_ACCENT);
+		if (!c->crisp) /* the trailing edge, a hair behind */
+			ln(c, x + sd * S * 0.05f, y + S * 0.03f, wx - sd * S * 0.01f, y + wy + S * 0.05f, v * 0.45f, US_MAT_ACCENT);
+	}
+	ln(c, x - D * S * 0.12f, y + S * 0.01f, x + D * S * 0.1f, y - S * 0.01f, v, US_MAT_ACCENT);
+	if (!c->crisp)
+		us_point(c, x + D * S * 0.12f, y - S * 0.015f, S * 0.035f, v, US_MAT_ACCENT);
+}
+
 static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 {
 	st_t *st = sp;
 	const us_audio *a = ctx->a;
 	us_world *w = ctx->w;
-	us_rng *r = &st->rng;
+	us_rng *r = &st->rng, *lr = &st->lr;
 	float dt = ctx->dt, A = ctx->aspect, dens = ctx->p->density;
 	if (!st->inited) {
 		/* start from the music already playing (no slow ramp-up of the surf and the light) */
@@ -1362,6 +1533,65 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 				for (int k = -1; k <= 1; k++)
 					wu_line(c, x - rr * ca * 0.8f, y, x + rr * cosf(st->sh_a[i] + k * 0.5f) * 0.7f, y - rr * 0.3f + k * rr * 0.12f, v * 0.6f, m);
 		}
+		/* wrack along the high-water line: tangles of bladderwrack (a forking frond beaded with air bladders)
+		 * and a strap of kelp, dark on the pale sand, the bladders wet and catching the moon */
+		{
+			int nk = (int)(N_KELP * (0.4f + 0.6f * dens) + 0.5f);
+			for (int i = 0; i < nk; i++) {
+				float z = st->kp_z[i];
+				if (z > st->tide_s * 0.97f) /* the tide has it again */
+					continue;
+				float sc = KP / z, X = st->kp_x[i] * A, Y = proj_y(z);
+				float len = 0.16f * sc * st->kp_s[i];
+				int ns = ctx->crisp ? 2 : 3;
+				for (int s = 0; s < ns; s++) {
+					float hs = hash1(st->kp_a[i] + s * 3.1f);
+					float ang = (hs - 0.5f) * 1.2f + (s & 1 ? US_PI : 0.0f);
+					float L = len * (0.6f + 0.5f * hash1(st->kp_a[i] * 1.7f + s));
+					float pts[2 * 10];
+					for (int k = 0; k < 10; k++) {
+						float f = k / 9.0f;
+						float wig = 0.18f * sinf(f * 7.0f + st->kp_a[i] + s * 2.0f) * L;
+						float lx = cosf(ang) * f * L, lz = sinf(ang) * f * L + wig;
+						pts[2 * k] = X + lx;
+						pts[2 * k + 1] = Y + lz * 0.18f; /* lying flat on the sand: foreshortened */
+					}
+					if (ctx->crisp) {
+						for (int k = 0; k < 9; k++) {
+							float dx = pts[2 * k + 2] - pts[2 * k], dy = pts[2 * k + 3] - pts[2 * k + 1];
+							int n = 1 + (int)(sqrtf(dx * dx + dy * dy) * c->s);
+							for (int m = 0; m < n; m++)
+								put_set(c, (int)((pts[2 * k] + dx * m / n) * c->s), (int)((pts[2 * k + 1] + dy * m / n) * c->s), 0.12f,
+									US_MAT_EARTH);
+						}
+						if (s == 0)
+							us_put(c, (int)(pts[8] * c->s), (int)(pts[9] * c->s) - 1, 0.35f + 0.3f * night, US_MAT_LIGHT);
+						continue;
+					}
+					float kv = 0.3f + 0.1f * day;
+					if (s == 2) { /* the kelp strap: a ribbon, two edges */
+						for (int k = 0; k < 9; k++) {
+							float wd = sc * 0.006f * (1.0f - 0.6f * k / 9.0f);
+							wu_line(c, pts[2 * k], pts[2 * k + 1] - wd, pts[2 * k + 2], pts[2 * k + 3] - wd, kv, US_MAT_EARTH);
+							wu_line(c, pts[2 * k], pts[2 * k + 1] + wd * 0.5f, pts[2 * k + 2], pts[2 * k + 3] + wd * 0.5f, kv * 0.7f, US_MAT_EARTH);
+						}
+						continue;
+					}
+					for (int k = 0; k < 9; k++)
+						wu_line(c, pts[2 * k], pts[2 * k + 1], pts[2 * k + 2], pts[2 * k + 3], kv * 1.3f, US_MAT_EARTH);
+					/* forks and bladders */
+					for (int k = 2; k < 9; k += 2) {
+						float bx = pts[2 * k], by = pts[2 * k + 1], fa = ang + ((k & 2) ? 0.6f : -0.6f);
+						float fx = bx + cosf(fa) * L * 0.2f, fy = by + sinf(fa) * L * 0.2f * 0.18f;
+						wu_line(c, bx, by, fx, fy, kv * 1.1f, US_MAT_EARTH);
+						us_point(c, fx, fy, 0.0011f + 0.0012f * sc, kv * 1.6f, US_MAT_EARTH);
+						/* a wet bladder holding a point of moonlight */
+						if (k == 4 && body_v > 0.1f)
+							us_point(c, fx, fy - 0.0008f, 0.0008f, 0.25f + 0.4f * body_v, US_MAT_LIGHT);
+					}
+				}
+			}
+		}
 		/* a bleached driftwood log stranded above the tideline: a slightly bent trunk, tapering, its cut
 		 * end showing rings, a broken branch stub, grain along its length; moonlit along the top */
 		{
@@ -1736,6 +1966,14 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 				float gx = pxc + (body_x - pxc) * 0.08f;
 				us_line(c, gx - rx * 0.25f, py_, gx + rx * 0.25f, py_, 1.0f / c->s, 0.25f + 0.5f * body_v, US_MAT_LIGHT);
 			}
+			/* hats: the pool's skin shivers and throws a star of light, a different spot each time */
+			if (st->hat_env > 0.05f) {
+				float hh = hash1((float)(st->hat_seed & 1023u) * 0.37f + q * 5.1f);
+				float gx = pxc + (hh - 0.5f) * rx * 1.2f, gv = us_sat(st->hat_env) * (0.4f + 0.4f * body_v + 0.2f * day);
+				float sl = (ctx->crisp ? 1.5f / c->s : 0.006f * psc) * (0.5f + st->hat_env);
+				us_line(c, gx - sl, py_, gx + sl, py_, 1.0f / c->s, gv, US_MAT_LIGHT);
+				us_line(c, gx, py_ - sl * 0.6f, gx, py_ + sl * 0.6f, 1.0f / c->s, gv * 0.8f, US_MAT_LIGHT);
+			}
 			/* drip rings after a crash: expand and fade over ~0.8 s */
 			float pt = st->pool_t[q];
 			if (pt > 0.0f && pt < 0.8f) {
@@ -1814,6 +2052,203 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 			s->life = fminf(us_randr(r, 0.5f, 1.1f), 2.0f * -s->vy / s->g); /* gone when it falls back to the rock */
 		}
 		st->crash_spawn = 0;
+	}
+
+	/* ---- a grey seal hauled out on the rock: it lies flat when it's quiet, lifts its head to look about,
+	 *      and curls head and tail up into the banana; louder music keeps it more alert; a snare's spray
+	 *      bursting on the rock makes it flinch ---- */
+	{
+		float sc = KP / st->rk_z;
+		float xa = (st->rk_x - st->rk_w * 0.5f) * A, xw = st->rk_w * A;
+		st->se_t -= dt;
+		if (st->se_t <= 0.0f) {
+			float u = us_rand(lr);
+			if (u < 0.35f) /* head up, looking around */
+				st->se_ht = us_randr(lr, 0.5f, 1.0f), st->se_tt = us_randr(lr, 0.0f, 0.3f);
+			else if (u < 0.6f) /* the banana */
+				st->se_ht = us_randr(lr, 0.6f, 0.9f), st->se_tt = us_randr(lr, 0.6f, 1.0f);
+			else /* flat out */
+				st->se_ht = 0.0f, st->se_tt = 0.0f;
+			if (us_rand(lr) < 0.3f)
+				st->se_look = -st->se_look;
+			st->se_t = us_randr(lr, 2.5f, 7.0f);
+		}
+		if (a->snare_hit && a->snare > 0.5f)
+			st->se_jolt = 1.0f;
+		st->se_jolt = us_approach(st->se_jolt, 0.0f, 0.25f, rdt);
+		st->se_head = us_approach(st->se_head, us_sat(st->se_ht + 0.35f * st->lvl_env + 0.6f * st->se_jolt), 0.7f, dt);
+		st->se_tail = us_approach(st->se_tail, us_sat(st->se_tt + 0.5f * st->se_jolt), 0.5f, dt);
+		float Ls = 0.24f * sc, D = st->se_u < 0.5f ? -1.0f : 1.0f;
+		float xs = xa + st->se_u * xw;
+		float xt = xs - D * Ls * 0.5f, xh = xs + D * Ls * 0.5f;
+		float yt = rock_top(st, xt / A), yh = rock_top(st, xh / A), ym = rock_top(st, xs / A);
+		float yb0 = fminf(fminf(yt, yh), ym) + Ls * 0.02f; /* rests on the highest of the three */
+		float sv = (0.4f + 0.15f * day + 0.1f * night) * (0.9f + 0.2f * st->lvl_env);
+		if (ctx->crisp) {
+			float sx = xs + D * 1.0f / c->s, sy = yb0;
+			if (st->se_tail > 0.5f && st->se_head > 0.5f)
+				sprite(c, sx, sy, 6, 3, SEAL_BANANA, 4, D, sv * 1.4f);
+			else if (st->se_head > 0.45f)
+				sprite(c, sx, sy, 6, 3, SEAL_UP, 4, D, sv * 1.4f);
+			else
+				sprite(c, sx, sy, 6, 2, SEAL_FLAT, 3, D, sv * 1.4f);
+		} else {
+			/* side-on profile in body units (u: hind flippers 0 -> nose 1, h: up), the head raised by p, the hind
+			 * end by q: back, crown and snout above; chin, throat and the belly on the rock below */
+			float p = 0.2f + 0.8f * st->se_head, q = st->se_tail;
+			static const float UPR[][2] = {{0.0f, 0.07f}, {0.1f, 0.13f}, {0.25f, 0.21f}, {0.42f, 0.27f}, {0.58f, 0.3f},
+						       {0.7f, 0.29f}, {0.79f, 0.3f}, {0.86f, 0.33f}, {0.93f, 0.31f}, {0.99f, 0.25f}, {1.03f, 0.22f}};
+			static const float LWR[][2] = {{0.0f, 0.03f}, {0.15f, 0.0f}, {0.4f, -0.01f}, {0.66f, 0.0f}, {0.76f, 0.06f},
+						       {0.86f, 0.13f}, {0.95f, 0.17f}, {1.03f, 0.2f}};
+			float pu[2 * 11], pl[2 * 8];
+			for (int k = 0; k < 11; k++) {
+				float u = UPR[k][0], h = UPR[k][1] + p * 0.3f * us_smooth(0.62f, 0.95f, u) + q * 0.35f * (1.0f - u) * (1.0f - u) * (u < 0.4f);
+				pu[2 * k] = xt + D * u * Ls, pu[2 * k + 1] = yb0 - h * Ls;
+			}
+			for (int k = 0; k < 8; k++) {
+				float u = LWR[k][0], h = LWR[k][1] + p * 0.3f * us_smooth(0.62f, 0.95f, u) + q * 0.35f * (1.0f - u) * (1.0f - u) * (u < 0.4f);
+				pl[2 * k] = xt + D * u * Ls, pl[2 * k + 1] = yb0 - h * Ls;
+			}
+			for (int k = 0; k < 10; k++)
+				wu_line(c, pu[2 * k], pu[2 * k + 1], pu[2 * k + 2], pu[2 * k + 3], sv, US_MAT_ACCENT);
+			for (int k = 0; k < 7; k++)
+				wu_line(c, pl[2 * k], pl[2 * k + 1], pl[2 * k + 2], pl[2 * k + 3], k >= 4 ? sv * 0.85f : sv * 0.45f, US_MAT_ACCENT);
+			/* the nose closes the profile; eye, nostril, whiskers */
+			wu_line(c, pu[20], pu[21], pl[14], pl[15], sv, US_MAT_ACCENT);
+			float ex = xt + D * 0.88f * Ls, ey = yb0 - (0.27f + 0.3f * us_smooth(0.62f, 0.95f, 0.88f) * p) * Ls;
+			us_point(c, ex, ey, 0.0013f, sv * 1.5f, US_MAT_LIGHT);
+			us_point(c, pu[20] - D * Ls * 0.01f, pu[21] + Ls * 0.01f, 0.001f, sv, US_MAT_ACCENT);
+			for (int k = -1; k <= 1; k += 2)
+				wu_line(c, pl[14] - D * Ls * 0.02f, pl[15] - Ls * 0.01f, pl[14] + D * Ls * 0.08f, pl[15] + k * Ls * 0.025f, sv * 0.35f, US_MAT_ACCENT);
+			/* mottled grey coat */
+			for (int k = 0; k < 6; k++) {
+				float u = 0.2f + 0.08f * k, hh = 0.12f + 0.1f * hash1(k * 3.3f + 0.7f);
+				us_point(c, xt + D * u * Ls, yb0 - (hh + q * 0.35f * (1.0f - u) * (1.0f - u) * (u < 0.4f)) * Ls, 0.0011f, sv * 0.4f, US_MAT_ACCENT);
+			}
+			/* hind flippers splayed in a fan, a fore flipper tucked under the chest */
+			float fx0 = pu[0], fy0 = 0.5f * (pu[1] + pl[1]);
+			wu_line(c, fx0, fy0, fx0 - D * Ls * 0.12f, fy0 - Ls * (0.07f + 0.08f * q), sv * 0.8f, US_MAT_ACCENT);
+			wu_line(c, fx0, fy0, fx0 - D * Ls * 0.14f, fy0 + Ls * (0.02f - 0.05f * q), sv * 0.8f, US_MAT_ACCENT);
+			wu_line(c, fx0 - D * Ls * 0.12f, fy0 - Ls * (0.07f + 0.08f * q), fx0 - D * Ls * 0.14f, fy0 + Ls * (0.02f - 0.05f * q), sv * 0.5f, US_MAT_ACCENT);
+			float ffx = xt + D * 0.62f * Ls, ffy = yb0 - 0.06f * Ls;
+			wu_line(c, ffx, ffy, ffx + D * Ls * 0.1f, ffy + Ls * 0.03f, sv * 0.75f, US_MAT_ACCENT);
+		}
+	}
+
+	/* ---- herring gulls: a few stand on the rock (facing about, the odd hop and wing-shuffle on a hard kick,
+	 *      now and then throwing the head back to call); one or two wheel over the bay, gliding on crooked
+	 *      wings with bursts of beats. A hard snare puts one up off the rock; the kick gives the fliers a
+	 *      wingbeat. More of them in the air when the world's flocks are up and the music is loud; at night
+	 *      they come down to roost ---- */
+	{
+		float sc = KP / st->rk_z;
+		float xa = (st->rk_x - st->rk_w * 0.5f) * A, xw = st->rk_w * A;
+		float roost = 1.0f - us_smooth(0.0f, 0.35f, day);
+		float want = (0.12f + 0.35f * w->flock + 0.3f * st->lvl_env) * (1.0f - 0.85f * roost) * (ctx->crisp ? 0.0f : 1.0f);
+		int ng = 2 + (int)(dens * (N_GULLS - 2) + 0.5f);
+		int took = 0, air = 0;
+		for (int i = 0; i < ng; i++)
+			air += st->gu_st[i] != 0;
+		int max_air = 1 + (!ctx->crisp && w->flock > 0.5f); /* never a crowd in the sky */
+		st->gu_cool -= dt;
+		int flush = a->snare_hit && a->snare > 0.55f && st->gu_cool <= 0.0f;
+		if (flush)
+			st->gu_cool = us_randr(lr, 25.0f, 40.0f);
+		float gv = 0.55f + 0.25f * day + 0.1f * st->lvl_env;
+		for (int i = 0; i < ng; i++) {
+			float pu = st->gu_u[i];
+			float px = xa + pu * xw, py = rock_top(st, px / A) + 0.002f;
+			float side = st->rk_side ? -1.0f : 1.0f;
+			/* they wheel over their own rock, low over the swells, never far */
+			float cx = (st->rk_x + side * (0.02f + 0.025f * i)) * A, cy = rock_base(st) - 0.07f - st->gu_cy[i] * 0.25f;
+			float R = st->gu_r[i] * A * 0.55f;
+			st->gu_t[i] -= dt;
+			st->gu_flap[i] = us_approach(st->gu_flap[i], 0.0f, st->gu_st[i] == 0 ? 0.5f : 0.3f, rdt);
+			if (st->gu_st[i] == 0) {
+				st->gu_look[i] -= dt;
+				if (st->gu_look[i] <= 0) {
+					if (us_rand(lr) < 0.5f)
+						st->gu_dir[i] = -st->gu_dir[i];
+					st->gu_look[i] = us_randr(lr, 4.0f, 12.0f);
+				}
+				/* the kick: a quick shuffle of the wings (a half hop, over in a moment) */
+				if (a->kick_hit && a->kick > 0.5f && us_rand(lr) < 0.6f && st->gu_hop[i] <= 0.0f)
+					st->gu_hop[i] = 0.5f;
+				if (a->snare_hit && a->snare > 0.4f) /* the crash on the rock startles them all */
+					st->gu_hop[i] = 1.0f;
+				/* the long call: head back, bill open; more often when the music is loud */
+				if (st->gu_flap[i] < 0.05f && us_rand(lr) < dt * (0.02f + 0.08f * st->lvl_env))
+					st->gu_flap[i] = 1.0f;
+				/* a hard snare flushes the whole group off the rock (not every time: they settle again first);
+				 * in calm spells one sometimes goes up on its own */
+				int go = ((flush && roost < 0.9f) || (st->gu_t[i] <= 0.0f && us_rand(lr) < want && air < max_air && st->gu_cool <= 0.0f));
+				if (st->gu_t[i] <= 0.0f)
+					st->gu_t[i] = us_randr(lr, 4.0f, 14.0f);
+				if (go) {
+					air++;
+					st->gu_st[i] = 1;
+					st->gu_lt[i] = flush ? -0.12f * (took++) : 0.0f; /* one after another */
+					if (!flush)
+						st->gu_cool = us_randr(lr, 20.0f, 35.0f);
+					st->gu_x0[i] = px, st->gu_y0[i] = py - sc * 0.05f;
+					st->gu_flap[i] = 1.0f;
+				}
+			}
+			st->gu_hop[i] = fmaxf(0.0f, st->gu_hop[i] - rdt / 0.16f);
+			if (st->gu_st[i] >= 1) {
+				st->gu_a[i] += st->gu_w[i] * dt * (1.0f + 0.4f * st->lvl_env);
+				if (a->kick_hit && a->kick > 0.35f) { /* a downstroke on the beat: wings snap up, then beat down */
+					st->gu_flap[i] = fmaxf(st->gu_flap[i], 0.9f);
+					st->gu_ph[i] = US_PI * 0.5f;
+				}
+				if (us_rand(lr) < dt * 0.04f && !ctx->crisp)
+					st->gu_flap[i] = 1.0f;
+			}
+			float wx = cx + R * cosf(st->gu_a[i]), wy = cy + 0.3f * R * sinf(st->gu_a[i]);
+			float fx = wx, fy = wy, flap = st->gu_flap[i];
+			if (st->gu_st[i] == 1) { /* climbing out to its wheel */
+				st->gu_lt[i] += dt / 1.6f;
+				float e = us_sat(st->gu_lt[i]), e2 = e * e * (3.0f - 2.0f * e);
+				fx = us_lerp(st->gu_x0[i], wx, e2);
+				fy = us_lerp(st->gu_y0[i], wy, e2) - 0.03f * sinf(US_PI * e);
+				flap = fmaxf(flap, 1.0f - 0.6f * e);
+				if (st->gu_lt[i] >= 1.0f) {
+					st->gu_st[i] = 2;
+					st->gu_t[i] = us_randr(lr, 2.5f, 6.0f) * (1.0f - 0.5f * roost) * (ctx->crisp ? 0.5f : 1.0f);
+				}
+			} else if (st->gu_st[i] == 2) {
+				if (st->gu_t[i] <= 0.0f && (us_rand(lr) > want || roost > 0.5f)) {
+					st->gu_st[i] = 3;
+					st->gu_lt[i] = 0.0f;
+					st->gu_x0[i] = wx, st->gu_y0[i] = wy;
+				} else if (st->gu_t[i] <= 0.0f)
+					st->gu_t[i] = us_randr(lr, 6.0f, 16.0f);
+			} else if (st->gu_st[i] == 3) { /* gliding back in, braking with a few beats */
+				st->gu_lt[i] += dt / 2.2f;
+				float e = us_sat(st->gu_lt[i]), e2 = e * e * (3.0f - 2.0f * e);
+				fx = us_lerp(st->gu_x0[i], px, e2);
+				fy = us_lerp(st->gu_y0[i], py - 0.06f * sc, e2) - 0.02f * sinf(US_PI * e);
+				if (e > 0.7f)
+					flap = fmaxf(flap, 0.9f);
+				if (st->gu_lt[i] >= 1.0f) {
+					st->gu_st[i] = 0;
+					st->gu_t[i] = us_randr(lr, 6.0f, 20.0f) * (1.0f + 2.0f * roost);
+					st->gu_dir[i] = fx > st->gu_x0[i] ? 1.0f : -1.0f;
+				}
+			}
+			if (st->gu_st[i] == 0) {
+				float hop = st->gu_hop[i] > 0.0f ? sinf(US_PI * (1.0f - st->gu_hop[i])) : 0.0f;
+				float call = st->gu_flap[i] > 0.0f ? sinf(US_PI * us_sat(1.0f - st->gu_flap[i]) * 1.0f) : 0.0f;
+				gull_stand(c, px, py, st->gu_dir[i], 0.11f * sc, hop, call, gv);
+				continue;
+			}
+			/* in the air: nearer (bigger, brighter) on the front of its wheel */
+			float dpt = st->gu_st[i] == 2 ? sinf(st->gu_a[i]) : 0.0f;
+			float S = 0.042f * (1.0f + 0.15f * dpt);
+			st->gu_ph[i] += dt * (11.0f + 4.0f * flap);
+			float D = (-sinf(st->gu_a[i]) * st->gu_w[i]) > 0 ? 1.0f : -1.0f;
+			gull_fly(c, fx, fy, D, S, st->gu_ph[i], us_sat(flap), gv * (0.85f + 0.15f * dpt));
+		}
 	}
 
 	/* ---- spray off the breaking lips ---- */
@@ -2426,19 +2861,78 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 				if (us_rand(r) < 0.4f)
 					st->cr_dir[i] = -st->cr_dir[i];
 			}
-			st->cr_e[i] = us_approach(st->cr_e[i], tgt, 0.15f, ctx->real_dt);
-			st->cr_x[i] += st->cr_dir[i] * st->cr_e[i] * 0.05f * dt;
-			if (st->cr_x[i] < 0.26f)
-				st->cr_dir[i] = 1.0f;
-			if (st->cr_x[i] > 0.74f)
-				st->cr_dir[i] = -1.0f;
-			st->cr_leg[i] += dt * st->cr_e[i] * 45.0f;
+			/* a snare: every crab bolts sideways for its burrow and drops in; a few seconds later the eye
+			 * stalks come up first, then the crab */
+			if (a->snare_hit && a->snare > 0.4f && st->cr_hide[i] < 0.5f)
+				st->cr_wait[i] = us_randr(lr, 1.0f, 2.5f);
+			float bdx = st->cr_bx[i] - st->cr_x[i];
+			if (st->cr_wait[i] > 0.0f) {
+				if (fabsf(bdx) > 0.003f) {
+					float sp = fminf(fabsf(bdx), 0.32f * dt);
+					st->cr_dir[i] = bdx > 0 ? 1.0f : -1.0f;
+					st->cr_x[i] += st->cr_dir[i] * sp;
+					st->cr_e[i] = 1.0f;
+					st->cr_leg[i] += dt * 70.0f;
+				} else {
+					st->cr_hide[i] = us_approach(st->cr_hide[i], 1.0f, 0.06f, rdt);
+					st->cr_wait[i] -= dt;
+				}
+			} else {
+				st->cr_hide[i] = us_approach(st->cr_hide[i], 0.0f, 0.5f, dt);
+				if (st->cr_hide[i] < 0.1f) {
+					st->cr_e[i] = us_approach(st->cr_e[i], tgt, 0.15f, ctx->real_dt);
+					st->cr_x[i] += st->cr_dir[i] * st->cr_e[i] * 0.05f * dt;
+					if (st->cr_x[i] < 0.26f)
+						st->cr_dir[i] = 1.0f;
+					if (st->cr_x[i] > 0.74f)
+						st->cr_dir[i] = -1.0f;
+					st->cr_leg[i] += dt * st->cr_e[i] * 45.0f;
+					/* wandered off: it has another burrow near here (unseen until it's close) */
+					if (fabsf(bdx) > 0.12f)
+						st->cr_bx[i] = us_clampf(st->cr_x[i] + st->cr_dir[i] * us_randr(lr, 0.02f, 0.06f), 0.26f, 0.74f);
+				}
+			}
 			float z = st->cr_z[i];
 			if (z > st->tide_s * 0.86f) /* the tide has its patch */
 				continue;
-			float sc = KP / z, R = fmaxf(0.011f * sc, 2.0f / c->s);
+			float sc = KP / z, R = fmaxf(0.014f * sc, 2.0f / c->s);
 			float x = st->cr_x[i] * A, y = proj_y(z);
 			float v = (0.28f + 0.2f * night + 0.1f * day) * (0.8f + 0.25f * st->cr_e[i]);
+			/* the burrow: a dark mouth with a fan of thrown-out sand */
+			float hb = st->cr_bx[i] * A;
+			if (fabsf(st->cr_bx[i] - st->cr_x[i]) < 0.1f) {
+				if (ctx->crisp) {
+					put_set(c, (int)(hb * c->s), (int)(y * c->s), 0.06f, US_MAT_EARTH);
+					put_set(c, (int)(hb * c->s) + 1, (int)(y * c->s), 0.06f, US_MAT_EARTH);
+					us_put(c, (int)(hb * c->s) - 1, (int)(y * c->s) + 1, 0.4f, US_MAT_EARTH);
+				} else {
+					float qx = 0, qy = 0;
+					for (int k = 0; k <= 10; k++) {
+						float an = US_TAU * k / 10.0f, px = hb + cosf(an) * R * 0.8f, py = y + sinf(an) * R * 0.25f;
+						if (k)
+							wu_line(c, qx, qy, px, py, 0.2f + 0.05f * day, US_MAT_EARTH);
+						qx = px, qy = py;
+					}
+					for (int k = 0; k < 6; k++)
+						us_point(c, hb + (hash1(k * 1.7f + i) - 0.5f) * R * 3.0f, y + R * (0.35f + 0.4f * hash1(k * 2.3f + i)), 0.0009f, 0.28f,
+							 US_MAT_EARTH);
+				}
+			}
+			float hide = st->cr_hide[i];
+			if (hide > 0.35f) { /* down the hole: only the eye stalks, peeping */
+				if (hide < 0.97f) {
+					float ey = y - R * 0.7f * (1.0f - hide) * 2.0f;
+					if (ctx->crisp)
+						us_put(c, (int)(hb * c->s), (int)(ey * c->s), v, US_MAT_ACCENT);
+					else {
+						wu_line(c, hb - R * 0.3f, y, hb - R * 0.35f, ey, v, US_MAT_ACCENT);
+						wu_line(c, hb + R * 0.3f, y, hb + R * 0.35f, ey, v, US_MAT_ACCENT);
+					}
+				}
+				continue;
+			}
+			y += R * hide * 1.5f;
+			v *= 1.0f - hide;
 			if (ctx->crisp) {
 				us_line(c, x - R, y - R * 0.5f, x + R, y - R * 0.5f, 1.0f / c->s, v, US_MAT_ACCENT);
 				float lg = (sinf(st->cr_leg[i]) > 0) ? 1.0f / c->s : 0.0f;
