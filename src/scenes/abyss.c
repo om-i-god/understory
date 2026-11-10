@@ -43,6 +43,9 @@
 #define HW 80
 #define HH 45
 #define SIPH_N 56
+#define MAXLF 26 /* lanternfish */
+#define MAXBS 5  /* brittle stars */
+#define NGS 3    /* glass sponges */
 
 #define TILT 0.30f
 
@@ -86,6 +89,15 @@ typedef struct {
 } wave_t;
 
 typedef struct {
+	float x, y, vx, vy, dx, dy, sx, sy, z, ph, flash, seed;
+} lfish_t;
+
+typedef struct {
+	float u, rot, ph, curl, fl_age, fl_a, dir;
+	int raised;
+} bstar_t;
+
+typedef struct {
 	us_rng rng;
 	jelly_t j[MAXJ];
 	int order[MAXJ];
@@ -106,6 +118,12 @@ typedef struct {
 	/* siphonophore */
 	float si_ph, si_seed;
 	float vent_x;
+	/* lanternfish school */
+	lfish_t lf[MAXLF];
+	float lf_x, lf_y, lf_head, lf_head_to, lf_scare, lf_wait, lf_glow;
+	/* the floor's slow walkers */
+	bstar_t bs[MAXBS];
+	float pig_u, pig_face, pig_dir, pig_ph, pig_sq, pig_wait;
 	float haze[HH * HW];
 	int inited;
 } st_t;
@@ -492,7 +510,7 @@ static void jelly_draw(st_t *s, jelly_t *j, const us_ctx *ctx, us_canvas *c, flo
 			float qx, qy;
 			bell_pt(j, W, H, PH, al, &qx, &qy);
 			if (i > 0)
-				us_tri(c, cx, cy, px, py, qx, qy, 0.2f * B + 0.06f, US_MAT_WATER);
+				us_tri(c, cx, cy, px, py, qx, qy, (0.2f + 0.3f * j->glow) * B + 0.06f, US_MAT_WATER);
 			px = qx;
 			py = qy;
 		}
@@ -502,7 +520,7 @@ static void jelly_draw(st_t *s, jelly_t *j, const us_ctx *ctx, us_canvas *c, flo
 				float p0 = PH * i / 8, p1 = PH * (i + 1) / 8, x0, y0, x1, y1;
 				bell_pt(j, W, H, p0, al, &x0, &y0);
 				bell_pt(j, W, H, p1, al, &x1, &y1);
-				us_tri(c, cx, cy, x0, y0, x1, y1, 0.2f * B + 0.06f, US_MAT_WATER);
+				us_tri(c, cx, cy, x0, y0, x1, y1, (0.2f + 0.3f * j->glow) * B + 0.06f, US_MAT_WATER);
 			}
 		}
 	} else {
@@ -842,6 +860,8 @@ static void siph_draw(st_t *s, const us_ctx *ctx, us_canvas *c, float gain)
 
 /* ---- the sea floor, vent, plume and tube worms -------------------------- */
 
+static void whale_draw(const st_t *s, const us_ctx *ctx, us_canvas *c, float day);
+
 static void floor_draw(st_t *s, const us_ctx *ctx, us_canvas *c, float gain, float day)
 {
 	int cr = ctx->crisp;
@@ -858,6 +878,7 @@ static void floor_draw(st_t *s, const us_ctx *ctx, us_canvas *c, float gain, flo
 			py = y;
 		}
 	}
+	whale_draw(s, ctx, c, day);
 	/* near floor: a black mass, its edge lit by the haze above */
 	for (int px = 0; px < c->w; px++) {
 		float u = (px + 0.5f) / c->s / A;
@@ -1018,6 +1039,384 @@ static void bokeh_draw(st_t *s, const us_ctx *ctx, us_canvas *c, float gain)
 	}
 }
 
+/* ---- lanternfish: a school of small big-eyed fish with rows of light organs along the belly ---- */
+
+static void lfish_draw(const st_t *s, const lfish_t *f, const us_ctx *ctx, us_canvas *c, float gain)
+{
+	int cr = ctx->crisp;
+	float A = ctx->aspect;
+	float L = (0.03f + 0.018f * f->z) * (cr ? 1.1f : 1.0f);
+	/* dx: facing -1..1 (turning squashes the body through 0), dy: pitch angle */
+	float sg = f->dx >= 0.0f ? 1.0f : -1.0f, sq = fmaxf(0.22f, fabsf(f->dx));
+	float cp = cosf(f->dy), sp = sinf(f->dy);
+	float dx = sg * sq * cp, dy = sp;
+	float nx = -sg * sp, ny = cp; /* the belly side */
+	float x = f->x, y = f->y;
+	float zb = 0.55f + 0.45f * f->z;
+	float lit = haze_at(s, A, x, y);
+	float fl = f->flash;
+	float bodyv = gain * zb * (0.22f + 1.1f * lit + 0.25f * fl);
+	float photv = us_sat(gain * zb * (0.3f + 0.25f * s->lvl + 1.0f * fl));
+	float wag = 0.07f * L * sinf(f->ph);
+#define LP(a_, o_, ox_, oy_)                                         \
+	do {                                                             \
+		float _a = (a_) * L, _o = (o_);                              \
+		*(ox_) = x + dx * _a + nx * _o;                              \
+		*(oy_) = y + dy * _a + ny * _o;                              \
+	} while (0)
+	static const float pa[6] = {0.5f, 0.42f, 0.25f, 0.05f, -0.15f, -0.3f};
+	static const float ph_[6] = {0.3f, 0.78f, 1.0f, 0.88f, 0.52f, 0.3f};
+	float H = 0.13f * L;
+	if (cr) {
+		/* pixel: a one-pixel body, a row of light organs under it, a forked tail */
+		float hx, hy, tx, ty, ux, uy, lx, ly;
+		LP(0.45f, 0.0f, &hx, &hy);
+		LP(-0.3f, 0.0f, &tx, &ty);
+		float bv = us_sat(bodyv * 1.1f + 0.05f);
+		float x0 = hx * c->s, y0 = hy * c->s, x1 = tx * c->s, y1 = ty * c->s;
+		int n = (int)ceilf(fmaxf(fabsf(x1 - x0), fabsf(y1 - y0)));
+		if (n < 1) n = 1;
+		if (n > 64) n = 64;
+		for (int k = 0; k <= n; k++) {
+			int px = (int)floorf(x0 + (x1 - x0) * k / n), py = (int)floorf(y0 + (y1 - y0) * k / n);
+			us_put(c, px, py, k == 1 ? us_sat(bv * 1.6f) : bv, US_MAT_ACCENT);
+			if (k > 0 && k < n && (k & 1) == 0)
+				us_put(c, px, py + 1, photv, US_MAT_WATER);
+		}
+		LP(-0.52f, -0.17f * L, &ux, &uy);
+		LP(-0.52f, 0.17f * L, &lx, &ly);
+		us_put(c, (int)floorf((ux + nx * wag) * c->s), (int)floorf((uy + ny * wag) * c->s), bv, US_MAT_ACCENT);
+		us_put(c, (int)floorf((lx + nx * wag) * c->s), (int)floorf((ly + ny * wag) * c->s), bv, US_MAT_ACCENT);
+		if (fl > 0.3f)
+			us_put(c, (int)floorf(x1), (int)floorf(y1), us_sat(photv * 1.2f), US_MAT_LIGHT);
+		return;
+	}
+	/* body contours */
+	for (int side = -1; side <= 1; side += 2) {
+		float qx = 0, qy = 0;
+		for (int i = 0; i < 6; i++) {
+			float ox, oy;
+			LP(pa[i], side * H * ph_[i], &ox, &oy);
+			if (i)
+				ln(c, 0, qx, qy, ox, oy, 0.0009f, bodyv * (side > 0 ? 0.8f : 1.0f), US_MAT_ACCENT);
+			qx = ox, qy = oy;
+		}
+	}
+	/* blunt snout */
+	{
+		float ax, ay, bx, by;
+		LP(0.5f, -H * 0.3f, &ax, &ay);
+		LP(0.5f, H * 0.3f, &bx, &by);
+		ln(c, 0, ax, ay, bx, by, 0.0009f, bodyv, US_MAT_ACCENT);
+	}
+	/* forked tail */
+	{
+		float bx0, by0, bx1, by1, ux, uy, mx, my, lx, ly;
+		LP(-0.3f, -H * 0.3f, &bx0, &by0);
+		LP(-0.3f, H * 0.3f, &bx1, &by1);
+		LP(-0.5f, -0.17f * L, &ux, &uy);
+		LP(-0.42f, 0.0f, &mx, &my);
+		LP(-0.5f, 0.17f * L, &lx, &ly);
+		ux += nx * wag, uy += ny * wag, lx += nx * wag, ly += ny * wag, mx += nx * wag * 0.5f, my += ny * wag * 0.5f;
+		ln(c, 0, bx0, by0, ux, uy, 0.0008f, bodyv * 0.8f, US_MAT_ACCENT);
+		ln(c, 0, ux, uy, mx, my, 0.0008f, bodyv * 0.6f, US_MAT_ACCENT);
+		ln(c, 0, mx, my, lx, ly, 0.0008f, bodyv * 0.6f, US_MAT_ACCENT);
+		ln(c, 0, lx, ly, bx1, by1, 0.0008f, bodyv * 0.8f, US_MAT_ACCENT);
+	}
+	/* the big eye */
+	{
+		float ex, ey;
+		LP(0.36f, -H * 0.15f, &ex, &ey);
+		us_ring(c, ex, ey, 0.075f * L, 0.0008f, us_sat(bodyv * 1.5f + 0.05f), US_MAT_ACCENT);
+		us_point(c, ex, ey, 0.02f * L, us_sat(0.3f * photv), US_MAT_WATER);
+	}
+	/* photophores: a row along the belly, a shorter one above it, the bright gland at the tail */
+	for (int i = 0; i < 7; i++) {
+		float a = 0.34f - 0.1f * i, ox, oy;
+		float hh = us_lerp(1.0f, 0.4f, us_sat((0.25f - a) / 0.55f));
+		LP(a, H * 0.82f * hh, &ox, &oy);
+		us_point(c, ox, oy, 0.0012f + 0.0006f * f->z, photv, US_MAT_WATER);
+		if (i < 4) {
+			LP(a - 0.05f, H * 0.35f, &ox, &oy);
+			us_point(c, ox, oy, 0.0009f, photv * 0.6f, US_MAT_WATER);
+		}
+	}
+	{
+		float gx, gy;
+		LP(-0.33f, -H * 0.1f, &gx, &gy);
+		us_point(c, gx, gy, 0.0016f, us_sat(photv * (0.5f + 0.8f * fl)), US_MAT_LIGHT);
+	}
+#undef LP
+}
+
+/* ---- brittle stars: five thin snaking arms around a small disc, lying on the floor ---- */
+
+static void bstar_draw(const st_t *s, const bstar_t *b, const us_ctx *ctx, us_canvas *c, float gain)
+{
+	int cr = ctx->crisp;
+	float A = ctx->aspect;
+	float x = b->u * A, y = floor_y(b->u) + 0.006f;
+	float lit = haze_at(s, A, x, y - 0.03f);
+	float base = gain * (0.16f + 1.3f * lit);
+	const int N = 7;
+	float seg = 0.0066f;
+	float front = b->fl_age * 2.2f;
+	float fla = b->fl_age < 1.5f ? b->fl_a * expf(-b->fl_age / 0.7f) : 0.0f;
+	for (int k = 0; k < 5; k++) {
+		float ang = b->rot + US_TAU * k / 5.0f;
+		float px = x, py = y;
+		int up = b->raised && k == 1;
+		for (int i = 1; i <= N; i++) {
+			float f = (float)i / N;
+			/* each arm snakes: a wave runs out along it, the kick coils it */
+			ang += (0.18f + 0.5f * b->curl) * sinf(i * 0.9f - b->ph * 1.3f + k * 1.7f) * (0.4f + f);
+			float ax = cosf(ang) * seg, ay = sinf(ang) * seg * 0.34f;
+			if (up)
+				ay -= seg * (0.55f + 0.25f * sinf(b->ph * 0.7f)) * (0.4f + f);
+			float qx = px + ax, qy = py + ay;
+			float dd = (f - front) * 4.0f;
+			float g = fla * expf(-dd * dd);
+			float v = base * (1.0f - 0.45f * f) + gain * 0.9f * g;
+			ln(c, cr, px, py, qx, qy, cr ? 0.0045f : 0.0017f * (1.0f - 0.5f * f), v, g * 2.0f > base ? US_MAT_LEAF : US_MAT_ACCENT);
+			px = qx, py = qy;
+		}
+	}
+	if (cr)
+		us_put(c, (int)(x * c->s), (int)(y * c->s), us_sat(base * 1.5f + gain * fla), US_MAT_ACCENT);
+	else {
+		us_disc(c, x, y, 0.0048f, us_sat(base * 1.3f), US_MAT_ACCENT);
+		if (fla > 0.02f)
+			halo(c, x, y, 0.03f, 0.25f * fla * gain, US_MAT_LEAF);
+	}
+}
+
+/* ---- the sea pig (Scotoplanes): a plump translucent sea cucumber trudging on stubby tube feet ---- */
+
+static void pig_draw(const st_t *s, const us_ctx *ctx, us_canvas *c, float gain)
+{
+	int cr = ctx->crisp;
+	float A = ctx->aspect;
+	float fs = s->pig_face; /* -1..1: turning squashes it through 0 */
+	float ax = fabsf(fs) < 0.25f ? 0.25f : fabsf(fs), d = fs >= 0 ? 1.0f : -1.0f;
+	float La = 0.04f * ax, Hb = 0.015f * (1.0f - 0.3f * s->pig_sq);
+	float bx = s->pig_u * A;
+	float legh = 0.0075f;
+	float by = floor_y(s->pig_u) + 0.002f - legh - Hb * 0.7f; /* centre of the body */
+	float lit = haze_at(s, A, bx, by - 0.02f);
+	float v = gain * (0.2f + 1.3f * lit + 0.06f * s->lvl);
+	/* tube feet: five on this side, stepping in a wave from back to front */
+	for (int k = 0; k < 5; k++) {
+		float a = -0.7f + 0.33f * k;
+		float st = sinf(s->pig_ph - k * 1.1f);
+		float fx = bx + d * a * La, fy = by + Hb * 0.75f;
+		float tx = fx + d * 0.003f * st, ty = fy + legh * (0.85f + 0.15f * (st > 0 ? 1.0f - st : 1.0f));
+		ln(c, cr, fx, fy, tx, ty, cr ? 0.0045f : 0.0026f, v * 0.75f, US_MAT_BLOOM);
+	}
+	/* the body: a soft bean, rounder at the front */
+	const int N = cr ? 14 : 28;
+	float qx = 0, qy = 0;
+	for (int i = 0; i <= N; i++) {
+		float t = US_TAU * i / N;
+		float ct = cosf(t), stt = sinf(t);
+		float hb = Hb * (stt > 0 ? 0.8f : 1.0f) * (1.0f + 0.15f * ct * d);
+		float ox = bx + ct * La, oy = by + stt * hb;
+		if (cr && i > 0)
+			us_tri(c, bx, by, qx, qy, ox, oy, us_sat(v * 0.5f), US_MAT_BLOOM);
+		if (i > 0 && !cr)
+			ln(c, 0, qx, qy, ox, oy, 0.0011f, us_sat(v * 1.1f), US_MAT_BLOOM);
+		qx = ox, qy = oy;
+	}
+	if (!cr) {
+		halo(c, bx, by, La * 1.1f, 0.22f * v, US_MAT_BLOOM);
+		/* a faint mid-line and the mouth's frill of feeding tentacles at the front, low */
+		ln(c, 0, bx - d * La * 0.8f, by + Hb * 0.1f, bx + d * La * 0.7f, by - Hb * 0.05f, 0.0008f, v * 0.3f, US_MAT_BLOOM);
+		for (int k = 0; k < 4; k++) {
+			float mx = bx + d * La * 0.92f, my = by + Hb * (0.25f + 0.15f * k);
+			ln(c, 0, mx, my, mx + d * 0.004f, my + 0.003f + 0.0012f * sinf(s->pig_ph * 2.0f + k), 0.0007f, v * 0.6f,
+			   US_MAT_BLOOM);
+		}
+	}
+	/* the papillae: two pairs of long feelers on the back, waving */
+	for (int k = 0; k < 2; k++) {
+		float a = 0.35f + 0.22f * k;
+		float rx = bx + d * a * La, ry = by - Hb * 0.85f;
+		float len = 0.019f - 0.004f * k;
+		float wv = 0.35f * sinf(s->pig_ph * 0.6f + k * 1.4f) + 0.4f * s->pig_sq;
+		float ang = -US_PI * 0.5f + d * (0.35f + 0.15f * k) + wv * 0.4f;
+		float px = rx, py = ry;
+		for (int i = 1; i <= 3; i++) {
+			ang += d * 0.25f;
+			float nx_ = px + cosf(ang) * len / 3, ny_ = py + sinf(ang) * len / 3;
+			ln(c, cr, px, py, nx_, ny_, cr ? 0.0045f : 0.0012f * (1.0f - 0.25f * i), us_sat(v * (1.1f - 0.15f * i)), US_MAT_BLOOM);
+			px = nx_, py = ny_;
+		}
+	}
+}
+
+/* ---- glass sponges (Venus' flower basket): tall vases of silica lattice ---- */
+
+static void sponge_draw(const st_t *s, const us_ctx *ctx, us_canvas *c, float gain, int k)
+{
+	int cr = ctx->crisp;
+	float A = ctx->aspect, t = (float)ctx->t;
+	static const float us_[NGS] = {0.405f, 0.445f, 0.665f}, hs[NGS] = {0.12f, 0.075f, 0.14f};
+	float u = us_[k], H = hs[k], W = H * 0.2f;
+	float bx = u * A, by = floor_y(u) + 0.004f;
+	float lit = haze_at(s, A, bx, by - H * 0.6f);
+	float v = gain * (0.12f + 1.25f * lit + 0.05f * s->lvl);
+	float sway = 0.003f * sinf(t * 0.4f + k * 2.0f) + 0.6f * s->cur;
+	float hs_ = (float)(s->hat_seed & 0xffff);
+	float hat = s->hat_env;
+#define SR(sv) (W * (0.4f + 0.6f * powf((sv), 0.6f)) * (1.0f - 0.12f * (sv) * (sv)))
+	if (cr) {
+		/* pixel: the silhouette filled with a one-pixel diamond lattice, brighter at the rims */
+		int y0 = (int)floorf((by - H) * c->s), y1 = (int)floorf(by * c->s);
+		for (int py = y0; py <= y1; py++) {
+			float sv = us_sat((by - (py + 0.5f) / c->s) / H);
+			float cx = (bx + sway * sv * sv) * c->s, rx = SR(sv) * c->s;
+			int xa = (int)floorf(cx - rx + 0.5f), xb = (int)floorf(cx + rx - 0.5f);
+			for (int px = xa; px <= xb; px++) {
+				int edge = px == xa || px == xb || py == y0;
+				int lat = ((px + py) % 3 == 0) || (((px - py) % 3 + 3) % 3 == 0);
+				if (edge || lat)
+					us_put(c, px, py, v * (edge ? 0.9f : 0.5f), US_MAT_ACCENT);
+			}
+		}
+		return;
+	}
+	/* the lattice: two families of spiral struts, the front ones bright */
+	int nh = cr ? 2 : 7, ns = cr ? 6 : 12;
+	for (int dir = -1; dir <= 1; dir += 2)
+		for (int h = 0; h < nh; h++) {
+			float qx = 0, qy = 0, qf = 0;
+			for (int i = 0; i <= ns; i++) {
+				float sv = (float)i / ns;
+				float th = US_TAU * h / nh + dir * sv * 2.6f + k;
+				float x = bx + SR(sv) * cosf(th) + sway * sv * sv, y = by - H * sv;
+				float fr = sinf(th); /* + faces us */
+				if (i > 0) {
+					float ff = 0.5f * (fr + qf);
+					float vv = v * (ff > 0 ? 0.45f + 0.4f * ff : 0.18f) * (cr ? 0.6f : 1.0f);
+					if (!cr || ff > 0)
+						ln(c, cr, qx, qy, x, y, cr ? 0.002f : 0.0007f, vv, US_MAT_ACCENT);
+					/* hats: a glint where struts cross */
+					if (!cr && hat > 0.05f && ff > 0.3f && hash1(i * 31 + h * 7 + k * 101 + (dir > 0) * 13, hs_) < 0.05f)
+						us_point(c, x, y, 0.0014f, us_sat(v + 1.0f * hat), US_MAT_ACCENT);
+				}
+				qx = x, qy = y, qf = fr;
+			}
+		}
+	/* the outline and a few rings */
+	for (int side = -1; side <= 1; side += 2) {
+		float qx = 0, qy = 0;
+		for (int i = 0; i <= ns; i++) {
+			float sv = (float)i / ns;
+			float x = bx + side * SR(sv) + sway * sv * sv, y = by - H * sv;
+			if (i > 0)
+				ln(c, cr, qx, qy, x, y, cr ? 0.0045f : 0.0009f, v * 0.85f, US_MAT_ACCENT);
+			qx = x, qy = y;
+		}
+	}
+	int nr = cr ? 1 : 4;
+	for (int rr = 1; rr <= nr; rr++) {
+		float sv = cr ? 1.0f : rr / (float)nr;
+		float cx = bx + sway * sv * sv, cy = by - H * sv, rx = SR(sv), ry = rx * 0.28f;
+		float qx = 0, qy = 0;
+		for (int i = 0; i <= 12; i++) {
+			float th = US_TAU * i / 12;
+			float x = cx + rx * cosf(th), y = cy + ry * sinf(th);
+			if (i > 0)
+				ln(c, cr, qx, qy, x, y, cr ? 0.002f : 0.0008f, v * (sinf(th) > 0 ? 0.7f : 0.35f) * (sv > 0.99f ? 1.3f : 1.0f),
+				   US_MAT_ACCENT);
+			qx = x, qy = y;
+		}
+	}
+	/* the glassy root tuft anchoring it in the ooze */
+	if (!cr)
+		for (int i = 0; i < 5; i++) {
+			float a = US_PI * (0.2f + 0.15f * i);
+			ln(c, 0, bx, by - 0.002f, bx + cosf(a) * W * 1.1f, by + sinf(a) * 0.004f, 0.0006f, v * 0.5f, US_MAT_ACCENT);
+		}
+#undef SR
+}
+
+/* ---- the whale fall: a skeleton far off on the ridge, its bones furred with faintly glowing bacterial mats ---- */
+
+static void whale_draw(const st_t *s, const us_ctx *ctx, us_canvas *c, float day)
+{
+	int cr = ctx->crisp;
+	float A = ctx->aspect, T = s->T;
+	float u0 = 0.5f, u1 = 0.66f;
+	float base = 0.22f + 0.05f * day;
+	enum { NV = 22 };
+	float sx[NV + 1], sy[NV + 1];
+	for (int i = 0; i <= NV; i++) {
+		float f = (float)i / NV, u = us_lerp(u0, u1, f);
+		sx[i] = u * A;
+		sy[i] = ridge_y(u) - 0.004f - 0.008f * sinf(US_PI * f) * (1.0f - f);
+	}
+	/* spine and vertebrae */
+	for (int i = 0; i < NV; i++) {
+		float lit = haze_at(s, A, sx[i], sy[i] - 0.02f);
+		float v = base + 0.9f * lit;
+		ln(c, cr, sx[i], sy[i], sx[i + 1], sy[i + 1], cr ? 0.0045f : 0.0012f, v, US_MAT_ACCENT);
+		if (!cr && (i & 1))
+			ln(c, 0, sx[i], sy[i] - 0.003f, sx[i], sy[i] + 0.002f, 0.0008f, v * 0.9f, US_MAT_ACCENT);
+	}
+	/* ribs: long arcs rising off the spine, leaning toward the tail, shorter toward it */
+	int nr = cr ? 7 : 11;
+	for (int r = 0; r < nr; r++) {
+		float f = 0.2f + 0.45f * r / (nr - 1);
+		int i = (int)(f * NV);
+		float rl = 0.06f * (1.0f - 0.55f * (f - 0.2f) / 0.45f) * (0.9f + 0.2f * hash1(r, 2.0f));
+		float lit = haze_at(s, A, sx[i], sy[i] - rl * 0.6f);
+		float v = (base + 0.9f * lit) * 0.9f;
+		float px = sx[i], py = sy[i];
+		const int NS = cr ? 5 : 7;
+		for (int k = 1; k <= NS; k++) {
+			float q = (float)k / NS;
+			float ang = -US_PI * 0.5f + 0.5f + 0.9f * q + 0.1f * hash1(r, 3.0f); /* up, then curving over toward the tail */
+			float nx = px + cosf(ang) * rl / NS, ny = py + sinf(ang) * rl / NS;
+			ln(c, cr, px, py, nx, ny, cr ? 0.0045f : 0.0013f, v * (1.0f - 0.3f * q), US_MAT_ACCENT);
+			px = nx, py = ny;
+		}
+	}
+	/* the skull: a long flat wedge at the head end, and the two jaw bones lying ahead of it */
+	{
+		float hx = sx[0], hy = sy[0];
+		float lit = haze_at(s, A, hx, hy - 0.02f);
+		float v = base + 0.9f * lit;
+		float sk[2 * 5] = {hx, hy, hx - 0.012f, hy - 0.012f, hx - 0.05f, hy - 0.004f, hx - 0.056f, hy + 0.001f, hx - 0.01f, hy + 0.004f};
+		for (int i = 0; i < 5; i++) {
+			int j = (i + 1) % 5;
+			ln(c, cr, sk[2 * i], sk[2 * i + 1], sk[2 * j], sk[2 * j + 1], cr ? 0.0045f : 0.0012f, v, US_MAT_ACCENT);
+		}
+		if (!cr)
+			for (int jw = 0; jw < 2; jw++) {
+				float px = hx - 0.004f, py = hy + 0.006f + 0.003f * jw;
+				for (int k = 1; k <= 6; k++) {
+					float q = k / 6.0f;
+					float nx = hx - 0.004f - 0.068f * q, ny = hy + 0.006f + 0.003f * jw + 0.006f * sinf(US_PI * q);
+					ln(c, 0, px, py, nx, ny, 0.0009f, v * 0.75f, US_MAT_ACCENT);
+					px = nx, py = ny;
+				}
+			}
+	}
+	/* bacterial mats and bone-eating worms: faint living light along the spine */
+	int nm = cr ? 5 : 16;
+	for (int k = 0; k < nm; k++) {
+		int i = (int)(hash1(k, 9.0f) * NV);
+		float g = 0.5f + 0.5f * sinf(T * (0.4f + 0.3f * hash1(k, 8.0f)) + k * 2.3f);
+		float v = (0.08f + 0.12f * g) * (0.7f + 0.6f * s->swell_env);
+		float ox = sx[i] + 0.004f * (hash1(k, 7.0f) - 0.5f), oy = sy[i] - 0.002f - 0.004f * hash1(k, 6.0f);
+		if (cr) {
+			if (g > 0.6f)
+				us_put(c, (int)(ox * c->s), (int)(oy * c->s), v * 1.6f, US_MAT_BLOOM);
+		} else
+			us_point(c, ox, oy, 0.0012f, v * 1.4f, k & 1 ? US_MAT_BLOOM : US_MAT_LEAF);
+	}
+}
+
 /* ---- create / destroy ----------------------------------------------------- */
 
 static void *create(uint32_t seed)
@@ -1062,6 +1461,36 @@ static void *create(uint32_t seed)
 	s->an_turn = us_randr(r, 30, 60);
 	s->vent_x = us_randr(r, 0.78f, 0.86f);
 	s->si_seed = us_randr(r, 0, 50);
+	/* the lanternfish school, loosely packed in an ellipse */
+	s->lf_x = us_randr(r, 0.3f, 0.7f);
+	s->lf_y = 0.58f;
+	s->lf_head = s->lf_head_to = us_rand(r) < 0.5f ? 0.0f : US_PI;
+	s->lf_wait = us_randr(r, 8, 20);
+	for (int i = 0; i < MAXLF; i++) {
+		lfish_t *f = &s->lf[i];
+		f->sx = us_randn(r) * 0.1f;
+		f->sy = us_randn(r) * 0.035f;
+		f->z = us_rand(r);
+		f->x = s->lf_x + f->sx;
+		f->y = s->lf_y + f->sy;
+		f->dx = cosf(s->lf_head) >= 0 ? 1.0f : -1.0f;
+		f->dy = 0;
+		f->ph = us_rand(r) * US_TAU;
+		f->seed = us_rand(r);
+	}
+	for (int i = 0; i < MAXBS; i++) {
+		static const float bu[MAXBS] = {0.2f, 0.53f, 0.94f, 0.36f, 0.72f};
+		bstar_t *b = &s->bs[i];
+		b->u = bu[i] + us_randr(r, -0.02f, 0.02f);
+		b->rot = us_rand(r) * US_TAU;
+		b->ph = us_rand(r) * 10.0f;
+		b->dir = us_rand(r) < 0.5f ? -1.0f : 1.0f;
+		b->raised = i == 0 || i == 2;
+		b->fl_age = 9.0f;
+	}
+	s->pig_u = us_randr(r, 0.5f, 0.6f);
+	s->pig_dir = s->pig_face = us_rand(r) < 0.5f ? -1.0f : 1.0f;
+	s->pig_wait = us_randr(r, 20, 40);
 	s->T = us_rand(r) * 100;
 	return s;
 }
@@ -1158,12 +1587,113 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 			p->v = us_randr(r, 0.8f, 1.2f) * wv->str;
 		}
 	}
+	int snare_now = a->snare_hit && s->wv[(s->wv_i + MAXW - 1) % MAXW].age == 0.0f;
+	const wave_t *snw = &s->wv[(s->wv_i + MAXW - 1) % MAXW];
 	for (int i = 0; i < MAXW; i++)
 		s->wv[i].age += rdt;
 
+	/* ---- lanternfish: they rise toward the surface at night and sink by day (the daily migration);
+	 *      hats ripple their light organs, a snare startles them into a flashing dart ---- */
+	int nlf = 8 + (int)((MAXLF - 8) * us_sat((0.35f + 0.65f * dens) * (0.75f + 0.25f * (spring + summer) + 0.2f * (1.0f - day))));
+	if (nlf > MAXLF) nlf = MAXLF;
+	{
+		s->lf_wait -= dt;
+		float lo = 0.12f * A, hi = 0.88f * A;
+		if (s->lf_wait <= 0 || (s->lf_x < lo && cosf(s->lf_head_to) < 0) || (s->lf_x > hi && cosf(s->lf_head_to) > 0)) {
+			s->lf_head_to = cosf(s->lf_head_to) > 0 ? US_PI : 0.0f;
+			s->lf_head_to += us_randr(r, -0.15f, 0.15f);
+			s->lf_wait = us_randr(r, 12, 30);
+		}
+		float ty = 0.5f + 0.12f * day + 0.04f * us_noise2(s->T * 0.03f, 4.0f);
+		if (snare_now) {
+			/* the whole school bolts away from the flash */
+			float ax = s->lf_x - snw->x;
+			s->lf_head_to = ax >= 0 ? us_randr(r, -0.25f, 0.25f) : US_PI + us_randr(r, -0.25f, 0.25f);
+			s->lf_scare = 1.0f;
+		}
+		s->lf_scare = us_approach(s->lf_scare, 0.0f, 0.9f, rdt);
+		s->lf_head = us_approach(s->lf_head, s->lf_head_to, 1.2f - 0.9f * s->lf_scare, dt);
+		float spd = (0.016f + 0.012f * s->lvl) * (1.0f + 3.0f * s->lf_scare);
+		float cvx = cosf(s->lf_head) * spd, cvy = (ty - s->lf_y) * 0.15f;
+		s->lf_x += cvx * dt;
+		s->lf_y += cvy * dt;
+		s->lf_x = us_clampf(s->lf_x, 0.05f * A, 0.95f * A);
+		float hs_ = (float)(s->hat_seed & 0xffff);
+		float spread = 1.0f + 1.4f * s->lf_scare;
+		for (int i = 0; i < nlf; i++) {
+			lfish_t *f = &s->lf[i];
+			float tx = s->lf_x + f->sx * spread + 0.012f * us_noise2(f->seed * 40.0f, s->T * 0.2f);
+			float tyy = s->lf_y + f->sy * spread + 0.008f * us_noise2(f->seed * 40.0f + 7.0f, s->T * 0.2f);
+			float wvx = cvx + (tx - f->x) * 0.8f, wvy = cvy + (tyy - f->y) * 0.8f;
+			if (snare_now) {
+				float ax = f->x - snw->x, ay = f->y - snw->y;
+				float d = sqrtf(ax * ax + ay * ay) + 1e-4f;
+				float k = 0.12f + 0.25f * expf(-d * 3.0f);
+				f->vx += ax / d * k + us_randr(r, -0.03f, 0.03f);
+				f->vy += ay / d * k * 0.6f + us_randr(r, -0.02f, 0.02f);
+				f->flash = 1.0f;
+			}
+			float tau = 0.6f;
+			f->vx = us_approach(f->vx, wvx, tau, dt);
+			f->vy = us_approach(f->vy, wvy, tau, dt);
+			f->x += f->vx * dt;
+			f->y += f->vy * dt;
+			float vl = sqrtf(f->vx * f->vx + f->vy * f->vy);
+			if (vl > 0.004f) {
+				/* face along the swim (a turn squashes through side-on), pitch only a little */
+				float face = f->vx > 0.003f ? 1.0f : f->vx < -0.003f ? -1.0f : (f->dx >= 0.0f ? 1.0f : -1.0f);
+				float pitch = us_clampf(atan2f(f->vy, fabsf(f->vx) + 0.01f), -0.45f, 0.45f);
+				f->dx = us_approach(f->dx, face, 0.12f, dt);
+				f->dy = us_approach(f->dy, pitch, 0.15f, dt);
+			}
+			f->ph += dt * (6.0f + 140.0f * vl);
+			/* hats: a ripple of light runs through part of the school */
+			if (a->hat_hit && hash1(i, hs_) < 0.4f + 0.3f * hat)
+				f->flash = us_sat(f->flash + 0.55f + 0.3f * hat);
+			f->flash = us_approach(f->flash, 0.0f, 0.22f, rdt);
+		}
+	}
+
+	/* ---- the floor's slow walkers: brittle stars and the sea pig ---- */
+	int nbs = 2 + (int)(3.0f * dens + 0.5f);
+	if (nbs > MAXBS) nbs = MAXBS;
+	for (int i = 0; i < nbs; i++) {
+		bstar_t *b = &s->bs[i];
+		b->ph += dt * (0.6f + 1.2f * s->lvl);
+		/* rowing slowly across the ooze */
+		b->u += b->dir * 0.0012f * (0.5f + s->lvl) * dt / A;
+		b->rot += 0.03f * sinf(b->ph * 0.4f) * dt;
+		if (b->u < 0.03f || b->u > 0.97f)
+			b->dir = b->u < 0.03f ? 1.0f : -1.0f;
+		if (kick_now)
+			b->curl = 1.0f;
+		b->curl = us_approach(b->curl, 0.0f, 0.3f, rdt);
+		/* the snare's flash: the green light runs out along every arm */
+		if (snare_now) {
+			b->fl_age = 0.0f;
+			b->fl_a = 0.6f + 0.4f * snw->str;
+		}
+		b->fl_age += rdt;
+	}
+	{
+		s->pig_wait -= dt;
+		if (s->pig_wait <= 0 || (s->pig_u < 0.48f && s->pig_dir < 0) || (s->pig_u > 0.62f && s->pig_dir > 0)) {
+			s->pig_dir = s->pig_u < 0.48f ? 1.0f : s->pig_u > 0.62f ? -1.0f : -s->pig_dir;
+			s->pig_wait = us_randr(r, 25, 50);
+		}
+		s->pig_face = us_approach(s->pig_face, s->pig_dir, 1.2f, dt);
+		float walk = 0.5f + 0.8f * s->lvl;
+		s->pig_ph += dt * 2.2f * walk;
+		if (fabsf(s->pig_face) > 0.8f)
+			s->pig_u += s->pig_face * 0.0035f * walk * dt / A;
+		if (kick_now)
+			s->pig_sq = 1.0f;
+		s->pig_sq = us_approach(s->pig_sq, 0.0f, 0.18f, rdt);
+	}
+
 	/* ---- the haze: the water lit by the animals' light ---- */
 	{
-		float base = 0.018f + 0.03f * s->lvl + 0.03f * s->swell_env;
+		float base = 0.018f + (cr ? 0.05f : 0.045f) * s->lvl + 0.03f * s->swell_env;
 		for (int jy = 0; jy < HH; jy++) {
 			float y = (jy + 0.5f) / HH;
 			float top = (0.02f + 0.07f * day) * (1.0f - us_smooth(0.0f, 0.55f, y)); /* faint light from far above */
@@ -1175,15 +1705,29 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 			jelly_t *j = &s->j[i];
 			float zb = 0.5f + 0.5f * j->z;
 			haze_blob(s, A, j->x, j->y + j->R * 0.9f, j->R * 2.6f,
-				  zb * (0.03f + 0.04f * s->lvl + 0.03f * j->band_k + 0.09f * j->glow));
+				  zb * (0.03f + 0.04f * s->lvl + 0.03f * j->band_k + (cr ? 0.08f + 0.12f * s->lvl : 0.07f + 0.1f * s->lvl) * j->glow));
 		}
 		float lx = s->an_x * A + s->an_dir * 0.045f, ly = s->an_y - 0.03f;
 		haze_blob(s, A, lx, ly, 0.05f, 0.05f + 0.07f * s->lure);
 		haze_blob(s, A, s->vent_x * A, floor_y(s->vent_x) - 0.15f, 0.05f, 0.03f + 0.07f * s->sub_env);
+		{
+			/* the school's own light, brighter as it flashes */
+			float fl = 0;
+			for (int i = 0; i < nlf; i++)
+				fl += s->lf[i].flash;
+			fl /= nlf;
+			s->lf_glow = fl;
+			haze_blob(s, A, s->lf_x, s->lf_y, 0.07f, 0.012f + 0.006f * nlf / (float)MAXLF + 0.07f * fl);
+		}
+		for (int i = 0; i < nbs; i++) {
+			bstar_t *b = &s->bs[i];
+			if (b->fl_age < 1.2f)
+				haze_blob(s, A, b->u * A, floor_y(b->u) - 0.01f, 0.03f, 0.05f * b->fl_a * expf(-b->fl_age / 0.5f));
+		}
 		for (int i = 0; i < MAXW; i++) {
 			wave_t *wv = &s->wv[i];
 			if (wv->age < 1.0f)
-				haze_blob(s, A, wv->x, wv->y, 0.08f + 0.8f * wv->rmax * (1.0f - expf(-wv->age / 0.2f)), 0.16f * wv->str * expf(-wv->age / 0.4f));
+				haze_blob(s, A, wv->x, wv->y, 0.08f + 0.8f * wv->rmax * (1.0f - expf(-wv->age / 0.2f)), (cr ? 0.14f + 0.14f * s->lvl : 0.16f) * wv->str * expf(-wv->age / 0.4f));
 		}
 		if (cr)
 			haze_dither(s, c, A);
@@ -1227,6 +1771,11 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 	floor_draw(s, ctx, c, gain, day);
 	s->bass_env = us_approach(s->bass_env, a->bass, 0.3f, rdt);
 	seapens_draw(s, ctx, c, gain, s->bass_env);
+	for (int k = 0; k < NGS; k++)
+		sponge_draw(s, ctx, c, gain, k);
+	for (int i = 0; i < nbs; i++)
+		bstar_draw(s, &s->bs[i], ctx, c, gain);
+	pig_draw(s, ctx, c, gain);
 
 	/* ---- the anglerfish ---- */
 	{
@@ -1299,6 +1848,8 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 	for (; di < nj && s->j[s->order[di]].z < 0.4f; di++)
 		jelly_draw(s, &s->j[s->order[di]], ctx, c, gain);
 	siph_draw(s, ctx, c, gain);
+	for (int i = 0; i < nlf; i += cr ? 2 : 1) /* pixel: half as many, so the school stays legible */
+		lfish_draw(s, &s->lf[i], ctx, c, gain);
 	{
 		int nc = 1 + (int)(2.0f * dens + 0.3f * w->reef + 0.4f);
 		if (nc > MAXC) nc = MAXC;
