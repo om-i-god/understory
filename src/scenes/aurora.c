@@ -15,8 +15,14 @@
  *        strong onsets -> the odd shooting star; lowmid -> the cabin hearth (window + smoke).
  * World: daylight (by day only a pale washed ghost remains), season (strongest in winter),
  *        storm_charge (a geomagnetic storm: more curtains, lower/brighter pink fringes, faster motion).
+ * Near shore: a snowy tundra bank (lit by the sky: a louder aurora brightens the snow) with snow-capped
+ *        boulders, sedge and rimed dwarf birch; caribou graze along it (kick -> one paws at the snow and throws
+ *        it back; snare -> every head comes up at once; their breath frosts every few seconds, bigger when
+ *        loud); a snowy owl on a dead snag on the far hummock (kick -> a head bob, snare -> it mantles its
+ *        wings; it blinks and swivels its head); hats -> rime on the birch twigs glints.
  * Silence: curtains keep folding slowly, a quiet arc breathes low over the ridge (about 9 s), rays drift,
- *        stars twinkle, the odd meteor falls, a fox sometimes trots along the shore past the lit cabin.
+ *        stars twinkle, the odd meteor falls, a fox sometimes trots along the shore past the lit cabin, the
+ *        caribou graze and wander, the owl looks about.
  * The lake mirrors the same light field about the shore (rows wobbling and broken by ripples, hidden
  * behind the mirrored ridge); the sky's glow lights the snowy crests, the foothills and a glimmer on the water.
  */
@@ -40,6 +46,8 @@
 #define MAX_CRACK 7
 #define CRACK_PTS 9
 #define MAX_PULSE 3
+#define MAX_CARI 4
+#define MAX_FGP 96
 
 typedef struct {
 	float seed;      /* noise offset */
@@ -60,8 +68,21 @@ typedef struct {
 	float x, h, w; /* x fraction */
 } spruce_t;
 
+/* a caribou grazing on the near bank */
+typedef struct {
+	float x, d, tgt, t, dur, ph, head, paw, breath; /* x fraction of width */
+	int on, mode, puff; /* mode: 0 walk, 1 graze, 2 alert */
+} cari_t;
+
+/* kicked-up snow (kind 0) and frosty breath (kind 1) */
+typedef struct {
+	float x, y, vx, vy, r, v, life, max;
+	int kind;
+} fgp_t;
+
 typedef struct {
 	us_rng rng;
+	us_rng lrng; /* the near shore's own stream, so the sky runs as before */
 	curtain_t cu[MAX_CURT];
 	star_t st[MAX_STARS];
 	spruce_t tr[MAX_TREES];
@@ -100,6 +121,12 @@ typedef struct {
 	float cab_x;
 	float fox_x, fox_dir, fox_ph, next_fox;
 	int fox_on;
+	/* the near bank: caribou, a snowy owl on a snag, particles */
+	cari_t ca[MAX_CARI];
+	fgp_t fp[MAX_FGP];
+	int fpi;
+	float rime_gl; /* hats: rime on the twigs glints */
+	float owl_blink, owl_look, owl_head, owl_head_to, owl_mantle, owl_bob;
 } st_t;
 
 static float ridge_y(float u)
@@ -456,6 +483,20 @@ static void *create(uint32_t seed)
 	}
 	s->cab_x = us_randr(r, 0.58f, 0.8f);
 	s->next_fox = us_randr(r, 15, 35);
+	/* the caribou are already grazing along the bank when the scene opens */
+	us_rng_seed(&s->lrng, seed ^ 0x63617269u);
+	r = &s->lrng;
+	for (int i = 0; i < MAX_CARI; i++) {
+		cari_t *k = &s->ca[i];
+		k->on = 1;
+		k->x = (i == 0 ? 0.075f : i == 1 ? 0.25f : 0.17f) + us_randr(r, -0.02f, 0.02f);
+		k->d = us_rand(r) < 0.6f ? 1.0f : -1.0f;
+		k->mode = i == 1 ? 2 : 1; /* one stands watch */
+		k->head = i == 1 ? 0.0f : 1.0f;
+		k->dur = us_randr(r, 3.0f, 14.0f);
+		k->breath = us_randr(r, 0.0f, 3.0f);
+	}
+	s->owl_look = 2.0f;
 	return s;
 }
 
@@ -608,6 +649,553 @@ static void fox(st_t *s, const us_ctx *ctx, us_canvas *c, float day)
 			float lx = x + d * (l < 2 ? 0.3f : -0.38f) * L + (l & 1) * d * 0.002f;
 			float sw = 0.0022f * sinf(s->fox_ph + ((l == 0 || l == 3) ? 0.0f : US_PI));
 			wline_(c, cr, lx, by, lx + d * sw, y, vv * 0.9f, US_MAT_ACCENT);
+		}
+	}
+}
+
+/* ------------------------------------------------------------------ the near shore: tundra, caribou, a snowy owl */
+
+/* filled, occluding shapes (set, not max): the foreground sits in front of the lake's light */
+static inline void fpset(us_canvas *c, int px, int py, int iv, float cov, uint8_t mat)
+{
+	size_t i = (size_t)py * c->w + px;
+	int o = c->ink[i];
+	c->ink[i] = (uint8_t)(o + (int)((iv - o) * cov));
+	if (cov >= 0.5f)
+		c->mat[i] = mat;
+}
+
+/* filled polygon (normalized coords), clipped below y = clip; anti-aliased horizontal edges in ink */
+static void fpoly(us_canvas *c, const float *p, int n, float clip, float v, uint8_t mat)
+{
+	if (n < 3 || n > 40)
+		return;
+	float S = c->s, ymin = 1e9f, ymax = -1e9f;
+	for (int i = 0; i < n; i++) {
+		if (!(p[2 * i] == p[2 * i]) || !(p[2 * i + 1] == p[2 * i + 1]))
+			return;
+		if (p[2 * i + 1] < ymin) ymin = p[2 * i + 1];
+		if (p[2 * i + 1] > ymax) ymax = p[2 * i + 1];
+	}
+	if (ymax > clip)
+		ymax = clip;
+	int py0 = (int)floorf(ymin * S), py1 = (int)ceilf(ymax * S);
+	if (py0 < 0) py0 = 0;
+	if (py1 > c->h) py1 = c->h;
+	int iv = (int)(us_sat(v) * 255.0f + 0.5f);
+	for (int py = py0; py < py1; py++) {
+		float yc = (py + 0.5f) / S;
+		if (yc > clip)
+			break;
+		float xs[40];
+		int m = 0;
+		for (int i = 0; i < n && m < 40; i++) {
+			int j = (i + 1) % n;
+			float x0 = p[2 * i], y0 = p[2 * i + 1], x1 = p[2 * j], y1 = p[2 * j + 1];
+			if ((y0 <= yc && y1 > yc) || (y1 <= yc && y0 > yc))
+				xs[m++] = (x0 + (yc - y0) * (x1 - x0) / (y1 - y0)) * S;
+		}
+		for (int i = 1; i < m; i++) {
+			float a = xs[i];
+			int j = i - 1;
+			while (j >= 0 && xs[j] > a) {
+				xs[j + 1] = xs[j];
+				j--;
+			}
+			xs[j + 1] = a;
+		}
+		for (int i = 0; i + 1 < m; i += 2) {
+			float l = xs[i], r = xs[i + 1];
+			if (c->crisp) {
+				int a = (int)floorf(l + 0.5f), b = (int)floorf(r + 0.5f);
+				if (b == a && r - l > 0.3f)
+					b = a + 1; /* keep thin parts a pixel wide */
+				for (int px = a < 0 ? 0 : a; px < b && px < c->w; px++)
+					fpset(c, px, py, iv, 1.0f, mat);
+				continue;
+			}
+			int a = (int)floorf(l), b = (int)floorf(r);
+			for (int px = a < 0 ? 0 : a; px <= b && px < c->w; px++) {
+				float cov = us_sat((px + 1.0f) - l) * us_sat(r - px);
+				if (cov > 0.02f)
+					fpset(c, px, py, iv, cov, mat);
+			}
+		}
+	}
+}
+
+typedef struct {
+	us_canvas *c;
+	float ox, oy, cs, sn, d, sc, clip;
+} fx_t;
+
+static void fx_init(fx_t *F, us_canvas *c, float ox, float oy, float pitch, float d, float sc)
+{
+	F->c = c;
+	F->ox = ox;
+	F->oy = oy;
+	F->cs = cosf(pitch);
+	F->sn = sinf(pitch);
+	F->d = d;
+	F->sc = sc;
+	F->clip = 9.0f;
+}
+
+static void fx_pt(const fx_t *F, float lx, float ly, float *x, float *y)
+{
+	*x = F->ox + F->d * (lx * F->cs - ly * F->sn) * F->sc;
+	*y = F->oy + (lx * F->sn + ly * F->cs) * F->sc;
+}
+
+static void fx_poly(const fx_t *F, const float *lp, int n, float v, uint8_t m)
+{
+	float p[2 * 24];
+	if (n > 24)
+		n = 24;
+	for (int i = 0; i < n; i++)
+		fx_pt(F, lp[2 * i], lp[2 * i + 1], &p[2 * i], &p[2 * i + 1]);
+	fpoly(F->c, p, n, F->clip, v, m);
+}
+
+static void fx_ell(const fx_t *F, float lx, float ly, float rx, float ry, float rot, float v, uint8_t m)
+{
+	float lp[2 * 16], cr = cosf(rot), sr = sinf(rot);
+	for (int i = 0; i < 16; i++) {
+		float a = US_TAU * i / 16.0f, ex = cosf(a) * rx, ey = sinf(a) * ry;
+		lp[2 * i] = lx + ex * cr - ey * sr;
+		lp[2 * i + 1] = ly + ex * sr + ey * cr;
+	}
+	fx_poly(F, lp, 16, v, m);
+}
+
+/* a tapered limb between two world points (at least a pixel wide on crisp canvases) */
+static void flimb(us_canvas *c, float ax, float ay, float bx, float by, float w0, float w1, float v, uint8_t m)
+{
+	float dx = bx - ax, dy = by - ay, l = sqrtf(dx * dx + dy * dy);
+	if (l < 1e-6f)
+		return;
+	float nx = -dy / l, ny = dx / l;
+	float mn = (c->crisp ? 0.55f : 0.45f) / c->s;
+	if (w0 < mn) w0 = mn;
+	if (w1 < mn) w1 = mn;
+	float p[8] = {ax + nx * w0, ay + ny * w0, bx + nx * w1, by + ny * w1, bx - nx * w1, by - ny * w1, ax - nx * w0, ay - ny * w0};
+	fpoly(c, p, 4, 9.0f, v, m);
+}
+
+static void fx_seg(const fx_t *F, float ax, float ay, float bx, float by, float w0, float w1, float v, uint8_t m)
+{
+	float x0, y0, x1, y1;
+	fx_pt(F, ax, ay, &x0, &y0);
+	fx_pt(F, bx, by, &x1, &y1);
+	flimb(F->c, x0, y0, x1, y1, w0 * F->sc, w1 * F->sc, v, m);
+}
+
+/* the near ground: a snowy tundra bank on the left, a small hummock on the right (u = fraction of width) */
+static float bank_y(float u)
+{
+	float y = 2.0f;
+	if (u < 0.52f) {
+		float t = u / 0.52f;
+		y = 0.83f + 0.18f * powf(t, 2.2f) + 0.006f * us_noise2(u * 23.0f, 3.7f) - 0.008f * expf(-(u - 0.19f) * (u - 0.19f) / 0.003f);
+	}
+	if (u > 0.84f) {
+		float t = us_sat((u - 0.84f) / 0.1f);
+		float h = 0.992f - 0.042f * sqrtf(t) * (1.0f - 0.2f * t * t) + 0.004f * us_noise2(u * 31.0f, 8.1f);
+		if (h < y)
+			y = h;
+	}
+	return y;
+}
+
+/* the caribou stand on the bank's near slope, so their bodies show dark against the snow */
+static inline float cari_gy(float u) { float g = bank_y(us_clampf(u, 0.0f, 0.4f)) + 0.105f; return g < 0.99f ? g : 0.99f; }
+
+static inline float cari_sc(int i) { return 0.092f * (1.0f - 0.07f * (float)(i % 3)); }
+
+static void fg_part(st_t *s, float x, float y, float vx, float vy, float r, float v, float life, int kind)
+{
+	fgp_t *p = &s->fp[s->fpi];
+	s->fpi = (s->fpi + 1) % MAX_FGP;
+	p->x = x;
+	p->y = y;
+	p->vx = vx;
+	p->vy = vy;
+	p->r = r;
+	p->v = v;
+	p->life = p->max = life;
+	p->kind = kind;
+}
+
+static void caribou_step(st_t *s, const us_ctx *ctx, int n)
+{
+	us_rng *r = &s->lrng;
+	const us_audio *a = ctx->a;
+	float dt = ctx->dt, A = ctx->aspect;
+	int pawed = 0;
+	for (int i = 0; i < MAX_CARI; i++) {
+		cari_t *k = &s->ca[i];
+		if (i >= n) {
+			k->on = 0;
+			continue;
+		}
+		if (!k->on) { /* walks in along the bank from the left edge */
+			k->on = 1;
+			k->x = -0.06f - 0.05f * i;
+			k->d = 1.0f;
+			k->mode = 0;
+			k->tgt = us_randr(r, 0.06f, 0.34f);
+			k->head = 0.0f;
+		}
+		float cs = cari_sc(i);
+		k->t += dt;
+		k->paw = us_approach(k->paw, 0.0f, 0.05f, ctx->real_dt);
+		float head_to = 0.0f;
+		if (k->mode == 0) { /* walking: a slow, nodding walk */
+			k->x += k->d * 0.012f * dt;
+			k->ph += dt * 3.6f;
+			if (k->d * (k->x - k->tgt) >= 0.0f) {
+				k->mode = 1;
+				k->t = 0.0f;
+				k->dur = us_randr(r, 6.0f, 16.0f);
+			}
+		} else if (k->mode == 1) { /* grazing: muzzle in the snow, cratering for lichen */
+			head_to = 1.0f;
+			if (k->t > k->dur) {
+				k->tgt = us_clampf(k->x + us_randr(r, -0.1f, 0.1f), 0.05f, 0.31f);
+				for (int j = 0; j < MAX_CARI; j++) /* keep a little apart */
+					if (j != i && s->ca[j].on && fabsf(s->ca[j].x - k->tgt) < 0.09f)
+						k->tgt = us_clampf(k->tgt + (k->tgt > s->ca[j].x ? 0.09f : -0.09f), 0.05f, 0.31f);
+				k->d = k->tgt >= k->x ? 1.0f : -1.0f;
+				k->mode = 0;
+			}
+		} else { /* alert: head up, still */
+			if (k->t > k->dur) {
+				k->mode = 1;
+				k->t = 0.0f;
+				k->dur = us_randr(r, 4.0f, 12.0f);
+			}
+		}
+		/* snare: every head comes up at once */
+		if (a->snare_hit && a->snare > 0.3f && k->x > -0.02f) {
+			k->mode = 2;
+			k->t = 0.0f;
+			k->dur = us_randr(r, 1.0f, 1.8f);
+		}
+		if (k->mode == 2)
+			head_to = 0.0f;
+		/* kick: a grazing caribou paws at the snow, throwing it back */
+		if (a->kick_hit && k->mode == 1 && !pawed && k->paw < 0.3f && us_rand(r) < 0.8f) {
+			pawed = 1;
+			k->paw = 1.0f;
+			float fx = (k->x * A) + k->d * 0.4f * cs, fy = cari_gy(k->x);
+			int np = ctx->crisp ? 6 : 12;
+			for (int q = 0; q < np; q++)
+				fg_part(s, fx, fy - 0.004f, -k->d * us_randr(r, 0.03f, 0.12f), -us_randr(r, 0.05f, 0.16f), us_randr(r, 0.0012f, 0.0026f),
+					us_randr(r, 0.5f, 0.85f), us_randr(r, 0.5f, 0.8f), 0);
+		}
+		k->head = us_approach(k->head, head_to, head_to > k->head ? 0.35f : 0.1f, dt);
+		/* breath: a frosty puff every few seconds, bigger when it is loud */
+		k->breath -= dt;
+		if (k->breath <= 0.0f && k->x > 0.0f) {
+			k->breath = us_randr(r, 2.2f, 3.6f);
+			k->puff = 1;
+		}
+	}
+}
+
+static void caribou_draw(st_t *s, us_canvas *c, int i, float A, float lit, float lvl)
+{
+	cari_t *k = &s->ca[i];
+	int cr = c->crisp;
+	float cs = cari_sc(i), d = k->d, x = k->x * A, gy = cari_gy(k->x);
+	float vb = cr ? 0.02f : 0.012f, vp = (cr ? 0.5f : 0.2f) * (0.8f + 0.4f * lit), va = cr ? 0.4f : 0.2f;
+	float walk = k->mode == 0 ? 1.0f : 0.0f;
+	float by = gy - 0.68f * cs + 0.015f * cs * sinf(k->ph * 2.0f) * walk;
+	fx_t F;
+	fx_init(&F, c, x, by, 0.0f, d, cs);
+	/* legs: long, dark, big hooves; a slow walk; the near foreleg paws on the kick */
+	for (int l = 0; l < 4; l++) {
+		int front = l < 2, far = (l & 1) == 0;
+		float lv = far ? vb * 0.8f : vb;
+		float ax = (front ? 0.36f : -0.4f) + (far ? (front ? -0.06f : 0.06f) : 0.0f), ay = 0.12f;
+		float wx, wy;
+		fx_pt(&F, ax, ay, &wx, &wy);
+		float ph = k->ph + ((l == 0 || l == 3) ? 0.0f : US_PI);
+		float sw = 0.14f * cs * sinf(ph) * walk, lift = 0.05f * cs * us_sat(sinf(ph + 1.5f)) * walk;
+		if (front && !far && k->paw > 0.0f) { /* the scrape: up, forward, and back */
+			float p = 1.0f - k->paw;
+			sw += 0.14f * cs * sinf(US_TAU * p);
+			lift += 0.12f * cs * sinf(US_PI * p);
+		}
+		float fxw = wx + d * sw, fyw = gy - lift;
+		float kx = 0.5f * (wx + fxw) + (front ? d * 0.03f : -d * 0.08f) * cs, ky = 0.5f * (wy + fyw);
+		flimb(c, wx, wy, kx, ky, (front ? 0.07f : 0.1f) * cs, 0.035f * cs, lv, US_MAT_EARTH);
+		flimb(c, kx, ky, fxw, fyw, 0.03f * cs, 0.035f * cs, lv, US_MAT_EARTH);
+		{
+			float hp[8] = {fxw - 0.06f * cs, fyw, fxw + 0.07f * cs, fyw, fxw + 0.05f * cs, fyw - 0.04f * cs, fxw - 0.05f * cs, fyw - 0.04f * cs};
+			fpoly(c, hp, 4, 9.0f, lv, US_MAT_EARTH);
+		}
+	}
+	/* body: deep barrel, high shoulders, rump; a pale flank stripe and rump patch */
+	fx_ell(&F, 0.0f, 0.0f, 0.6f, 0.23f, 0.0f, vb, US_MAT_EARTH);
+	fx_ell(&F, 0.3f, -0.07f, 0.3f, 0.27f, 0.0f, vb, US_MAT_EARTH);
+	fx_ell(&F, -0.42f, -0.03f, 0.22f, 0.21f, 0.0f, vb, US_MAT_EARTH);
+	fx_seg(&F, -0.35f, 0.12f, 0.2f, 0.15f, 0.03f, 0.02f, vp * 0.5f, US_MAT_ACCENT);
+	fx_ell(&F, -0.6f, -0.08f, 0.07f, 0.1f, 0.0f, vp * 0.9f, US_MAT_ACCENT);
+	/* neck + head: up, or lowered to the snow */
+	float hd = k->head;
+	float hx = us_lerp(0.8f, 0.86f, hd), hy = us_lerp(-0.42f, 0.5f, hd);
+	float ha = us_lerp(0.55f, 1.45f, hd);
+	fx_seg(&F, 0.46f, 0.06f, hx + 0.02f, hy + 0.06f, 0.13f, 0.08f, vp, US_MAT_ACCENT); /* the pale mane under the neck */
+	fx_seg(&F, 0.42f, -0.12f, hx, hy, 0.2f, 0.11f, vb, US_MAT_EARTH);
+	float ca = cosf(ha), sa = sinf(ha);
+	fx_seg(&F, hx - ca * 0.04f, hy - sa * 0.04f, hx + ca * 0.32f, hy + sa * 0.32f, 0.1f, 0.065f, vb, US_MAT_EARTH);
+	fx_seg(&F, hx - sa * 0.03f, hy + ca * 0.03f - 0.06f, hx - ca * 0.14f - sa * 0.08f, hy - sa * 0.14f - 0.1f, 0.03f, 0.015f, vb, US_MAT_EARTH); /* ear */
+	/* antlers: long beams sweeping back and up, curving forward, a few tines and the shovel over the face */
+	float ar = (ha - 0.55f) * 0.9f, arc = cosf(ar), ars = sinf(ar);
+	for (int e = 0; e < 2; e++) {
+		float off = e ? 0.13f : 0.0f; /* the far antler, set back so both beams read */
+		float bx = hx - 0.04f - off, byy = hy - 0.08f;
+		static const float beam[6][2] = {{0, 0}, {-0.2f, -0.3f}, {-0.25f, -0.62f}, {-0.15f, -0.9f}, {0.02f, -1.05f}, {0.16f, -1.06f}};
+		float px = 0, py = 0;
+		for (int q = 0; q < 6; q++) {
+			float lx = beam[q][0] * (0.85f + 0.25f * e), ly = beam[q][1] * (0.85f - 0.12f * e);
+			float qx = bx + lx * arc - ly * ars, qy = byy + lx * ars + ly * arc;
+			if (q > 0)
+				fx_seg(&F, px, py, qx, qy, 0.025f, 0.018f, e ? va * 0.75f : va, US_MAT_ACCENT);
+			if (q == 3 || q == 4) { /* tines forward */
+				float tx = qx + (0.14f * arc - (-0.08f) * ars), ty = qy + (0.14f * ars + (-0.08f) * arc);
+				fx_seg(&F, qx, qy, tx, ty, 0.022f, 0.012f, e ? va * 0.75f : va, US_MAT_ACCENT);
+			}
+			px = qx;
+			py = qy;
+		}
+		if (!e) { /* the brow shovel */
+			float qx = bx + (-0.04f) * arc - (-0.12f) * ars, qy = byy + (-0.04f) * ars + (-0.12f) * arc;
+			float tx = qx + 0.2f * arc - 0.02f * ars, ty = qy + 0.2f * ars + 0.02f * arc;
+			fx_seg(&F, qx, qy, tx, ty, 0.03f, 0.04f, va, US_MAT_ACCENT);
+		}
+	}
+	/* the aurora's light along the crest of the neck and the head (they stand against the dark lake) */
+	{
+		float np[2 * 4];
+		fx_pt(&F, 0.36f, -0.3f, &np[0], &np[1]);
+		fx_pt(&F, us_lerp(0.42f, hx, 0.55f) + 0.04f, us_lerp(-0.3f, hy, 0.55f) - 0.1f, &np[2], &np[3]);
+		fx_pt(&F, hx + sa * 0.08f, hy - ca * 0.08f, &np[4], &np[5]);
+		fx_pt(&F, hx + ca * 0.32f + sa * 0.05f, hy + sa * 0.32f - ca * 0.05f, &np[6], &np[7]);
+		float rv = cr ? 0.22f + 0.2f * lit : us_sat(0.16f + 0.6f * lit);
+		for (int q = 0; q < 3; q++) {
+			if (cr)
+				us_line(c, np[2 * q], np[2 * q + 1], np[2 * q + 2], np[2 * q + 3], 0.004f, rv, US_MAT_ACCENT);
+			else
+				rim(c, np[2 * q], np[2 * q + 1], np[2 * q + 2], np[2 * q + 3], rv, US_MAT_LEAF);
+		}
+	}
+	/* the aurora's light along the back */
+	if (!cr && lit > 0.02f) {
+		float pts[2 * 7];
+		for (int q = 0; q < 7; q++) {
+			float t = q / 6.0f;
+			fx_pt(&F, -0.62f + 1.0f * t, -0.22f - 0.12f * sinf(US_PI * us_sat(t * 1.3f)), &pts[2 * q], &pts[2 * q + 1]);
+		}
+		for (int q = 0; q + 1 < 7; q++)
+			rim(c, pts[2 * q], pts[2 * q + 1] - 0.0012f, pts[2 * q + 2], pts[2 * q + 3] - 0.0012f, us_sat(0.15f + 0.6f * lit), US_MAT_LEAF);
+	}
+	/* breath: a frosty puff from the muzzle */
+	if (k->puff) {
+		k->puff = 0;
+		float mx, my;
+		fx_pt(&F, hx + ca * 0.34f, hy + sa * 0.34f, &mx, &my);
+		for (int q = 0; q < 3; q++)
+			fg_part(s, mx + d * 0.004f * q, my - 0.002f * q, d * (0.012f + 0.006f * q), -0.008f, (0.002f + 0.001f * q) * (1.0f + 0.5f * lvl),
+				0.08f + 0.12f * lvl, 1.4f + 0.3f * q, 1);
+	}
+}
+
+/* a snowy owl on a dead snag on the hummock: blinks, swivels its head, bobs on the kick, mantles on the snare */
+static void owl_fg(st_t *s, const us_ctx *ctx, us_canvas *c, float A, float lit)
+{
+	us_rng *r = &s->lrng;
+	const us_audio *a = ctx->a;
+	int cr = c->crisp;
+	float dt = ctx->dt, rdt = ctx->real_dt;
+	float sx = 0.925f * A, sb = bank_y(0.925f) + 0.004f, top = 0.8f;
+	/* the snag: a bleached trunk with broken stubs */
+	float tv = cr ? 0.22f : 0.1f;
+	flimb(c, sx, sb, sx + 0.002f, top, 0.0045f, 0.0028f, tv, cr ? US_MAT_EARTH : US_MAT_STEM);
+	static const float stub[4][3] = {{0.87f, -1.0f, 0.016f}, {0.9f, 1.0f, 0.012f}, {0.84f, 1.0f, 0.02f}, {0.93f, -1.0f, 0.01f}};
+	for (int q = 0; q < 4; q++) {
+		float y = us_lerp(sb, top, stub[q][0] - 0.75f + 0.08f * q);
+		flimb(c, sx, y, sx + stub[q][1] * stub[q][2], y - 0.6f * stub[q][2], 0.0018f, 0.0009f, tv, cr ? US_MAT_EARTH : US_MAT_STEM);
+	}
+	/* behaviour */
+	s->owl_blink -= rdt;
+	if (s->owl_blink < -5.0f)
+		s->owl_blink = 0.16f;
+	s->owl_look -= dt;
+	if (s->owl_look <= 0.0f) {
+		s->owl_head_to = us_randr(r, -1.0f, 1.0f);
+		s->owl_look = us_randr(r, 1.5f, 6.0f);
+	}
+	if (a->snare_hit && a->snare > 0.3f)
+		s->owl_mantle = us_sat(s->owl_mantle + 0.7f + 0.3f * a->snare);
+	if (a->kick_hit)
+		s->owl_bob = 1.0f;
+	s->owl_mantle = us_approach(s->owl_mantle, 0.0f, 0.18f, rdt);
+	s->owl_bob = us_approach(s->owl_bob, 0.0f, 0.07f, rdt);
+	s->owl_head = us_approach(s->owl_head, s->owl_head_to, 0.12f, dt);
+	float sc = cr ? 0.05f : 0.038f, x = sx + 0.002f, y = top + 0.003f;
+	float wv = (cr ? 0.8f : 0.42f) * (0.85f + 0.3f * lit), dk = cr ? 0.35f : 0.1f;
+	/* mantling: wings raised out to the sides */
+	if (s->owl_mantle > 0.05f) {
+		float m = s->owl_mantle;
+		for (int sd = -1; sd <= 1; sd += 2) {
+			float wp[8] = {x + sd * 0.25f * sc, y - 0.85f * sc, x + sd * (0.3f + 0.75f * m) * sc, y - (0.75f + 0.55f * m) * sc,
+				       x + sd * (0.35f + 0.8f * m) * sc, y - 0.2f * sc, x + sd * 0.25f * sc, y - 0.2f * sc};
+			fpoly(c, wp, 4, 9.0f, wv * 0.9f, US_MAT_ACCENT);
+		}
+	}
+	float p[2 * 20];
+	for (int i = 0; i < 20; i++) {
+		float t = US_TAU * i / 20.0f;
+		p[2 * i] = x + cosf(t) * (0.36f + 0.08f * sinf(t)) * sc;
+		p[2 * i + 1] = y - 0.55f * sc + sinf(t) * 0.55f * sc;
+	}
+	fpoly(c, p, 20, 9.0f, wv, US_MAT_ACCENT);
+	float hb = 0.12f * sc * sinf(US_PI * s->owl_bob);
+	float hx = x + s->owl_head * 0.05f * sc, hy = y - 1.0f * sc + hb;
+	fx_t F;
+	fx_init(&F, c, hx, hy, 0.0f, 1.0f, sc);
+	fx_ell(&F, 0.0f, 0.02f, 0.33f, 0.28f, 0.0f, wv, US_MAT_ACCENT);
+	if (!cr) /* dark flecks on the breast and wings */
+		for (int k = 0; k < 5; k++)
+			flimb(c, x + (((k * 37) % 5) / 4.0f - 0.5f) * 0.36f * sc, y - (0.2f + 0.1f * (k % 3)) * sc,
+			      x + (((k * 37) % 5) / 4.0f - 0.5f) * 0.36f * sc + 0.06f * sc, y - (0.2f + 0.1f * (k % 3)) * sc, 0.012f * sc,
+			      0.012f * sc, dk, US_MAT_EARTH);
+	float ex = hx + s->owl_head * 0.1f * sc, ey = hy + 0.01f * sc;
+	if (s->owl_blink < 0.0f) { /* yellow eyes, open */
+		us_disc(c, ex - 0.12f * sc, ey, (cr ? 0.07f : 0.08f) * sc, 0.85f, US_MAT_LIGHT);
+		us_disc(c, ex + 0.12f * sc, ey, (cr ? 0.07f : 0.08f) * sc, 0.85f, US_MAT_LIGHT);
+	} else if (!cr) {
+		flimb(c, ex - 0.2f * sc, ey, ex - 0.04f * sc, ey, 0.015f * sc, 0.015f * sc, dk, US_MAT_EARTH);
+		flimb(c, ex + 0.04f * sc, ey, ex + 0.2f * sc, ey, 0.015f * sc, 0.015f * sc, dk, US_MAT_EARTH);
+	}
+}
+
+static void foreground(st_t *s, const us_ctx *ctx, us_canvas *c, float day, float lit, float winter)
+{
+	int cr = c->crisp;
+	float A = ctx->aspect, S = c->s;
+	int W = c->w < MAXCOL ? c->w : MAXCOL;
+	/* the snow: lit by the sky (louder, brighter aurora = brighter snow) */
+	float sv = cr ? 0.17f + 0.1f * day + 0.3f * lit : 0.07f + 0.04f * day + 0.16f * lit;
+	for (int px = 0; px < W; px++) {
+		float u = (px + 0.5f) / S / A;
+		float gy = bank_y(u);
+		if (gy > 1.0f)
+			continue;
+		float y0 = gy * S;
+		int p0 = (int)floorf(y0);
+		for (int py = p0 < 0 ? 0 : p0; py < c->h; py++) {
+			float dd = (py + 0.5f) / S - gy;
+			float cov = cr ? 1.0f : us_sat((py + 1.0f) - y0);
+			float v = sv * (1.0f - 0.45f * us_smooth(0.0f, 0.12f, dd)) * (1.0f + 0.12f * us_noise2(u * 40.0f, py / S * 60.0f));
+			if (cr) {
+				int iv = dith(v, px, py);
+				fpset(c, px, py, iv, 1.0f, dd < 0.012f ? US_MAT_ACCENT : US_MAT_WATER);
+			} else
+				fpset(c, px, py, (int)(v * 255.0f), cov, US_MAT_WATER);
+		}
+	}
+	/* the crest catches the aurora's light */
+	if (!cr) {
+		float px_ = 0, py_ = 0;
+		for (int i = 0; i <= 120; i++) {
+			float u = i / 120.0f, y = bank_y(u);
+			if (i > 0 && y < 1.0f && py_ < 1.0f)
+				rim(c, px_, py_, u * A, y, us_sat(0.18f + 0.5f * lit), US_MAT_LEAF);
+			px_ = u * A;
+			py_ = y;
+		}
+	}
+	/* snow-capped boulders, sedge tufts and dwarf birch on the bank */
+	static const float rocks[3][3] = {{0.05f, 0.03f, 0.015f}, {0.3f, 0.02f, 0.012f}, {0.4f, 0.016f, 0.01f}};
+	for (int q = 0; q < 3; q++) {
+		float u = rocks[q][0], x = u * A, y = bank_y(u) + 0.012f, rw = rocks[q][1], rh = rocks[q][2];
+		float rp[2 * 10];
+		for (int i = 0; i < 10; i++) {
+			float t = US_PI * i / 9.0f;
+			rp[2 * i] = x - cosf(t) * rw;
+			rp[2 * i + 1] = y - sinf(t) * rh * (1.0f + 0.15f * sinf(i * 2.1f + q));
+		}
+		fpoly(c, rp, 10, 9.0f, cr ? 0.12f : 0.025f, US_MAT_EARTH);
+		float cp[2 * 8];
+		for (int i = 0; i < 8; i++) {
+			float t = US_PI * (0.12f + 0.76f * i / 7.0f);
+			cp[2 * i] = x - cosf(t) * rw * 0.85f;
+			cp[2 * i + 1] = y - sinf(t) * rh * 1.08f - 0.002f;
+		}
+		cp[0] = x - rw * 0.8f;
+		cp[1] = y - rh * 0.45f;
+		cp[14] = x + rw * 0.8f;
+		cp[15] = y - rh * 0.45f;
+		fpoly(c, cp, 8, 9.0f, us_sat(sv * 1.9f + 0.05f), US_MAT_ACCENT);
+	}
+	float t = (float)ctx->t, wind = ctx->w->wind;
+	s->rime_gl *= expf(-ctx->real_dt / 0.1f);
+	if (ctx->a->hat_hit)
+		s->rime_gl = us_sat(0.5f + 0.7f * ctx->a->hat);
+	static const float shrubs[5] = {0.12f, 0.22f, 0.345f, 0.88f, 0.975f};
+	for (int q = 0; q < 5; q++) {
+		float u = shrubs[q], x = u * A, y = bank_y(u) + 0.003f;
+		float h = 0.022f + 0.008f * (q % 2);
+		float sway = 0.04f * wind * sinf(t * 1.2f + q) + 0.05f * s->snr;
+		/* dwarf birch: a few wiry, branching stems, reddish */
+		for (int b = 0; b < 4; b++) {
+			float aa = -0.6f + 0.4f * b + sway + 0.1f * sinf(q * 3.0f + b);
+			float x1 = x + sinf(aa) * h * 0.6f, y1 = y - cosf(aa) * h * 0.6f;
+			float x2 = x1 + sinf(aa * 1.4f) * h * 0.5f, y2 = y1 - cosf(aa * 1.4f) * h * 0.5f;
+			flimb(c, x, y, x1, y1, 0.0011f, 0.0008f, cr ? 0.2f : 0.16f, US_MAT_STEM);
+			flimb(c, x1, y1, x2, y2, 0.0008f, 0.0004f, cr ? 0.2f : 0.14f, US_MAT_STEM);
+			flimb(c, x1, y1, x1 + sinf(aa - 0.6f) * h * 0.3f, y1 - cosf(aa - 0.6f) * h * 0.3f, 0.0006f, 0.0003f, cr ? 0.2f : 0.12f, US_MAT_STEM);
+			/* rime on the twigs: it glints with the hats */
+			float gl = s->rime_gl * (0.4f + 0.6f * hash1(q * 4 + b, 7.0f));
+			us_point(c, x2, y2, cr ? 0.003f : 0.0009f + 0.0012f * gl, us_sat(0.22f + 0.3f * lit + 0.7f * gl), gl > 0.3f ? US_MAT_ACCENT : US_MAT_WATER);
+		}
+		/* a sedge tuft beside it */
+		for (int b = 0; b < 5; b++) {
+			float aa = -0.5f + 0.25f * b + sway * 1.5f;
+			flimb(c, x + 0.012f, y, x + 0.012f + sinf(aa) * h * 0.55f, y - cosf(aa) * h * 0.55f, 0.0007f, 0.0003f,
+			      cr ? 0.25f : 0.2f, US_MAT_LEAF);
+		}
+	}
+	(void)winter;
+	/* caribou (far ones first) */
+	int n = 2 + (ctx->p->density > 0.7f);
+	if (n > MAX_CARI)
+		n = MAX_CARI;
+	caribou_step(s, ctx, n);
+	for (int i = 0; i < n; i++)
+		if (s->ca[i].on)
+			caribou_draw(s, c, i, A, lit, s->lvl_env);
+	owl_fg(s, ctx, c, A, lit);
+	/* particles: kicked-up snow, breath */
+	float dt = ctx->real_dt;
+	for (int i = 0; i < MAX_FGP; i++) {
+		fgp_t *p = &s->fp[i];
+		if (p->life <= 0.0f)
+			continue;
+		p->life -= dt;
+		p->x += p->vx * dt;
+		p->y += p->vy * dt;
+		float f = us_sat(p->life / p->max);
+		if (p->kind == 0) {
+			p->vy += 0.6f * dt;
+			us_disc(c, p->x, p->y, p->r, p->v * f, US_MAT_ACCENT);
+		} else {
+			p->vx += 0.01f * wind * dt;
+			float rr = p->r * (1.0f + 1.5f * (1.0f - f));
+			us_disc(c, p->x, p->y, rr, p->v * f * (cr ? 1.2f : 1.0f), US_MAT_WATER);
 		}
 	}
 }
@@ -1229,6 +1817,14 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 			wline_(c, ctx->crisp, p[2 * bk] * A, p[2 * bk + 1], p[2 * bk] * A + 0.01f, p[2 * bk + 1] + (i & 2 ? 0.008f : -0.006f),
 			       v * 0.7f, US_MAT_WATER);
 		}
+	}
+	/* ---- the near shore: tundra bank, caribou, the owl on its snag ---- */
+	{
+		float lit = 0.0f;
+		for (int g = 0; g < 64; g++)
+			lit += glow[g];
+		lit = us_sat(lit / 64.0f * strength * 0.8f);
+		foreground(s, ctx, c, day, lit, winter);
 	}
 }
 
