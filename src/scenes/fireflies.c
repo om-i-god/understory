@@ -99,6 +99,38 @@ typedef struct {
 	float dv, dsz, dba, dpw, dvis, dpart, dtwk, dbs, dlant;
 } fly_t;
 
+/* lily pads on the near half of the pool (x fraction of width) */
+typedef struct {
+	float x, y, rx, ry, notch, ph, bob;
+	int flower;
+} pad_t;
+
+/* a frog sitting on a lily pad: kicks puff its vocal sac, a hard snare makes it leap to another pad */
+typedef struct {
+	int pad, to;          /* the pad it sits on / is leaping to */
+	float face;           /* +1 faces right */
+	float sac, sac_tgt;   /* vocal sac inflation */
+	float hop;            /* 0..1 progress of a leap, <0 sitting */
+	float hx0, hy0;       /* where the leap started */
+	float blink, blink_t, cool, call_t, glint;
+	int calls;            /* puffs left in a self-paced chorus (in quiet) */
+} frog_t;
+
+/* a bat hawking insects against the sky */
+typedef struct {
+	float x, y, vx, vy, ph, tt, tx, ty, on, dart;
+} bat_t;
+
+/* a deer at the foot of the wood, drinking at the far shore */
+typedef struct {
+	float xf, dir, head, head_tgt, state_t, legph, tail, ear, alert;
+	int state; /* 0 graze, 1 look, 2 walk */
+} deer_t;
+
+#define NPAD 7
+#define NFROG 2
+#define NBAT 3
+
 typedef struct {
 	us_rng rng;
 	int inited;
@@ -160,6 +192,14 @@ typedef struct {
 	float lf_x[NLEAF], lf_y[NLEAF], lf_a[NLEAF], lf_l[NLEAF];
 	uint8_t lf_hid[NLEAF]; /* buried inside the canopy silhouette: nothing to draw */
 	int lf_n;
+	/* the pond's inhabitants (their own RNG, so the swarm's sequence is untouched) */
+	us_rng rng2;
+	int life_init;
+	pad_t pad[NPAD];
+	frog_t frog[NFROG];
+	bat_t bat[NBAT];
+	deer_t deer;
+	unsigned kick_n;
 } st_t;
 
 static void free_cache(st_t *s)
@@ -181,6 +221,7 @@ static void *create(uint32_t seed)
 {
 	st_t *s = calloc(1, sizeof(*s));
 	us_rng_seed(&s->rng, seed ^ 0x66697265u);
+	us_rng_seed(&s->rng2, seed ^ 0x706f6e64u);
 	return s;
 }
 
@@ -1071,6 +1112,598 @@ static void spawn_fly(st_t *st, fly_t *f, float A, float life0)
 	}
 }
 
+/* ================= the pond's inhabitants: lily pads + frogs, bats, a deer at the wood's foot ================= */
+
+/* fill a small polygon (a silhouette) toward `tone`: ink moves to the tone by its coverage (4 sub-rows in Ink, a hard
+ * centre test on pixel canvases), so a dark shape knocks the sky / water out behind it */
+static void poly_fill(us_canvas *c, const float *xy, int n, float tone, uint8_t m)
+{
+	float x0 = 1e9f, x1 = -1e9f, y0 = 1e9f, y1 = -1e9f;
+	for (int k = 0; k < n; k++) {
+		float x = xy[2 * k] * c->s, y = xy[2 * k + 1] * c->s;
+		x0 = fminf(x0, x), x1 = fmaxf(x1, x), y0 = fminf(y0, y), y1 = fmaxf(y1, y);
+	}
+	int px0 = (int)floorf(x0), px1 = (int)ceilf(x1) + 1, py0 = (int)floorf(y0), py1 = (int)ceilf(y1) + 1;
+	if (px0 < 0)
+		px0 = 0;
+	if (py0 < 0)
+		py0 = 0;
+	if (px1 > c->w)
+		px1 = c->w;
+	if (py1 > c->h)
+		py1 = c->h;
+	if (px1 <= px0 || py1 <= py0 || px1 - px0 > 512 || n > 40)
+		return;
+	float acc[513];
+	int S = c->crisp ? 1 : 4;
+	float tv = tone * 255.0f;
+	for (int py = py0; py < py1; py++) {
+		int any = 0;
+		memset(acc, 0, sizeof(float) * (size_t)(px1 - px0 + 1));
+		for (int s = 0; s < S; s++) {
+			float sy = py + (s + 0.5f) / S;
+			float xs[40];
+			int nx = 0;
+			for (int k = 0; k < n; k++) {
+				int k1 = (k + 1) % n;
+				float ay = xy[2 * k + 1] * c->s, by = xy[2 * k1 + 1] * c->s;
+				if ((ay <= sy) != (by <= sy)) {
+					float ax = xy[2 * k] * c->s, bx = xy[2 * k1] * c->s;
+					xs[nx++] = ax + (sy - ay) / (by - ay) * (bx - ax);
+				}
+			}
+			for (int i = 1; i < nx; i++) /* insertion sort: a handful of crossings */
+				for (int j = i; j > 0 && xs[j - 1] > xs[j]; j--) {
+					float tmp = xs[j];
+					xs[j] = xs[j - 1], xs[j - 1] = tmp;
+				}
+			for (int q = 0; q + 1 < nx; q += 2) {
+				float xa = fmaxf(xs[q], (float)px0), xb = fminf(xs[q + 1], (float)px1);
+				if (xb <= xa)
+					continue;
+				any = 1;
+				if (c->crisp) {
+					for (int i = (int)ceilf(xa - 0.5f); i + 0.5f < xb && i < px1; i++)
+						acc[i - px0] += 1.0f;
+				} else {
+					for (int i = (int)floorf(xa); i <= (int)floorf(xb) && i < px1; i++) {
+						float cv = fminf(xb, i + 1.0f) - fmaxf(xa, (float)i);
+						if (cv > 0)
+							acc[i - px0] += cv / S;
+					}
+				}
+			}
+		}
+		if (!any)
+			continue;
+		uint8_t *ink = c->ink + (size_t)py * c->w, *mat = c->mat + (size_t)py * c->w;
+		for (int i = px0; i < px1; i++) {
+			float cv = fminf(acc[i - px0], 1.0f);
+			if (cv <= 0.01f || (c->crisp && cv < 0.5f))
+				continue;
+			float v = ink[i] + (tv - ink[i]) * cv;
+			ink[i] = (uint8_t)(v < 0 ? 0 : v > 255 ? 255 : v + 0.5f);
+			if (cv > 0.5f)
+				mat[i] = m;
+		}
+	}
+}
+
+/* the lit outline of a silhouette: edges facing up catch the moon (vtop), the underside stays dim (vbot) */
+static void rim_poly(us_canvas *c, const float *xy, int n, float vtop, float vbot, uint8_t m)
+{
+	float a2 = 0;
+	for (int k = 0; k < n; k++) {
+		int k1 = (k + 1) % n;
+		a2 += xy[2 * k] * xy[2 * k1 + 1] - xy[2 * k1] * xy[2 * k + 1];
+	}
+	float sg = a2 > 0 ? 1.0f : -1.0f;
+	for (int k = 0; k < n; k++) {
+		int k1 = (k + 1) % n;
+		float dx = xy[2 * k1] - xy[2 * k], dy = xy[2 * k1 + 1] - xy[2 * k + 1];
+		float l = sqrtf(dx * dx + dy * dy) + 1e-7f;
+		float ny = -sg * dx / l; /* outward normal's y */
+		float v = us_lerp(vbot, vtop, us_sat(0.5f - 0.7f * ny));
+		if (v > 0.01f)
+			wline(c, xy[2 * k], xy[2 * k + 1], xy[2 * k1], xy[2 * k1 + 1], v, m);
+	}
+}
+
+/* a thin dark limb (a leg) as a filled quad, at least a pixel across */
+static void sil_seg(us_canvas *c, float ax, float ay, float bx, float by, float r, float tone, uint8_t m)
+{
+	float dx = bx - ax, dy = by - ay, l = sqrtf(dx * dx + dy * dy) + 1e-7f;
+	float rr = fmaxf(r, (c->crisp ? 0.5f : 0.55f) / c->s);
+	float ox = -dy / l * rr, oy = dx / l * rr;
+	float q[8] = {ax + ox, ay + oy, bx + ox * 0.8f, by + oy * 0.8f, bx - ox * 0.8f, by - oy * 0.8f, ax - ox, ay - oy};
+	poly_fill(c, q, 4, tone, m);
+}
+
+static void life_setup(st_t *st)
+{
+	us_rng *r = &st->rng2;
+	/* lily pads: two loose rafts on the near half of the pool, where the water mirrors the sky */
+	int np = 0;
+	for (int tries = 0; tries < 400 && np < NPAD; tries++) {
+		int raft = np == 1 || np >= 5;
+		float cx = raft == 0 ? 0.40f : 0.66f;
+		float xf = cx + us_randn(r) * (raft == 0 ? 0.05f : 0.04f);
+		float d = np < 2 ? us_randr(r, 0.66f, 0.8f) : us_randr(r, 0.4f, 0.88f); /* the frogs' pads sit near */
+		float y = W0 + d * (POOL_Y - W0);
+		float rx = (0.010f + 0.026f * d) * (np < 2 ? 1.45f : us_randr(r, 0.7f, 1.05f));
+		float ry = rx * (0.2f + 0.12f * d);
+		if (y + ry > shore_at(xf) - 0.006f || xf < 0.3f || xf > 0.93f)
+			continue;
+		int clash = 0;
+		for (int k = 0; k < np; k++) {
+			float dx = (st->pad[k].x - xf) * 1.7778f, dy = (st->pad[k].y - y) * 3.5f;
+			if (dx * dx + dy * dy < (st->pad[k].rx + rx + 0.006f) * (st->pad[k].rx + rx + 0.006f))
+				clash = 1;
+		}
+		if (clash)
+			continue;
+		pad_t *p = &st->pad[np];
+		p->x = xf, p->y = y, p->rx = rx, p->ry = ry;
+		p->notch = us_randr(r, -0.6f, 0.6f) + (us_rand(r) < 0.5f ? 0.0f : US_PI);
+		p->ph = us_rand(r) * US_TAU;
+		p->flower = np == 3 || np == 6;
+		np++;
+	}
+	for (; np < NPAD; np++) { /* (never short in practice: fall back to a quiet spot) */
+		pad_t *p = &st->pad[np];
+		p->x = 0.5f + 0.05f * np, p->y = POOL_Y - 0.04f, p->rx = 0.012f, p->ry = 0.003f;
+		p->flower = 0;
+	}
+	for (int k = 0; k < NFROG; k++) {
+		frog_t *f = &st->frog[k];
+		f->pad = k;
+		f->hop = -1;
+		f->face = st->pad[k].x < 0.55f ? 1.0f : -1.0f; /* the two face each other across the water */
+		f->blink_t = us_randr(r, 2.0f, 6.0f);
+		f->call_t = us_randr(r, 2.0f, 8.0f);
+	}
+	for (int k = 0; k < NBAT; k++) {
+		st->bat[k].x = us_randr(r, 0.5f, 1.6f);
+		st->bat[k].y = 0.55f;
+		st->bat[k].ph = us_rand(r) * US_TAU;
+	}
+	st->deer.xf = us_randr(r, 0.5f, 0.6f);
+	st->deer.dir = us_rand(r) < 0.5f ? -1.0f : 1.0f;
+	st->deer.state_t = us_randr(r, 3.0f, 6.0f);
+	st->life_init = 1;
+}
+
+/* lily pads: dark leaves lying on the bright water, each with its notch and a rim catching the moon and the swarm */
+static void draw_pads(st_t *st, us_canvas *c, float A, float t, float glow, float LV, float winter)
+{
+	int crisp = c->crisp;
+	for (int k = 0; k < NPAD; k++) {
+		pad_t *p = &st->pad[k];
+		p->bob *= 0.92f;
+		float x = p->x * A, y = p->y + 0.0008f * sinf(t * 0.7f + p->ph) + 0.0025f * p->bob * sinf(t * 18.0f);
+		float rx = p->rx * (1.0f - 0.25f * winter), ry = p->ry * (1.0f - 0.25f * winter);
+		enum { NPP = 16 };
+		float pts[2 * (NPP + 1)];
+		for (int j = 0; j < NPP; j++) {
+			float an = p->notch + 0.3f + (US_TAU - 0.6f) * j / (NPP - 1);
+			float wv = 1.0f + 0.04f * sinf(an * 3.0f + p->ph);
+			pts[2 * j] = x + cosf(an) * rx * wv;
+			pts[2 * j + 1] = y + sinf(an) * ry * wv;
+		}
+		pts[2 * NPP] = x + cosf(p->notch) * rx * 0.08f; /* the notch reaches the centre */
+		pts[2 * NPP + 1] = y + sinf(p->notch) * ry * 0.08f;
+		poly_fill(c, pts, NPP + 1, crisp ? 0.1f : 0.035f, US_MAT_LEAF);
+		int gb = (int)(p->x * NGB);
+		float lit = st->gbin_s[gb < 0 ? 0 : (gb >= NGB ? NGB - 1 : gb)];
+		float rv = (crisp ? 0.26f : 0.2f) + 0.35f * lit + 0.15f * glow;
+		rim_poly(c, pts, NPP + 1, rv, rv * 0.35f, US_MAT_LEAF);
+		if (!crisp) /* veins */
+			for (int j = 1; j < 5; j++) {
+				float an = p->notch + 0.3f + (US_TAU - 0.6f) * j / 5.0f;
+				wline(c, pts[2 * NPP], pts[2 * NPP + 1], x + cosf(an) * rx * 0.8f, y + sinf(an) * ry * 0.8f, rv * 0.3f,
+				      US_MAT_LEAF);
+			}
+		if (p->flower && winter < 0.5f) {
+			/* a water lily: a pale cup that opens a little wider when the music is loud */
+			float fx = x + rx * 0.25f, fy = y - ry * 0.2f, fs = rx * 0.42f;
+			float open = 0.35f + 0.5f * LV;
+			float fv = (crisp ? 0.75f : 0.55f) + 0.3f * lit;
+			for (int j = -2; j <= 2; j++) {
+				float an = -US_PI * 0.5f + j * (0.32f + 0.22f * open);
+				float tx = fx + cosf(an) * fs * (1.0f + 0.2f * (j == 0)), ty = fy + sinf(an) * fs * (0.9f + 0.2f * open);
+				float bxl = fx + j * fs * 0.16f - fs * 0.14f, bxr = fx + j * fs * 0.16f + fs * 0.14f;
+				if (crisp)
+					us_tri(c, bxl, fy, bxr, fy, tx, ty, fv * (1.0f - 0.15f * abs(j)), US_MAT_BLOOM);
+				else {
+					wline(c, bxl, fy, tx, ty, fv * (1.0f - 0.12f * abs(j)), US_MAT_BLOOM);
+					wline(c, bxr, fy, tx, ty, fv * (1.0f - 0.12f * abs(j)), US_MAT_BLOOM);
+				}
+			}
+			us_point(c, fx, fy - fs * 0.15f, crisp ? 0.003f : 0.0012f, 0.8f, US_MAT_LIGHT);
+		}
+	}
+}
+
+/* frog outlines in frog units (x forward, y down, 0 = the pad): sitting, and stretched out in a leap */
+static const float FROG_SIT[16][2] = {{1.0f, -0.42f}, {0.85f, -0.58f}, {0.72f, -0.70f}, {0.56f, -0.86f}, {0.40f, -0.72f},
+				      {0.20f, -0.62f}, {-0.25f, -0.58f}, {-0.65f, -0.44f}, {-0.86f, -0.18f}, {-0.72f, 0.0f},
+				      {0.15f, 0.0f},   {0.10f, -0.10f},  {0.36f, -0.04f}, {0.62f, 0.0f},   {0.62f, -0.2f},
+				      {0.86f, -0.30f}};
+static const float FROG_LEAP[16][2] = {{1.15f, -0.40f}, {1.0f, -0.52f},  {0.84f, -0.62f}, {0.70f, -0.74f}, {0.56f, -0.62f},
+				       {0.35f, -0.55f}, {-0.15f, -0.50f}, {-0.6f, -0.40f}, {-1.2f, -0.26f},  {-1.8f, -0.12f},
+				       {-1.2f, -0.12f}, {-0.3f, -0.18f},  {0.55f, -0.14f}, {1.0f, -0.04f},  {0.78f, -0.20f},
+				       {1.02f, -0.30f}};
+
+static void frog_xy(const frog_t *f, float ox, float oy, float u, float s, float ang, float px, float py, float *X, float *Y)
+{
+	(void)f;
+	float ca = cosf(ang), sa = sinf(ang);
+	float lx = px * f->face * u, ly = py * u;
+	(void)s;
+	*X = ox + lx * ca - ly * sa;
+	*Y = oy + lx * sa + ly * ca;
+}
+
+static void frogs(st_t *st, const us_ctx *ctx, us_canvas *c, float A, float t, float LV, float night, float winter)
+{
+	const us_audio *a = ctx->a;
+	us_rng *r = &st->rng2;
+	float rdt = ctx->real_dt, dt = ctx->dt;
+	int crisp = c->crisp;
+	if (winter > 0.65f) /* asleep in the mud */
+		return;
+	/* kicks: the frogs call in turn (call and response); a hard kick sets both off */
+	if (a->kick_hit) {
+		st->kick_n++;
+		float amp = 0.55f + 0.45f * us_sat(a->kick);
+		frog_t *f = &st->frog[st->kick_n % NFROG];
+		if (f->hop < 0)
+			f->sac_tgt = fmaxf(f->sac_tgt, amp);
+		if (a->kick > 0.8f && st->frog[(st->kick_n + 1) % NFROG].hop < 0)
+			st->frog[(st->kick_n + 1) % NFROG].sac_tgt = fmaxf(st->frog[(st->kick_n + 1) % NFROG].sac_tgt, amp * 0.7f);
+	}
+	for (int k = 0; k < NFROG; k++) {
+		frog_t *f = &st->frog[k];
+		/* in quiet passages they keep up their own slow chorus: a bout of a few croaks now and then */
+		f->call_t -= dt;
+		if (f->call_t <= 0) {
+			if (f->calls > 0) {
+				f->calls--;
+				if (f->hop < 0)
+					f->sac_tgt = fmaxf(f->sac_tgt, 0.55f);
+				f->call_t = f->calls > 0 ? us_randr(r, 0.38f, 0.5f) : us_randr(r, 5.0f, 12.0f);
+			} else {
+				f->calls = a->active > 0.5f && st->drive > 0.2f ? 0 : 2 + (int)(us_rand(r) * 3.0f);
+				f->call_t = f->calls > 0 ? 0.05f : us_randr(r, 3.0f, 6.0f);
+			}
+		}
+		f->sac = us_approach(f->sac, f->sac_tgt, f->sac_tgt > f->sac ? 0.035f : 0.09f, rdt);
+		f->sac_tgt = us_approach(f->sac_tgt, 0.0f, 0.1f, rdt);
+		/* hats: a glint in the eye */
+		if (a->hat_hit && us_rand(r) < 0.7f)
+			f->glint = fmaxf(f->glint, 0.4f + 0.6f * us_sat(a->hat));
+		f->glint *= expf(-rdt / 0.07f);
+		f->blink_t -= dt;
+		if (f->blink_t <= 0) {
+			f->blink = 1.0f;
+			f->blink_t = us_randr(r, 2.5f, 7.0f);
+		}
+		f->blink = us_approach(f->blink, 0.0f, 0.06f, dt);
+		/* a hard snare startles one: it leaps to another free pad (or, now and then, it just moves) */
+		f->cool -= dt;
+		int go = f->hop < 0 && f->cool <= 0 &&
+			 ((a->snare_hit && a->snare > 0.45f && us_rand(r) < 0.4f) || us_rand(r) < dt * 0.02f);
+		if (go) {
+			int best = -1;
+			float bd = 1e9f;
+			for (int j = 0; j < NPAD; j++) {
+				int used = 0;
+				for (int q = 0; q < NFROG; q++)
+					if (st->frog[q].pad == j || (st->frog[q].hop >= 0 && st->frog[q].to == j))
+						used = 1;
+				if (used || st->pad[j].rx < 0.016f)
+					continue;
+				float dx = (st->pad[j].x - st->pad[f->pad].x) * A, dy = st->pad[j].y - st->pad[f->pad].y;
+				float d = sqrtf(dx * dx + dy * dy) + 0.05f * us_rand(r);
+				if (d < bd && d < 0.35f)
+					bd = d, best = j;
+			}
+			if (best >= 0) {
+				f->to = best;
+				f->hop = 0;
+				f->hx0 = st->pad[f->pad].x * A;
+				f->hy0 = st->pad[f->pad].y;
+				f->face = st->pad[best].x > st->pad[f->pad].x ? 1.0f : -1.0f;
+				f->sac = f->sac_tgt = 0;
+				st->pad[f->pad].bob = 1.0f;
+			}
+			f->cool = us_randr(r, 3.0f, 7.0f);
+		}
+		/* where it is, and its pose */
+		const pad_t *p = &st->pad[f->hop >= 0 ? f->to : f->pad];
+		const pad_t *p0 = &st->pad[f->pad];
+		float u = us_clampf(p0->rx * 0.72f, 0.018f, 0.031f);
+		float ox, oy, s = 0, ang = 0;
+		if (f->hop >= 0) {
+			f->hop += dt / 0.55f;
+			float h = us_sat(f->hop);
+			float tx = p->x * A, ty = p->y;
+			float dx = tx - f->hx0, dist = fabsf(dx) + fabsf(ty - f->hy0);
+			ox = f->hx0 + dx * h;
+			oy = us_lerp(f->hy0, ty, h) - (0.03f + 0.25f * dist) * 4.0f * h * (1.0f - h);
+			s = us_smooth(0.0f, 0.18f, h) * us_smooth(1.0f, 0.78f, h);
+			ang = f->face * (h - 0.45f) * 0.9f * s;
+			if (f->hop >= 1.0f) {
+				f->hop = -1;
+				f->pad = f->to;
+				st->pad[f->pad].bob = 1.0f;
+				p0 = &st->pad[f->pad];
+				ox = p0->x * A, oy = p0->y;
+				s = 0, ang = 0;
+				/* the landing rocks the pad and rings the water */
+				for (int q = 0; q < NPR; q++)
+					if (st->pr_age[q] < 0) {
+						st->pr_age[q] = 0;
+						st->pr_x[q] = ox;
+						st->pr_y[q] = oy + 0.002f;
+						st->pr_amp[q] = 0.8f;
+						break;
+					}
+			}
+		} else {
+			ox = p0->x * A - f->face * p0->rx * 0.15f;
+			oy = p0->y + p0->ry * 0.15f + 0.0025f * p0->bob * sinf(t * 18.0f);
+		}
+		/* outline: lerp sit -> leap */
+		float pts[32];
+		for (int q = 0; q < 16; q++) {
+			float px = us_lerp(FROG_SIT[q][0], FROG_LEAP[q][0], s), py = us_lerp(FROG_SIT[q][1], FROG_LEAP[q][1], s);
+			if (q == 14) /* the throat swells with the call */
+				py += 0.12f * f->sac;
+			frog_xy(f, ox, oy, u, s, ang, px, py, &pts[2 * q], &pts[2 * q + 1]);
+		}
+		int gb = (int)(ox / A * NGB);
+		float lit = st->gbin_s[gb < 0 ? 0 : (gb >= NGB ? NGB - 1 : gb)];
+		poly_fill(c, pts, 16, crisp ? 0.5f : 0.075f, US_MAT_LEAF);
+		float rv = (crisp ? 0.75f : 0.42f) + 0.4f * lit + 0.1f * night;
+		rim_poly(c, pts, 16, rv, rv * 0.3f, US_MAT_LEAF);
+		float ex, ey; /* the eye, high on the head */
+		frog_xy(f, ox, oy, u, s, ang, us_lerp(0.56f, 0.70f, s), us_lerp(-0.72f, -0.62f, s), &ex, &ey);
+		if (!crisp && s < 0.3f) { /* the folded hind leg, engraved inside the silhouette */
+			float hx, hy, kx, ky, ax2, ay2;
+			frog_xy(f, ox, oy, u, s, ang, -0.5f, -0.36f, &hx, &hy);
+			frog_xy(f, ox, oy, u, s, ang, 0.02f, -0.22f, &kx, &ky);
+			frog_xy(f, ox, oy, u, s, ang, -0.55f, -0.05f, &ax2, &ay2);
+			wline(c, hx, hy, kx, ky, rv * 0.45f, US_MAT_LEAF);
+			wline(c, kx, ky, ax2, ay2, rv * 0.4f, US_MAT_LEAF);
+		}
+		float eb = (0.3f + 0.5f * night) * (1.0f - f->blink) + 0.9f * f->glint;
+		if (crisp)
+			us_put(c, (int)(ex * c->s), (int)(ey * c->s), us_sat(0.45f + eb), US_MAT_LIGHT);
+		else {
+			us_ring(c, ex, ey, u * 0.14f, 0.0008f, rv * 0.8f, US_MAT_LEAF);
+			us_point(c, ex + f->face * u * 0.03f, ey, 0.0009f, us_sat(eb), US_MAT_LIGHT);
+		}
+		/* the vocal sac: a pale bubble under the chin, and the call trembling the water round the pad */
+		if (f->sac > 0.04f && f->hop < 0) {
+			float sx, sy;
+			frog_xy(f, ox, oy, u, 0, 0, 0.7f + 0.12f * f->sac, -0.2f + 0.02f * f->sac, &sx, &sy);
+			float sr = u * (0.08f + 0.36f * f->sac);
+			float sv = us_sat(0.35f + 0.6f * f->sac);
+			if (crisp)
+				us_disc(c, sx, sy, fmaxf(sr, 0.7f / c->s), sv, US_MAT_ACCENT);
+			else {
+				us_disc(c, sx, sy, sr, 0.25f * sv, US_MAT_ACCENT);
+				us_ring(c, sx, sy, sr, 0.0009f, sv, US_MAT_ACCENT);
+				us_point(c, sx - sr * 0.3f, sy - sr * 0.35f, 0.0008f, sv, US_MAT_ACCENT);
+			}
+			float wr = p0->rx * (1.05f + 0.6f * (1.0f - f->sac));
+			hellipse(c, p0->x * A, p0->y, wr, wr * p0->ry / p0->rx, (crisp ? 0.2f : 0.14f) * f->sac * (0.6f + 0.6f * LV), US_MAT_WATER);
+		}
+	}
+}
+
+/* bats hawking insects against the sky: erratic, quick turns; a hat makes one dart at a moth */
+static void bats(st_t *st, const us_ctx *ctx, us_canvas *c, float A, float LV, float night, float winter)
+{
+	const us_audio *a = ctx->a;
+	us_rng *r = &st->rng2;
+	float dt = ctx->dt;
+	int crisp = c->crisp;
+	int nb = 1 + (int)(ctx->p->density * 1.4f + ctx->w->insects * 1.2f + 0.3f);
+	if (nb > NBAT)
+		nb = NBAT;
+	int out = night > 0.45f && winter < 0.6f;
+	for (int k = 0; k < NBAT; k++) {
+		bat_t *b = &st->bat[k];
+		int want = out && k < nb;
+		float xf = us_clampf(b->x / A, 0.0f, 1.0f);
+		float tops = tree_at(st, xf);
+		if (!want && b->on <= 0.0f)
+			continue;
+		if (want && b->on <= 0.0f) { /* out of the trees */
+			b->x = us_randr(r, 0.45f, 0.95f) * A;
+			b->y = tree_at(st, b->x / A) + 0.01f;
+			b->vx = b->vy = 0;
+			b->tt = 0;
+		}
+		b->on = us_sat(b->on + dt * (want ? 0.6f : -0.5f));
+		b->tt -= dt;
+		if (b->tt <= 0) {
+			b->tx = us_randr(r, 0.42f, 0.97f) * A;
+			b->ty = us_randr(r, 0.2f, 0.5f);
+			b->tt = us_randr(r, 0.3f, 1.3f) / (0.8f + 0.7f * LV);
+		}
+		if (a->hat_hit && us_rand(r) < 0.45f) { /* a snap at an insect: sharp turn, burst of speed */
+			float an = us_rand(r) * US_TAU;
+			b->tx = us_clampf(b->x + cosf(an) * 0.1f, 0.4f * A, 0.98f * A);
+			b->ty = us_clampf(b->y + sinf(an) * 0.07f, 0.16f, 0.52f);
+			b->tt = 0.35f;
+			b->dart = 1.0f;
+		}
+		float ty = b->ty;
+		if (!want) /* home to roost: down into the wood */
+			ty = tops + 0.03f;
+		ty = fminf(ty, tops - 0.025f + (want ? 0.0f : 0.06f));
+		float dx = b->tx - b->x, dy = ty - b->y, d = sqrtf(dx * dx + dy * dy) + 1e-5f;
+		float spd = (0.16f + 0.12f * LV) * (1.0f + 0.9f * b->dart);
+		b->vx = us_approach(b->vx, dx / d * spd, 0.13f, dt);
+		b->vy = us_approach(b->vy, dy / d * spd, 0.13f, dt);
+		b->dart *= expf(-dt / 0.3f);
+		b->x += b->vx * dt;
+		b->y += b->vy * dt + 0.006f * sinf(b->ph * 0.5f) * dt;
+		b->ph += dt * US_TAU * (6.5f + 2.5f * LV + 2.0f * b->dart);
+		if (b->on < 0.02f)
+			continue;
+		/* silhouette (seen from below): ears, body, two scalloped wings whose tips beat up and down */
+		float fl = sinf(b->ph);
+		float u = crisp ? 0.019f : 0.016f;
+		float bank = us_clampf(b->vx * 2.2f, -0.45f, 0.45f), ca = cosf(bank), sa = sinf(bank);
+		static const float WING[8][3] = {/* x, y, how much it moves with the beat */
+						 {0.09f, -0.14f, 0.0f}, {0.5f, -0.30f, 0.5f}, {1.0f, -0.06f, 0.85f}, {0.78f, 0.10f, 0.6f},
+						 {0.62f, 0.02f, 0.45f}, {0.5f, 0.18f, 0.35f}, {0.32f, 0.08f, 0.2f}, {0.16f, 0.20f, 0.08f}};
+		float pts[2 * 23];
+		int n = 0;
+#define BATP(X, Y)                                                    \
+	do {                                                          \
+		float _x = (X) * u, _y = (Y) * u;                         \
+		pts[2 * n] = b->x + _x * ca - _y * sa;                    \
+		pts[2 * n + 1] = b->y + _x * sa + _y * ca;                \
+		n++;                                                      \
+	} while (0)
+		BATP(-0.075f, -0.40f);
+		BATP(0.0f, -0.25f);
+		BATP(0.075f, -0.40f);
+		for (int q = 0; q < 8; q++)
+			BATP(WING[q][0] * (1.0f - 0.25f * fabsf(fl) * WING[q][2]), WING[q][1] - 0.8f * fl * WING[q][2]);
+		BATP(0.06f, 0.24f);
+		BATP(0.0f, 0.32f);
+		BATP(-0.06f, 0.24f);
+		for (int q = 7; q >= 0; q--)
+			BATP(-WING[q][0] * (1.0f - 0.25f * fabsf(fl) * WING[q][2]), WING[q][1] - 0.8f * fl * WING[q][2]);
+#undef BATP
+		float vis = b->on;
+		poly_fill(c, pts, n, crisp ? 0.04f : 0.0f, US_MAT_EARTH);
+		if (!crisp)
+			rim_poly(c, pts, n, 0.2f * vis * (0.6f + 0.4f * night), 0.07f * vis, US_MAT_ACCENT);
+	}
+}
+
+/* the deer at the far shore: grazes and drinks, looks up, wanders a few steps; a snare startles it (head snaps up,
+ * the white tail flags), a kick flicks an ear */
+static void deer(st_t *st, const us_ctx *ctx, us_canvas *c, float A, float night)
+{
+	const us_audio *a = ctx->a;
+	us_rng *r = &st->rng2;
+	deer_t *d = &st->deer;
+	float dt = ctx->dt, rdt = ctx->real_dt;
+	int crisp = c->crisp;
+	d->state_t -= dt;
+	if (d->state_t <= 0 && d->alert < 0.3f) {
+		float q = us_rand(r);
+		d->state = q < 0.5f ? 0 : q < 0.75f ? 1 : 2;
+		d->state_t = d->state == 0 ? us_randr(r, 4.0f, 9.0f) : d->state == 1 ? us_randr(r, 1.5f, 3.5f) : us_randr(r, 2.0f, 5.0f);
+		if (d->state == 2 && us_rand(r) < 0.4f)
+			d->dir = -d->dir;
+	}
+	if (a->snare_hit && a->snare > 0.35f) {
+		if (d->alert < 0.5f)
+			d->state = 1, d->state_t = us_randr(r, 2.0f, 4.0f);
+		d->alert = 1.0f;
+	}
+	d->alert = us_sat(d->alert - dt / 3.0f);
+	if (a->kick_hit)
+		d->ear = 1.0f;
+	d->ear *= expf(-rdt / 0.12f);
+	d->head_tgt = d->alert > 0.05f ? 1.0f : d->state == 0 ? 0.0f : d->state == 1 ? 0.85f : 0.55f;
+	d->head = us_approach(d->head, d->head_tgt, d->head_tgt > d->head && d->alert > 0.5f ? 0.07f : 0.5f, dt);
+	d->tail = us_approach(d->tail, d->alert > 0.2f ? 1.0f : 0.0f, d->alert > 0.2f ? 0.05f : 0.6f, dt);
+	if (d->state == 2 && d->alert < 0.05f) {
+		d->xf += d->dir * 0.008f * dt / A;
+		d->legph += dt * 5.0f;
+		if ((d->xf > 0.66f && d->dir > 0) || (d->xf < 0.46f && d->dir < 0))
+			d->dir = -d->dir;
+	}
+	float u = crisp ? 0.016f : 0.0115f, s = d->dir;
+	float bx = d->xf * A, gy = W0 + 0.0015f;
+#define DP(X, Y, OX, OY) do { (OX) = bx + s * (X) * u; (OY) = gy + (Y) * u; } while (0)
+	float tone = crisp ? 0.03f : 0.004f;
+	uint8_t m = US_MAT_EARTH;
+	/* legs (walking swings them; the hind legs bend at the hock) */
+	{
+		static const float LEG[4][2] = {{0.72f, 0.0f}, {0.52f, 1.6f}, {-0.78f, 3.1f}, {-0.98f, 4.7f}};
+		for (int k = 0; k < 4; k++) {
+			float sw = d->state == 2 && d->alert < 0.05f ? 0.28f * sinf(d->legph + LEG[k][1]) : 0.0f;
+			float x0, y0, x1, y1, x2, y2;
+			DP(LEG[k][0], -1.25f, x0, y0);
+			if (k >= 2) {
+				DP(LEG[k][0] - 0.2f + 0.5f * sw, -0.62f, x1, y1);
+				DP(LEG[k][0] + 0.05f + sw, 0.0f, x2, y2);
+			} else {
+				DP(LEG[k][0] + 0.5f * sw, -0.62f, x1, y1);
+				DP(LEG[k][0] + sw, 0.0f, x2, y2);
+			}
+			sil_seg(c, x0, y0, x1, y1, 0.11f * u, tone, m);
+			sil_seg(c, x1, y1, x2, y2, 0.08f * u, tone, m);
+		}
+	}
+	/* body: a barrel, deeper at the chest, a rounded rump */
+	float pts[2 * 14];
+	for (int k = 0; k < 14; k++) {
+		float an = US_TAU * k / 14.0f, cx = cosf(an), sy = sinf(an);
+		float ry = 0.46f * (sy > 0 ? (cx > 0 ? 1.15f : 0.95f) : 1.0f);
+		DP(1.15f * cx, -1.6f + ry * sy, pts[2 * k], pts[2 * k + 1]);
+	}
+	poly_fill(c, pts, 14, tone, m);
+	/* neck + head: low to the water when drinking, up and still when alert */
+	float na = us_lerp(1.05f, -1.15f, d->head); /* neck angle (down-forward .. up-forward) */
+	float hx = 0.85f + cosf(na) * 1.35f, hy = -1.78f + sinf(na) * 1.35f;
+	float ma = us_lerp(1.45f, 0.55f, d->head); /* muzzle direction */
+	float mx = hx + cosf(ma) * 0.62f, my = hy + sinf(ma) * 0.62f;
+	{
+		float pa = na + US_PI * 0.5f, ca2 = cosf(pa), sa2 = sinf(pa);
+		float q[12];
+		DP(0.55f - 0.25f, -1.95f, q[0], q[1]);
+		DP(1.05f + 0.32f * ca2, -1.6f + 0.32f * sa2, q[2], q[3]);
+		DP(hx + 0.12f * ca2, hy + 0.12f * sa2, q[4], q[5]);
+		DP(mx, my, q[6], q[7]);
+		DP(hx - 0.2f * ca2, hy - 0.2f * sa2, q[8], q[9]);
+		DP(0.85f - 0.2f * ca2, -1.95f - 0.15f, q[10], q[11]);
+		poly_fill(c, q, 6, tone, m);
+		if (!crisp)
+			rim_poly(c, q, 6, 0.1f + 0.06f * night, 0.0f, US_MAT_ACCENT);
+	}
+	/* ears: up and forward when alert; a kick flicks one */
+	for (int k = 0; k < 2; k++) {
+		float ea = us_lerp(-2.6f, -1.75f, d->head) + (k ? 0.35f : 0.0f) - (k == 0 ? 0.6f * d->ear : 0.0f);
+		float ex0, ey0, ex1, ey1;
+		DP(hx - 0.05f, hy - 0.05f, ex0, ey0);
+		DP(hx + cosf(ea) * 0.5f, hy + sinf(ea) * 0.5f, ex1, ey1);
+		sil_seg(c, ex0, ey0, ex1, ey1, 0.09f * u, tone, m);
+		if (!crisp)
+			wline(c, ex0, ey0, ex1, ey1, 0.08f + 0.06f * night, US_MAT_ACCENT);
+	}
+	/* tail: hangs; flagged up white in alarm */
+	{
+		float t0x, t0y, t1x, t1y;
+		DP(-1.12f, -1.82f, t0x, t0y);
+		DP(us_lerp(-1.32f, -1.38f, d->tail), us_lerp(-1.48f, -2.3f, d->tail), t1x, t1y);
+		sil_seg(c, t0x, t0y, t1x, t1y, 0.12f * u, tone, m);
+		if (d->tail > 0.1f) {
+			float wv = (crisp ? 0.85f : 0.6f) * d->tail;
+			if (crisp)
+				us_put(c, (int)(t1x * c->s), (int)(t1y * c->s), wv, US_MAT_ACCENT);
+			else {
+				wline(c, t0x, t0y, t1x, t1y, wv, US_MAT_ACCENT);
+				us_point(c, t1x, t1y, 0.0012f, wv, US_MAT_ACCENT);
+			}
+		}
+	}
+	if (!crisp)
+		rim_poly(c, pts, 14, 0.1f + 0.06f * night, 0.0f, US_MAT_ACCENT);
+#undef DP
+}
+
 static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 {
 	st_t *st = sp;
@@ -1178,6 +1811,8 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 		st->beat_iv = 0.5f;
 		st->inited = 1;
 	}
+	if (!st->life_init)
+		life_setup(st);
 
 	st->since_beat += rdt;
 	if (a->beat) {
@@ -1612,6 +2247,9 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 			}
 	}
 
+	/* bats hawking over the pond against the sky */
+	bats(st, ctx, c, A, LV, night, winter);
+
 	/* ================= fireflies: simulate ================= */
 	float gl_sum = 0;
 	st->hist_acc += dt;
@@ -1812,6 +2450,9 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 			  st->bd_ok ? st->bd_mat : NULL);
 	}
 
+	/* a deer at the wood's foot, a dark shape against the mist */
+	deer(st, ctx, c, A, night);
+
 
 	/* ================= the pond: still water, ripples, rising fish, the moon path ================= */
 	{
@@ -1904,6 +2545,11 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 	for (int i = 0; i < MAXF; i++)
 		if (st->f[i].state)
 			draw_refl(c, &st->f[i], t);
+	c->blend = US_BLEND_MAX;
+	/* lily pads, and the frogs on them */
+	draw_pads(st, c, A, t, st->glow, LV, winter);
+	frogs(st, ctx, c, A, t, LV, night, winter);
+	c->blend = US_BLEND_ADD;
 	for (int i = 0; i < MAXF; i++)
 		if (st->f[i].state && st->f[i].z < 0.55f)
 			draw_fly(c, &st->f[i], trail_k, aamp);

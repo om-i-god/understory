@@ -176,6 +176,32 @@ typedef struct {
 	float xf, y, vy, life;
 } crumb_t;
 
+/* surface life (its own RNG: the network's and the critters' sequences are untouched) */
+#define N_FERN 3
+#define FERN_FR 6
+#define N_MOSS 4
+#define SLIME_N 36
+typedef struct {
+	float xf, h, ph;
+	int nf;
+	float fa[FERN_FR], fl[FERN_FR], fc[FERN_FR]; /* frond: lean angle, length, arch */
+} fern_t;
+
+typedef struct {
+	float xf, w;
+} moss_t;
+
+typedef struct {
+	float xf, dir, ext, ext_tgt, out, ph;
+	float slime[SLIME_N]; /* xf of the trail behind it (newest first), < 0 = none */
+	float slime_acc;
+} snail_t;
+
+typedef struct {
+	float xf, dir, legph, stride, freeze, lift, bout_t, tongue;
+	int bout, quick;
+} sal_t;
+
 typedef struct {
 	us_rng rng, rng2; /* rng2: the small lives, so they never disturb the layout */
 	int inited;
@@ -226,6 +252,13 @@ typedef struct {
 	float mole_u, mole_dir, mole_paw;                       /* position along the tunnel 0..1 */
 	crumb_t crumb[MAX_CRUMB];
 	int ncrumb;
+	us_rng rng3;
+	int life_init;
+	fern_t fern[N_FERN];
+	moss_t moss[N_MOSS];
+	float acorn_xf, fern_sh, fern_k;
+	snail_t snail;
+	sal_t sal;
 	/* audio envelopes (each part of the music gets its own creature / response) */
 	float sub_env, lm_env, air_env, swell_g, cent_env, width_env;
 	float hi_fast, hi_slow, hi_cool;
@@ -250,6 +283,7 @@ static void *create(uint32_t seed)
 	st_t *s = calloc(1, sizeof(*s));
 	us_rng_seed(&s->rng, seed ^ 0x6d796365u);
 	us_rng_seed(&s->rng2, seed ^ 0x63726974u);
+	us_rng_seed(&s->rng3, seed ^ 0x6c656166u);
 	return s;
 }
 
@@ -604,6 +638,8 @@ static void make_plant(st_t *st, plant_t *p, float xf)
 	}
 }
 
+static void life_setup(st_t *st);
+
 static void init_scene(st_t *st, const us_ctx *ctx)
 {
 	us_rng *r = &st->rng;
@@ -797,6 +833,7 @@ static void init_scene(st_t *st, const us_ctx *ctx)
 	st->beetle.xf = us_randr(&st->rng2, 0.2f, 0.8f);
 	st->beetle.dir = us_rand(&st->rng2) < 0.5f ? -1.0f : 1.0f;
 	st->beetle.ph = us_rand(&st->rng2) * 10.0f;
+	life_setup(st);
 
 	/* memory: a network that grew elsewhere (world mycelium) is already here when the scene opens */
 	float m = ctx->w->mycelium;
@@ -1161,6 +1198,593 @@ static void draw_critters(st_t *st, const us_ctx *ctx, us_canvas *c, int kick_hi
 	}
 }
 
+/* ==== surface life: ferns, moss, an oak seedling, a snail and a fire salamander on the leaf litter ==== */
+
+/* fill a small polygon toward `tone` by coverage (4 sub-rows in Ink, centre test on pixel canvases): a creature's
+ * body occludes the grass and the web behind it, so its outline reads as a solid animal */
+static void poly_fill(us_canvas *c, const float *xy, int n, float tone, uint8_t m)
+{
+	float x0 = 1e9f, x1 = -1e9f, y0 = 1e9f, y1 = -1e9f;
+	for (int k = 0; k < n; k++) {
+		float x = xy[2 * k] * c->s, y = xy[2 * k + 1] * c->s;
+		x0 = fminf(x0, x), x1 = fmaxf(x1, x), y0 = fminf(y0, y), y1 = fmaxf(y1, y);
+	}
+	int px0 = (int)floorf(x0), px1 = (int)ceilf(x1) + 1, py0 = (int)floorf(y0), py1 = (int)ceilf(y1) + 1;
+	if (px0 < 0)
+		px0 = 0;
+	if (py0 < 0)
+		py0 = 0;
+	if (px1 > c->w)
+		px1 = c->w;
+	if (py1 > c->h)
+		py1 = c->h;
+	if (px1 <= px0 || py1 <= py0 || px1 - px0 > 512 || n > 48)
+		return;
+	float acc[513];
+	int S = c->crisp ? 1 : 4;
+	float tv = tone * 255.0f;
+	for (int py = py0; py < py1; py++) {
+		int any = 0;
+		memset(acc, 0, sizeof(float) * (size_t)(px1 - px0 + 1));
+		for (int sr = 0; sr < S; sr++) {
+			float sy = py + (sr + 0.5f) / S;
+			float xs[48];
+			int nx = 0;
+			for (int k = 0; k < n; k++) {
+				int k1 = (k + 1) % n;
+				float ay = xy[2 * k + 1] * c->s, by = xy[2 * k1 + 1] * c->s;
+				if ((ay <= sy) != (by <= sy)) {
+					float ax = xy[2 * k] * c->s, bx = xy[2 * k1] * c->s;
+					xs[nx++] = ax + (sy - ay) / (by - ay) * (bx - ax);
+				}
+			}
+			for (int i = 1; i < nx; i++)
+				for (int j = i; j > 0 && xs[j - 1] > xs[j]; j--) {
+					float tmp = xs[j];
+					xs[j] = xs[j - 1], xs[j - 1] = tmp;
+				}
+			for (int q = 0; q + 1 < nx; q += 2) {
+				float xa = fmaxf(xs[q], (float)px0), xb = fminf(xs[q + 1], (float)px1);
+				if (xb <= xa)
+					continue;
+				any = 1;
+				if (c->crisp) {
+					for (int i = (int)ceilf(xa - 0.5f); i + 0.5f < xb && i < px1; i++)
+						acc[i - px0] += 1.0f;
+				} else {
+					for (int i = (int)floorf(xa); i <= (int)floorf(xb) && i < px1; i++) {
+						float cv = fminf(xb, i + 1.0f) - fmaxf(xa, (float)i);
+						if (cv > 0)
+							acc[i - px0] += cv / S;
+					}
+				}
+			}
+		}
+		if (!any)
+			continue;
+		uint8_t *ink = c->ink + (size_t)py * c->w, *mat = c->mat + (size_t)py * c->w;
+		for (int i = px0; i < px1; i++) {
+			float cv = fminf(acc[i - px0], 1.0f);
+			if (cv <= 0.01f || (c->crisp && cv < 0.5f))
+				continue;
+			float v = ink[i] + (tv - ink[i]) * cv;
+			ink[i] = (uint8_t)(v < 0 ? 0 : v > 255 ? 255 : v + 0.5f);
+			if (cv > 0.5f)
+				mat[i] = m;
+		}
+	}
+}
+
+/* outline of a closed polygon */
+static void poly_line(us_canvas *c, const float *xy, int n, float v, uint8_t m)
+{
+	for (int k = 0; k < n; k++) {
+		int k1 = (k + 1) % n;
+		hline(c, xy[2 * k], xy[2 * k + 1], xy[2 * k1], xy[2 * k1 + 1], v, m);
+	}
+}
+
+static void life_setup(st_t *st)
+{
+	us_rng *r = &st->rng3;
+	/* ferns in the gaps between the flowering plants and the tree */
+	for (int k = 0; k < N_FERN; k++) {
+		fern_t *f = &st->fern[k];
+		float best = -1, bx = 0.5f;
+		for (int tries = 0; tries < 24; tries++) {
+			float xf = us_randr(r, 0.05f, 0.95f), d = fabsf(xf - st->tree_x) - 0.05f;
+			for (int i = 0; i < st->nplants; i++)
+				d = fminf(d, fabsf(xf - st->plant[i].x));
+			for (int j = 0; j < k; j++)
+				d = fminf(d, fabsf(xf - st->fern[j].xf));
+			if (d > best)
+				best = d, bx = xf;
+		}
+		f->xf = bx;
+		f->h = us_randr(r, 0.8f, 1.15f);
+		f->ph = us_rand(r) * 20.0f;
+		f->nf = 4 + (int)(us_rand(r) * 3.0f);
+		for (int j = 0; j < f->nf; j++) {
+			float u = f->nf > 1 ? (float)j / (f->nf - 1) : 0.5f;
+			f->fa[j] = (u - 0.5f) * 2.3f + us_randn(r) * 0.12f; /* fanned out from the crown */
+			f->fl[j] = us_randr(r, 0.075f, 0.105f) * (1.0f - 0.3f * fabsf(u - 0.5f));
+			f->fc[j] = us_randr(r, 0.1f, 0.18f);
+		}
+	}
+	/* moss cushions: at the tree's foot, by a fern, and on open ground */
+	for (int k = 0; k < N_MOSS; k++) {
+		moss_t *m = &st->moss[k];
+		if (k < 2 && st->tree_x > 0)
+			m->xf = st->tree_x + (k ? 1.0f : -1.0f) * us_randr(r, 0.045f, 0.06f);
+		else if (k == 2)
+			m->xf = st->fern[0].xf + us_randr(r, 0.025f, 0.04f) * (us_rand(r) < 0.5f ? -1.0f : 1.0f);
+		else
+			m->xf = us_randr(r, 0.1f, 0.9f);
+		m->xf = us_clampf(m->xf, 0.02f, 0.98f);
+		m->w = us_randr(r, 0.018f, 0.032f);
+	}
+	/* an acorn that fell from the old tree, sprouting */
+	st->acorn_xf = st->tree_x > 0 ? st->tree_x + (st->tree_x < 0.5f ? 1.0f : -1.0f) * us_randr(r, 0.09f, 0.12f) : 0.5f;
+	st->snail.xf = us_randr(r, 0.2f, 0.8f);
+	st->snail.dir = us_rand(r) < 0.5f ? -1.0f : 1.0f;
+	st->snail.ext = st->snail.ext_tgt = 1.0f;
+	for (int k = 0; k < SLIME_N; k++)
+		st->snail.slime[k] = -1.0f;
+	st->sal.xf = us_randr(r, 0.2f, 0.8f);
+	st->sal.dir = us_rand(r) < 0.5f ? -1.0f : 1.0f;
+	st->sal.bout_t = us_randr(r, 1.0f, 3.0f);
+	st->life_init = 1;
+}
+
+/* plants of the surface: fern clumps (fiddleheads in spring, bronze in autumn, collapsed in winter), moss cushions whose
+ * capsules glint with the hats, and an oak seedling sprouting from an acorn */
+static void draw_flora(st_t *st, const us_ctx *ctx, us_canvas *c)
+{
+	us_world *w = ctx->w;
+	float A = ctx->aspect;
+	int crisp = c->crisp;
+	float spring = us_world_season_w(w, 0), autumn = us_world_season_w(w, 2), winter = us_world_winter(w);
+	float hatv = us_sat(ctx->a->hat * 1.3f);
+	if (ctx->a->snare_hit)
+		st->fern_sh = fmaxf(st->fern_sh, 0.6f + 0.4f * us_sat(ctx->a->snare));
+	st->fern_sh *= expf(-ctx->real_dt / 0.07f);
+	if (ctx->a->kick_hit)
+		st->fern_k = fmaxf(st->fern_k, 0.6f + 0.4f * us_sat(ctx->a->kick));
+	st->fern_k *= expf(-ctx->real_dt / 0.06f);
+	/* ---- ferns ---- */
+	int nfern = 1 + (int)(ctx->p->density * 2.5f);
+	if (nfern > N_FERN)
+		nfern = N_FERN;
+	for (int k = 0; k < nfern; k++) {
+		const fern_t *f = &st->fern[k];
+		float bx = f->xf * A, by = soil_y(f->xf) + 0.002f;
+		uint8_t fm = winter > 0.5f || autumn > 0.6f ? US_MAT_EARTH : US_MAT_LEAF;
+		float droop = 0.9f * winter;
+		for (int j = 0; j < f->nf; j++) {
+			/* in spring the youngest frond is still a fiddlehead, uncurling */
+			int young = j == f->nf / 2;
+			float curl = young ? spring * (0.55f + 0.45f * sinf(st->t * 0.05f + f->ph)) : 0.0f;
+			float L = f->fl[j] * f->h * (1.0f - 0.35f * winter) * (1.0f - 0.45f * curl);
+			/* fronds barely drift (no flutter: the network stays the motion), but they answer the drums */
+			float sw = us_noise2(st->t * 0.07f + f->ph, j * 1.3f) * (0.03f + 0.03f * st->hi_slow) +
+				   0.07f * st->fern_k * (f->fa[j] >= 0 ? 1.0f : -1.0f) + /* kicks: the fronds dip outward */
+				   0.07f * st->fern_sh * sinf(st->t * 47.0f + j * 2.1f + k);   /* snare: they shudder */
+			float ang = -US_PI * 0.5f + f->fa[j] * (1.0f + 0.25f * droop) + sw;
+			float side = f->fa[j] >= 0 ? 1.0f : -1.0f;
+			enum { NS = 10 };
+			float x = bx, y = by;
+			float v = (crisp ? 0.5f : 0.46f) * (1.0f - 0.25f * winter);
+			for (int q = 0; q < NS; q++) {
+				float u = (q + 0.5f) / NS;
+				float seg = L / NS;
+				/* arching rachis: it bends outward and down along its length, and a fiddlehead coils */
+				ang += side * (f->fc[j] + droop * 0.25f) * 1.2f / NS * (1.0f + u) + side * curl * 3.4f * u * u * u / NS * 6.0f;
+				float nx = x + cosf(ang) * seg, ny = y + sinf(ang) * seg;
+				if (ny > by)
+					ny = by;
+				hline(c, x, y, nx, ny, v, fm);
+				/* pinnae: paired leaflets, longest mid-frond, angled toward the tip */
+				float pl = L * 0.2f * powf(sinf(US_PI * fminf(u * 1.1f, 1.0f)), 0.7f) * (1.0f - curl * u);
+				if (q > 0 && pl > 0.0015f && (!crisp || (q & 1))) {
+					for (int sd = -1; sd <= 1; sd += 2) {
+						float pa = ang + sd * 1.05f;
+						float ex = nx + cosf(pa) * pl, ey = ny + sinf(pa) * pl;
+						if (ey > by)
+							ey = by;
+						if (crisp)
+							hline(c, nx, ny, ex, ey, v * 0.9f, fm);
+						else {
+							float mx = (nx + ex) * 0.5f + cosf(ang) * pl * 0.12f, my = (ny + ey) * 0.5f + sinf(ang) * pl * 0.12f;
+							wu_line(c, nx, ny, mx, my, v * 0.85f, fm);
+							wu_line(c, mx, my, ex, ey, v * 0.7f, fm);
+						}
+					}
+				}
+				x = nx, y = ny;
+			}
+		}
+	}
+	/* ---- moss: a cushion of tiny shoots, and stalked capsules that glint on the hats ---- */
+	for (int k = 0; k < N_MOSS; k++) {
+		const moss_t *m = &st->moss[k];
+		int nsh = crisp ? 10 : 34, ncap = 6;
+		for (int i = 0; i < nsh; i++) {
+			uint32_t h = (uint32_t)(k * 977 + i) * 2654435761u;
+			h ^= h >> 15;
+			float u = ((h & 1023) / 1023.0f) * 2.0f - 1.0f;
+			float xf = m->xf + u * m->w / A;
+			float gy = soil_y(xf) + 0.0015f;
+			float hh = (0.0035f + 0.0045f * ((h >> 10) & 255) / 255.0f) * sqrtf(fmaxf(0.0f, 1.0f - u * u)) * (1.0f - 0.3f * winter);
+			float lean = (((h >> 18) & 255) / 255.0f - 0.5f) * 0.004f;
+			hline(c, xf * A, gy, xf * A + lean, gy - hh, crisp ? 0.4f : 0.36f + 0.1f * ((h >> 26) & 1), US_MAT_LEAF);
+		}
+		if (winter > 0.6f)
+			continue;
+		for (int i = 0; i < ncap; i++) {
+			uint32_t h = (uint32_t)(k * 131 + i) * 2246822519u;
+			h ^= h >> 13;
+			float u = ((h & 1023) / 1023.0f) * 1.6f - 0.8f;
+			float xf = m->xf + u * m->w / A;
+			float gy = soil_y(xf) + 0.001f;
+			float hh = 0.009f + 0.007f * ((h >> 10) & 255) / 255.0f;
+			float sw = 0.0015f * sinf(i * 1.7f + k) * 0.5f;
+			float tx = xf * A + sw + (u * 0.002f), ty = gy - hh;
+			hline(c, xf * A, gy - 0.003f, tx, ty, crisp ? 0.36f : 0.3f, US_MAT_STEM);
+			/* hats: about half the capsules catch the light (a different half each hit) */
+			uint32_t g = (uint32_t)(k * 31 + i) * 0x9e3779b9u ^ st->hat_n * 0x85ebca6bu;
+			g ^= g >> 16;
+			float gl = (g & 1) ? hatv : 0.0f;
+			float cv = us_sat(0.45f + 0.55f * gl);
+			if (crisp)
+				put_max(c, (int)(tx * c->s), (int)(ty * c->s), cv, gl > 0.2f ? US_MAT_LIGHT : US_MAT_ACCENT);
+			else {
+				wu_line(c, tx, ty, tx + 0.0016f + sw * 0.3f, ty + 0.0012f, cv, gl > 0.2f ? US_MAT_LIGHT : US_MAT_ACCENT);
+				us_point(c, tx + 0.0009f, ty + 0.0005f, 0.0011f, cv, gl > 0.2f ? US_MAT_LIGHT : US_MAT_ACCENT);
+			}
+		}
+	}
+	/* ---- the acorn and its seedling (a radicle into the humus, a stem with lobed oak leaves) ---- */
+	if (st->tree_x > 0) {
+		float xf = st->acorn_xf, ax = xf * A, gy = soil_y(xf);
+		float grown = (1.0f - 0.6f * winter);
+		/* radicle */
+		float px = ax, py = gy;
+		for (int q = 1; q <= 6; q++) {
+			float nx = ax + 0.004f * sinf(q * 1.3f), ny = gy + 0.0065f * q;
+			hline(c, px, py, nx, ny, 0.36f - 0.03f * q, US_MAT_EARTH);
+			if (!crisp && q > 1)
+				wu_line(c, nx, ny, nx + 0.003f * ((q & 1) ? 1 : -1), ny + 0.002f, 0.18f, US_MAT_EARTH);
+			px = nx, py = ny;
+		}
+		/* the acorn lying on the litter: a glossy nut and its scaly cup */
+		float cx = ax - 0.006f, cy = gy - 0.0042f;
+		if (crisp) {
+			us_disc(c, cx, cy, 0.0045f, 0.55f, US_MAT_EARTH);
+			put_max(c, (int)((cx - 0.004f) * c->s), (int)(cy * c->s), 0.7f, US_MAT_ACCENT);
+		} else {
+			float qx = 0, qy = 0;
+			for (int k = 0; k <= 14; k++) {
+				float an = US_TAU * k / 14.0f;
+				float ex = cx + cosf(an) * 0.0062f, ey = cy + sinf(an) * 0.0042f;
+				if (k > 0)
+					wu_line(c, qx, qy, ex, ey, 0.6f, US_MAT_EARTH);
+				qx = ex, qy = ey;
+			}
+			us_arc(c, cx - 0.0018f, cy - 0.0012f, 0.0028f, US_PI * 1.05f, US_PI * 1.5f, 0.0008f, 0.55f, US_MAT_ACCENT); /* gloss */
+			for (int k = 0; k < 4; k++) /* the cup's scales */
+				wu_line(c, cx + 0.0035f + 0.0007f * k, cy - 0.0042f + 0.0026f * k, cx + 0.0068f, cy - 0.003f + 0.0024f * k, 0.45f,
+					US_MAT_EARTH);
+		}
+		/* seedling */
+		float sh = 0.03f * grown;
+		float sw = us_noise2(st->t * 0.08f, 3.3f) * 0.08f * sh;
+		float tx = ax + sw, ty = gy - sh;
+		hline(c, ax, gy, (ax + tx) * 0.5f + sw * 0.2f, gy - sh * 0.5f, 0.5f, US_MAT_STEM);
+		hline(c, (ax + tx) * 0.5f + sw * 0.2f, gy - sh * 0.5f, tx, ty, 0.5f, US_MAT_STEM);
+		if (winter < 0.7f) {
+			uint8_t lm = autumn > 0.55f ? US_MAT_BLOOM : US_MAT_LEAF;
+			for (int k = 0; k < 3; k++) {
+				float la = -US_PI * 0.5f + (k - 1) * 0.95f + 0.1f * sinf(st->sway_t + k);
+				float ll = 0.013f * (k == 1 ? 1.0f : 0.8f) * (1.0f - 0.5f * winter);
+				float lx0 = tx, ly0 = ty + (k != 1 ? sh * 0.15f : 0.0f);
+				float ex = lx0 + cosf(la) * ll, ey = ly0 + sinf(la) * ll;
+				float nx = -sinf(la), ny = cosf(la);
+				if (crisp) {
+					us_tri(c, lx0, ly0, (lx0 + ex) * 0.5f + nx * ll * 0.3f, (ly0 + ey) * 0.5f + ny * ll * 0.3f, ex, ey, 0.5f, lm);
+					us_tri(c, lx0, ly0, (lx0 + ex) * 0.5f - nx * ll * 0.3f, (ly0 + ey) * 0.5f - ny * ll * 0.3f, ex, ey, 0.45f, lm);
+				} else {
+					/* a lobed oak leaf: the margin swells and pinches three times each side */
+					for (int sd = -1; sd <= 1; sd += 2) {
+						float qx = lx0, qy = ly0;
+						for (int q = 1; q <= 8; q++) {
+							float u = q / 8.0f;
+							float wdt = ll * (0.18f + 0.12f * fabsf(sinf(u * US_PI * 3.0f))) * sinf(u * US_PI) * 1.4f;
+							float mx = lx0 + (ex - lx0) * u + sd * nx * wdt, my = ly0 + (ey - ly0) * u + sd * ny * wdt;
+							if (q == 8)
+								mx = ex, my = ey;
+							wu_line(c, qx, qy, mx, my, 0.55f, lm);
+							qx = mx, qy = my;
+						}
+					}
+					wu_line(c, lx0, ly0, ex, ey, 0.3f, lm);
+				}
+			}
+		}
+	}
+}
+
+/* the snail: creeps along the litter on its foot, eyes up on long stalks, leaving a slime trail that glints on the hats;
+ * a snare makes it pull its eyes in (they unroll again slowly); dry spells and winter seal it in its shell */
+static void draw_snail(st_t *st, const us_ctx *ctx, us_canvas *c, int hi_hit)
+{
+	us_world *w = ctx->w;
+	snail_t *sn = &st->snail;
+	float A = ctx->aspect, dt = ctx->dt, rdt = ctx->real_dt;
+	int crisp = c->crisp;
+	float winter = us_world_winter(w), night = us_sat(1.0f - w->daylight * 1.6f);
+	float wet = us_sat(0.3f + w->moisture * 1.5f + 0.4f * night);
+	float out_tgt = winter > 0.6f || wet < 0.35f ? 0.0f : 1.0f;
+	sn->out = us_approach(sn->out, out_tgt, 2.0f, dt);
+	if (ctx->a->snare_hit && ctx->a->snare > 0.3f)
+		sn->ext_tgt = 0.0f;
+	sn->ext_tgt = us_approach(sn->ext_tgt, 1.0f, 1.6f, rdt);
+	sn->ext = us_approach(sn->ext, sn->ext_tgt * sn->out, sn->ext_tgt < sn->ext ? 0.05f : 0.5f, rdt);
+	float spd = 0.0016f * (0.4f + 0.6f * wet) * sn->out * (0.2f + 0.8f * sn->ext) * (1.0f + 0.6f * st->bass_env);
+	float ox = sn->xf;
+	sn->xf += sn->dir * spd * dt / A;
+	float tx = st->tree_x;
+	if (sn->xf < 0.04f || sn->xf > 0.96f || (tx > 0 && fabsf(sn->xf - tx) < 0.065f && (sn->xf - tx) * sn->dir < 0))
+		sn->dir = -sn->dir;
+	sn->ph += dt * (0.8f + 2.0f * spd / 0.0016f);
+	/* the trail: a point every few thousandths of travel */
+	sn->slime_acc += fabsf(sn->xf - ox) * A;
+	if (sn->slime_acc > 0.004f) {
+		sn->slime_acc = 0;
+		memmove(&sn->slime[1], &sn->slime[0], sizeof(float) * (SLIME_N - 1));
+		sn->slime[0] = sn->xf - sn->dir * 0.012f / A;
+	}
+	float hatv = us_sat(ctx->a->hat * 1.4f);
+	(void)hi_hit;
+	for (int k = 0; k + 1 < SLIME_N; k++) {
+		if (sn->slime[k] < 0 || sn->slime[k + 1] < 0)
+			break;
+		float fade = 1.0f - (float)k / SLIME_N;
+		float xa = sn->slime[k] * A, xb = sn->slime[k + 1] * A;
+		float ya = soil_y(sn->slime[k]) - 0.0012f, yb = soil_y(sn->slime[k + 1]) - 0.0012f;
+		uint32_t g = (uint32_t)(k * 2654435761u) ^ (st->hat_n * 0x9e3779b9u);
+		g ^= g >> 15;
+		g *= 0x2c1b3c6du;
+		g ^= g >> 12;
+		float gl = (g % 3 == 0) ? hatv : 0.0f;
+		float v = (0.14f + 0.08f * wet) * fade;
+		if (k & 1 || crisp)
+			hline(c, xa, ya, xb, yb, v, US_MAT_ACCENT);
+		if (gl > 0.05f) {
+			if (crisp)
+				put_max(c, (int)(xa * c->s), (int)(ya * c->s), us_sat(0.4f + 0.6f * gl) * fade, US_MAT_LIGHT);
+			else
+				us_point(c, xa, ya, 0.0011f, us_sat(0.35f + 0.65f * gl) * fade, US_MAT_LIGHT);
+		}
+	}
+	/* body */
+	float d = sn->dir, x = sn->xf * A, gy = soil_y(sn->xf) - 0.0006f;
+	float u = crisp ? 0.013f : 0.0115f;
+	float e = sn->ext, o = sn->out;
+	float sx = x - d * 0.25f * u, sy = gy - 1.5f * u; /* shell centre, riding on the foot */
+	if (o > 0.05f) {
+		float rip = 0.04f * sinf(sn->ph);
+		float L = (1.0f + 0.25f * e) * o;
+		float pts[2 * 12];
+		int n = 0;
+#define SP(X, Y) do { pts[2 * n] = x + d * (X) * u; pts[2 * n + 1] = gy + (Y) * u; n++; } while (0)
+		SP(-1.75f * L, 0.0f);          /* tail tip */
+		SP(-1.2f * L, -0.22f);
+		SP(-0.4f, -0.45f + rip);
+		SP(0.7f, -0.5f - rip);
+		SP(1.1f + 0.5f * (L - 1.0f), -0.78f * (0.6f + 0.4f * e));  /* head lifted */
+		SP(1.45f + 0.6f * (L - 1.0f), -0.62f * (0.6f + 0.4f * e));
+		SP(1.62f + 0.6f * (L - 1.0f), -0.3f);
+		SP(1.55f + 0.6f * (L - 1.0f), 0.0f);
+#undef SP
+		poly_fill(c, pts, n, crisp ? 0.32f : 0.03f, US_MAT_STEM);
+		if (!crisp)
+			poly_line(c, pts, n, 0.5f, US_MAT_STEM);
+		/* tentacles: the long eye stalks and the short feelers, rolling in and out */
+		float hx = x + d * (1.25f + 0.6f * (L - 1.0f)) * u, hy = gy - 0.68f * (0.6f + 0.4f * e) * u;
+		for (int k = 0; k < 2; k++) {
+			float sl = (0.25f + 1.45f * e) * u, a0 = -US_PI * 0.5f + d * (0.45f + 0.28f * k) + 0.05f * sinf(sn->ph + k);
+			float ex = hx + cosf(a0) * sl - d * 0.12f * k * u, ey = hy + sinf(a0) * sl;
+			hline(c, hx - d * 0.12f * k * u, hy, ex, ey, k ? 0.38f : 0.55f, US_MAT_STEM);
+			if (e > 0.25f) {
+				if (crisp)
+					put_max(c, (int)(ex * c->s), (int)(ey * c->s), 0.8f, US_MAT_ACCENT);
+				else
+					us_point(c, ex, ey, 0.0011f, 0.75f * (k ? 0.7f : 1.0f), US_MAT_ACCENT);
+			}
+			if (!crisp) { /* feelers */
+				float fa = d > 0 ? 0.35f + 0.25f * k : US_PI - 0.35f - 0.25f * k;
+				float fl = (0.15f + 0.4f * e) * u;
+				wu_line(c, hx + d * 0.3f * u, hy + 0.35f * u, hx + d * 0.3f * u + cosf(fa) * fl, hy + 0.35f * u + sinf(fa) * fl, 0.35f,
+					US_MAT_STEM);
+			}
+		}
+	}
+	/* shell: a coiled whorl, banded */
+	{
+		float R = 1.12f * u;
+		float pts[2 * 16];
+		for (int k = 0; k < 16; k++) {
+			float an = US_TAU * k / 16.0f;
+			pts[2 * k] = sx + cosf(an) * R;
+			pts[2 * k + 1] = sy + sinf(an) * R * 0.95f;
+		}
+		poly_fill(c, pts, 16, crisp ? 0.42f : 0.06f, US_MAT_EARTH);
+		if (crisp) {
+			put_max(c, (int)((sx + d * 0.2f * R) * c->s), (int)((sy - 0.1f * R) * c->s), 0.75f, US_MAT_ACCENT);
+		} else {
+			poly_line(c, pts, 16, 0.62f, US_MAT_EARTH);
+			/* the spiral: a logarithmic coil turning toward the head */
+			float qx = 0, qy = 0;
+			for (int k = 0; k <= 40; k++) {
+				float th = k * (US_TAU * 2.4f / 40.0f);
+				float rr = R * expf(-0.2f * th) * 0.92f;
+				float an = -US_PI * 0.5f - d * th;
+				float px = sx + d * 0.06f * R + cosf(an) * rr, py = sy + 0.04f * R + sinf(an) * rr * 0.95f;
+				if (k > 0)
+					wu_line(c, qx, qy, px, py, 0.5f - 0.004f * k, US_MAT_EARTH);
+				qx = px, qy = py;
+			}
+			us_arc(c, sx, sy, R * 0.8f, -US_PI * 0.85f, -US_PI * 0.55f, 0.0008f, 0.5f, US_MAT_ACCENT); /* sheen */
+		}
+	}
+}
+
+/* the fire salamander: black with gold spots, walking the litter on splayed legs. Each kick is a stride (it walks to
+ * the beat), a snare freezes it with its head raised, and on the hats it flicks its tongue; in quiet it walks in
+ * short bouts of its own; it keeps to wet nights and sleeps out the winter */
+static void draw_salamander(st_t *st, const us_ctx *ctx, us_canvas *c)
+{
+	us_world *w = ctx->w;
+	sal_t *s = &st->sal;
+	us_rng *r = &st->rng3;
+	const us_audio *a = ctx->a;
+	float A = ctx->aspect, dt = ctx->dt, rdt = ctx->real_dt;
+	int crisp = c->crisp;
+	if (us_world_winter(w) > 0.62f)
+		return;
+	const float STRIDE_T = 0.3f; /* its own pace; a kick-driven stride is a quick lunge */
+	s->freeze -= rdt;
+	if (a->snare_hit && a->snare > 0.3f)
+		s->freeze = 0.35f + 0.2f * us_sat(a->snare), s->stride = 0;
+	if (a->hat_hit && s->tongue <= 0 && us_rand(r) < 0.35f)
+		s->tongue = 1.0f;
+	s->tongue = fmaxf(0.0f, s->tongue - rdt / 0.22f);
+	if (s->freeze <= 0) {
+		if (a->kick_hit && s->stride <= 0)
+			s->stride = 1.0f, s->quick = 1;
+		s->bout_t -= dt;
+		if (s->bout_t <= 0 && s->stride <= 0) {
+			if (s->bout > 0) {
+				s->bout--;
+				s->stride = 1.0f, s->quick = 0;
+				s->bout_t = s->bout > 0 ? STRIDE_T + us_randr(r, 0.05f, 0.25f) : us_randr(r, 2.0f, 6.0f);
+			} else {
+				s->bout = 2 + (int)(us_rand(r) * 4.0f);
+				s->bout_t = 0.1f;
+				if (us_rand(r) < 0.2f)
+					s->dir = -s->dir;
+			}
+		}
+	}
+	float u = crisp ? 0.0125f : 0.011f;
+	if (s->stride > 0) {
+		float step = fminf(s->stride, rdt / (s->quick ? 0.13f : STRIDE_T));
+		s->stride -= step;
+		s->legph += US_PI * step;
+		s->xf += s->dir * 0.85f * u * step / A;
+		float tx = st->tree_x;
+		if (s->xf < 0.05f || s->xf > 0.95f || (tx > 0 && fabsf(s->xf - tx) < 0.075f && (s->xf - tx) * s->dir < 0))
+			s->dir = -s->dir;
+	}
+	s->lift = us_approach(s->lift, s->freeze > 0 ? 1.0f : 0.0f, s->freeze > 0 ? 0.06f : 0.4f, rdt);
+	float d = s->dir, x0 = s->xf * A, gy = soil_y(s->xf) - 0.0008f;
+	float walk = fabsf(sinf(s->legph));
+	/* spine: tail tip .. snout, thickness and centre line in salamander units (y up = negative) */
+	enum { NSP = 15 };
+	float up[2 * NSP], lo[2 * NSP];
+	float sway = 0.08f * sinf(s->legph * 2.0f);
+	for (int i = 0; i < NSP; i++) {
+		float xx = -3.2f + 5.25f * i / (NSP - 1);
+		float th, cy;
+		if (xx < -1.0f) {
+			float q = (xx + 3.2f) / 2.2f;
+			th = us_lerp(0.04f, 0.27f, q);
+			cy = us_lerp(-0.12f, -0.62f, q * q * (3 - 2 * q)) + sway * (1 - q) * (1 - q);
+		} else if (xx < 1.05f) {
+			th = 0.34f + 0.04f * sinf((xx + 1.0f) / 2.05f * US_PI);
+			cy = -0.62f - 0.03f * walk;
+		} else if (xx < 1.35f) {
+			th = 0.29f;
+			cy = -0.64f;
+		} else {
+			float q = (xx - 1.6f) / 0.47f;
+			th = 0.33f * sqrtf(fmaxf(0.04f, 1.0f - (q > 0 ? q * q : 0.2f * q * q)));
+			cy = -0.66f;
+		}
+		if (xx > 1.0f)
+			cy -= s->lift * (xx - 1.0f) * 0.45f;
+		up[2 * i] = x0 + d * xx * u, up[2 * i + 1] = gy + (cy - th) * u;
+		lo[2 * i] = x0 + d * xx * u, lo[2 * i + 1] = gy + (cy + th * 0.8f) * u;
+	}
+	/* legs first (the far pair dimmer), then the body over them */
+	static const float LEGX[2] = {0.85f, -0.75f};
+	for (int k = 0; k < 4; k++) {
+		int far = k >= 2, fore = k & 1 ? 0 : 1;
+		float lx = LEGX[fore ? 0 : 1] + (far ? -0.12f : 0.0f);
+		float ph = s->legph + ((fore ^ far) ? 0.0f : US_PI); /* diagonal pairs */
+		float fx = lx + 0.4f * cosf(ph) * (fore ? 1.0f : -1.0f) * 0.9f;
+		float lift = 0.18f * fmaxf(0.0f, sinf(ph)) * (s->stride > 0 ? 1.0f : 0.0f);
+		float sy0 = -0.55f + (far ? -0.08f : 0.0f);
+		float ex = lx + (fore ? 0.3f : -0.3f), ey = -0.2f - lift - (far ? 0.08f : 0.0f);
+		float px0 = x0 + d * lx * u, py0 = gy + sy0 * u, px1 = x0 + d * ex * u, py1 = gy + (ey - 0.18f) * u;
+		float px2 = x0 + d * fx * u, py2 = gy - lift * u - (far ? 0.05f * u : 0.0f);
+		float lv = far ? 0.32f : 0.58f;
+		if (crisp) {
+			hline(c, px0, py0, px2, py2, far ? 0.25f : 0.4f, US_MAT_STEM);
+			continue;
+		}
+		wu_line(c, px0, py0, px1, py1, lv, US_MAT_ACCENT);
+		wu_line(c, px1, py1, px2, py2, lv, US_MAT_ACCENT);
+		for (int t = -1; t <= 1; t++) /* splayed toes */
+			wu_line(c, px2, py2, px2 + d * (0.22f * t + 0.12f) * u, py2 + 0.05f * u, lv * 0.7f, US_MAT_ACCENT);
+	}
+	float poly[4 * NSP];
+	for (int i = 0; i < NSP; i++) {
+		poly[2 * i] = up[2 * i], poly[2 * i + 1] = up[2 * i + 1];
+		poly[2 * (2 * NSP - 1 - i)] = lo[2 * i], poly[2 * (2 * NSP - 1 - i) + 1] = lo[2 * i + 1];
+	}
+	poly_fill(c, poly, 2 * NSP, crisp ? 0.2f : 0.0f, US_MAT_STEM);
+	if (!crisp) {
+		for (int i = 0; i + 1 < NSP; i++) {
+			wu_line(c, up[2 * i], up[2 * i + 1], up[2 * i + 2], up[2 * i + 3], 0.62f, US_MAT_ACCENT);
+			wu_line(c, lo[2 * i], lo[2 * i + 1], lo[2 * i + 2], lo[2 * i + 3], 0.4f, US_MAT_ACCENT);
+		}
+		wu_line(c, up[2 * (NSP - 1)], up[2 * (NSP - 1) + 1], lo[2 * (NSP - 1)], lo[2 * (NSP - 1) + 1], 0.55f, US_MAT_ACCENT);
+	}
+	/* gold spots down the back, a pair of parotoid glands behind the eye */
+	static const float SPOT[9][2] = {{-2.55f, 0.5f}, {-2.0f, 0.4f}, {-1.45f, 0.55f}, {-0.85f, 0.35f}, {-0.35f, 0.6f},
+					 {0.15f, 0.3f},   {0.6f, 0.55f},  {1.15f, 0.45f},  {1.45f, 0.6f}};
+	for (int k = 0; k < 9; k++) {
+		float fx = (SPOT[k][0] + 3.2f) / 5.25f * (NSP - 1);
+		int i = (int)fx;
+		if (i >= NSP - 1)
+			i = NSP - 2;
+		float f = fx - i;
+		float ux = us_lerp(up[2 * i], up[2 * i + 2], f), uy = us_lerp(up[2 * i + 1], up[2 * i + 3], f);
+		float ly = us_lerp(lo[2 * i + 1], lo[2 * i + 3], f);
+		float py = us_lerp(uy, ly, SPOT[k][1] * 0.6f);
+		if (crisp)
+			put_max(c, (int)(ux * c->s), (int)(py * c->s), 0.9f, US_MAT_LIGHT);
+		else
+			us_disc(c, ux, py, (0.09f + 0.04f * (k == 8)) * u * (k < 3 ? 0.8f : 1.0f), 0.9f, US_MAT_LIGHT);
+	}
+	/* eye + tongue */
+	{
+		float hx = up[2 * (NSP - 3)], hy = us_lerp(up[2 * (NSP - 3) + 1], lo[2 * (NSP - 3) + 1], 0.32f);
+		if (crisp)
+			put_max(c, (int)((hx) * c->s), (int)(hy * c->s), 0.7f, US_MAT_ACCENT);
+		else {
+			us_ring(c, hx, hy, 0.12f * u, 0.0008f, 0.75f, US_MAT_ACCENT);
+			us_point(c, hx + d * 0.03f * u, hy, 0.0008f, 0.9f, US_MAT_ACCENT);
+		}
+		if (s->tongue > 0) {
+			float tl = sinf(s->tongue * US_PI) * 0.9f * u;
+			float sx = up[2 * (NSP - 1)], sy = (up[2 * (NSP - 1) + 1] + lo[2 * (NSP - 1) + 1]) * 0.5f + 0.05f * u;
+			hline(c, sx, sy, sx + d * tl, sy + 0.15f * u, 0.75f, US_MAT_BLOOM);
+		}
+	}
+}
+
 /* the world around the network: sky, surface life, the tree, soil horizons, stones, roots, worms */
 static void draw_ground(st_t *st, const us_ctx *ctx, us_canvas *c, float wind)
 {
@@ -1500,6 +2124,7 @@ static void draw_ground(st_t *st, const us_ctx *ctx, us_canvas *c, float wind)
 			us_disc(c, tx, ty, crisp ? 0.004f : 0.0022f, 0.85f, US_MAT_LIGHT);
 		}
 	}
+	draw_flora(st, ctx, c);
 }
 
 /* colony of a random living thread (bigger colonies fire more often) */
@@ -1703,6 +2328,8 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 		settle_mats(c, US_MAT_ACCENT, st->fcount_m++);
 	draw_ground(st, ctx, c, wind);
 	draw_critters(st, ctx, c, kick_hit, hi_hit);
+	draw_snail(st, ctx, c, hi_hit);
+	draw_salamander(st, ctx, c);
 
 	PROF(7);
 	/* ---- the network ---- */
