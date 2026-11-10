@@ -636,6 +636,34 @@ static void ripple_draw(us_canvas *c, float x, float y, float rx, float v)
 	}
 }
 
+/* fill a small polygon solidly (even-odd test at pixel centres over its bounding box): used for the heron's
+ * and coots' body mass, where a fan of thin triangles would only leave anti-aliased slivers under MAX blending */
+static void fill_poly(us_canvas *c, const float *xy, int n, float v, uint8_t m)
+{
+	float x0 = 1e9f, x1 = -1e9f, y0 = 1e9f, y1 = -1e9f;
+	for (int i = 0; i < n; i++) {
+		x0 = fminf(x0, xy[2 * i]), x1 = fmaxf(x1, xy[2 * i]);
+		y0 = fminf(y0, xy[2 * i + 1]), y1 = fmaxf(y1, xy[2 * i + 1]);
+	}
+	int px0 = (int)floorf(x0 * c->s), px1 = (int)ceilf(x1 * c->s), py0 = (int)floorf(y0 * c->s), py1 = (int)ceilf(y1 * c->s);
+	if (px1 - px0 > 200 || py1 - py0 > 200)
+		return;
+	for (int py = py0; py <= py1; py++) {
+		float yy = (py + 0.5f) / c->s;
+		for (int px = px0; px <= px1; px++) {
+			float xx = (px + 0.5f) / c->s;
+			int in = 0;
+			for (int i = 0, j = n - 1; i < n; j = i++) {
+				float yi = xy[2 * i + 1], yj = xy[2 * j + 1];
+				if ((yi > yy) != (yj > yy) && xx < xy[2 * j] + (xy[2 * i] - xy[2 * j]) * (yy - yj) / (yi - yj))
+					in = !in;
+			}
+			if (in)
+				us_put(c, px, py, v, m);
+		}
+	}
+}
+
 static inline void bez3(float t, const float *p, float *x, float *y)
 {
 	float u = 1.0f - t, a = u * u * u, b = 3 * u * u * t, cc = 3 * u * t * t, d = t * t * t;
@@ -693,6 +721,8 @@ static void heron_draw(us_canvas *c, float x, float y, float S, float f, float e
 	/* body mass: a dim fill, a firmer outline, the folded wing and the hanging primaries */
 	/* a fan from one rim point over a coarse hexagon: broad triangles fill solidly (thin slivers would only
 	 * leave their anti-aliased edges under MAX blending) */
+	if (cr)
+		fill_poly(c, body, 18, v * 0.42f, US_MAT_ACCENT);
 	for (int j = 1; j < 5 && !cr; j++)
 		us_tri(c, body[0], body[1], body[6 * j], body[6 * j + 1], body[6 * j + 6], body[6 * j + 7], v * (cr ? 0.62f : 0.28f),
 		       US_MAT_ACCENT);
@@ -735,8 +765,12 @@ static void heron_draw(us_canvas *c, float x, float y, float S, float f, float e
 		nk[2 * i] = HX(px), nk[2 * i + 1] = HY(py);
 	}
 	if (cr)
-		for (int i = 0; i < 10; i++)
+		for (int i = 0; i < 10; i++) {
 			pline(c, nk[2 * i], nk[2 * i + 1], nk[2 * i + 2], nk[2 * i + 3], v, US_MAT_ACCENT);
+			if (i < 6) /* the neck thickens toward the breast */
+				pline(c, nk[2 * i] - f / c->s, nk[2 * i + 1], nk[2 * i + 2] - f / c->s, nk[2 * i + 3], v * 0.8f,
+				      US_MAT_ACCENT);
+		}
 	else
 		us_polyline(c, nk, 11, 0.0021f * S / 0.09f, v, US_MAT_ACCENT);
 	/* head + dagger bill (yellow) + the black crest plume trailing back */
@@ -749,8 +783,11 @@ static void heron_draw(us_canvas *c, float x, float y, float S, float f, float e
 	float dxb = cosf(ba), dyb = sinf(ba);
 	float hr = 0.03f;
 	if (cr) {
-		us_put(c, (int)floorf(HX(hx) * c->s), (int)floorf(HY(hy) * c->s), v, US_MAT_ACCENT);
-		us_put(c, (int)floorf(HX(hx - 0.03f) * c->s), (int)floorf(HY(hy) * c->s), v, US_MAT_ACCENT);
+		int hpx = (int)floorf(HX(hx) * c->s), hpy = (int)floorf(HY(hy) * c->s), d = f > 0 ? -1 : 1;
+		us_put(c, hpx, hpy, v, US_MAT_ACCENT);
+		us_put(c, hpx + d, hpy, v, US_MAT_ACCENT);
+		us_put(c, hpx + d, hpy - 1, v * 0.8f, US_MAT_ACCENT);
+		us_put(c, hpx + 2 * d, hpy - 1, v * 0.55f, US_MAT_ACCENT); /* the crest plume */
 	} else
 		us_disc(c, HX(hx), HY(hy), hr * S, v * 0.8f, US_MAT_ACCENT);
 	float b0x = hx + dxb * hr * 0.6f, b0y = hy + dyb * hr * 0.6f;
@@ -775,51 +812,63 @@ static void heron_draw(us_canvas *c, float x, float y, float S, float f, float e
  * every stroke, the white bill-shield. x, y = waterline under the body; s = depth scale; nod 0..1. */
 static void coot_draw(us_canvas *c, float x, float y, float s, float f, float nod, float flap, float shield, float v)
 {
-	if (c->crisp) {
-		int px = (int)(x * c->s), py = (int)(y * c->s), d = f > 0 ? 1 : -1;
-		int big = s > 0.75f;
-		for (int i = -2; i <= 1; i++)
-			us_put(c, px + d * i, py - 1, v, US_MAT_ACCENT);
-		for (int i = -1 - big; i <= 0; i++)
-			us_put(c, px + d * i, py - 2, v, US_MAT_ACCENT);
-		int hn = nod > 0.4f ? 1 : 0;
-		us_put(c, px + d * (1 + hn), py - 3 + hn, v, US_MAT_ACCENT);
-		us_put(c, px + d * (2 + hn), py - 3 + hn, us_sat(0.5f + shield), US_MAT_LIGHT);
-		if (flap > 0.2f) {
-			us_put(c, px - d, py - 3 - (flap > 0.6f), v * 0.8f, US_MAT_ACCENT);
-			us_put(c, px - d * 2, py - 4, v * 0.6f * flap, US_MAT_ACCENT);
-		}
-		return;
-	}
-	float L = 0.0155f * s, H = 0.009f * s;
+	int cr = c->crisp;
+	/* never smaller than a few pixels, so the hull keeps its rounded shape at pixel resolution */
+	float L = fmaxf(0.023f * s, cr ? 3.2f / c->s : 0.0f), H = L * 0.58f;
 #define CX(a) (x + f * (a) * L)
 #define CY(b) (y - (b) * H)
-	/* hull: a low arc, highest just behind the middle, the stern a little cocked */
-	float pts[2 * 11];
+	/* hull: a rounded black body riding high on the water, highest just behind the middle */
+	float pts[2 * 13];
 	for (int i = 0; i <= 10; i++) {
 		float u = i / 10.0f, a = US_PI * u;
 		float ax = -cosf(a) * (u < 0.5f ? 1.0f : 0.8f), ay = sinf(a) * (1.0f - 0.15f * u) + 0.25f * (1.0f - u) * (1.0f - u);
 		pts[2 * i] = CX(ax), pts[2 * i + 1] = CY(ay);
 	}
-	for (int i = 0; i < 10; i++)
-		us_tri(c, CX(0.0f), CY(0.0f), pts[2 * i], pts[2 * i + 1], pts[2 * i + 2], pts[2 * i + 3], v * 0.45f, US_MAT_ACCENT);
-	us_polyline(c, pts, 11, 0.0011f, v, US_MAT_ACCENT);
-	wline(c, CX(-1.0f), CY(0.0f), CX(0.8f), CY(0.0f), v * 0.6f, US_MAT_ACCENT);
-	/* neck + head: the nod throws the head forward and down */
+	pts[22] = CX(0.8f), pts[23] = CY(-0.05f);
+	pts[24] = CX(-1.0f), pts[25] = CY(-0.05f);
+	/* its reflection: the hull flipped under the water line, dim and squashed */
+	{
+		float rp[2 * 11];
+		for (int i = 0; i <= 10; i++)
+			rp[2 * i] = pts[2 * i], rp[2 * i + 1] = y + (y - pts[2 * i + 1]) * 0.55f + 0.0015f;
+		if (cr) {
+			int ry = (int)floorf((y + 0.2f * H) * c->s) + 1;
+			for (int px = (int)floorf(CX(f > 0 ? -0.8f : 0.6f) * c->s); px <= (int)floorf(CX(f > 0 ? 0.6f : -0.8f) * c->s); px++)
+				us_put(c, px, ry, v * 0.4f, US_MAT_WATER);
+		} else {
+			fill_poly(c, rp, 11, v * 0.14f, US_MAT_WATER);
+			wline(c, CX(-0.7f), y + 0.9f * H, CX(0.5f), y + 0.9f * H, v * 0.18f, US_MAT_WATER);
+		}
+	}
+	fill_poly(c, pts, 13, v * (cr ? 0.75f : 0.42f), US_MAT_ACCENT);
+	if (!cr) {
+		us_polyline(c, pts, 11, 0.0012f, v, US_MAT_ACCENT);
+		/* the water line it sits on */
+		wline(c, CX(-1.25f), y, CX(1.05f), y, v * 0.55f, US_MAT_WATER);
+	}
+	/* neck + small head: the nod throws the head forward and down */
 	float hx = 0.95f + 0.35f * nod, hy = 1.55f - 0.6f * nod;
-	wline(c, CX(0.55f), CY(0.7f), CX(hx), CY(hy), v, US_MAT_ACCENT);
-	us_disc(c, CX(hx), CY(hy), 0.28f * H, v * 0.9f, US_MAT_ACCENT);
-	/* the white shield and bill */
-	wline(c, CX(hx + 0.12f), CY(hy + 0.12f), CX(hx + 0.5f), CY(hy - 0.12f), us_sat(v * 1.3f + shield), US_MAT_LIGHT);
+	if (cr) {
+		pline(c, CX(0.55f), CY(0.8f), CX(hx), CY(hy), v, US_MAT_ACCENT);
+		us_put(c, (int)floorf(CX(hx) * c->s), (int)floorf(CY(hy) * c->s), v, US_MAT_ACCENT);
+		us_put(c, (int)floorf(CX(hx + 0.45f) * c->s), (int)floorf(CY(hy) * c->s), us_sat(0.75f + shield), US_MAT_LIGHT);
+	} else {
+		wline(c, CX(0.55f), CY(0.7f), CX(hx), CY(hy), v, US_MAT_ACCENT);
+		us_disc(c, CX(hx), CY(hy), 0.3f * H, v * 0.9f, US_MAT_ACCENT);
+		/* the white frontal shield running up the forehead, and the bill */
+		us_disc(c, CX(hx + 0.22f), CY(hy + 0.12f), 0.13f * H, us_sat(v * 1.4f + shield), US_MAT_LIGHT);
+		wline(c, CX(hx + 0.15f), CY(hy + 0.05f), CX(hx + 0.55f), CY(hy - 0.12f), us_sat(v * 1.4f + shield), US_MAT_LIGHT);
+	}
 	if (flap > 0.05f) {
 		/* skittering: wings flailing up off the back */
 		float wa = flap * (0.6f + 0.4f * sinf(flap * 40.0f));
-		wline(c, CX(0.1f), CY(0.9f), CX(-0.6f), CY(0.9f + 2.2f * wa), v * 0.9f, US_MAT_ACCENT);
-		wline(c, CX(-0.6f), CY(0.9f + 2.2f * wa), CX(-1.1f), CY(0.9f + 1.4f * wa), v * 0.6f, US_MAT_ACCENT);
+		if (cr)
+			pline(c, CX(0.1f), CY(0.9f), CX(-0.6f), CY(0.9f + 2.2f * wa), v * 0.9f, US_MAT_ACCENT);
+		else {
+			wline(c, CX(0.1f), CY(0.9f), CX(-0.6f), CY(0.9f + 2.2f * wa), v * 0.9f, US_MAT_ACCENT);
+			wline(c, CX(-0.6f), CY(0.9f + 2.2f * wa), CX(-1.1f), CY(0.9f + 1.4f * wa), v * 0.6f, US_MAT_ACCENT);
+		}
 	}
-	/* a short broken reflection under it */
-	wline(c, CX(-0.9f), y + 0.6f * H, CX(0.7f), y + 0.6f * H, v * 0.25f, US_MAT_WATER);
-	wline(c, CX(-0.6f), y + 1.3f * H, CX(0.4f), y + 1.3f * H, v * 0.15f, US_MAT_WATER);
 #undef CX
 #undef CY
 }
@@ -2072,7 +2121,7 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 				e_t = 0.3f, lean_t = 1.0f, k_t = 1.0f;
 				if (st->hn_k > 0.85f && st->hn_tmr > 0.2f) {
 					st->hn_tmr = 0.2f;
-					float S = HERON_S;
+					float S = HERON_S * (ctx->crisp ? 1.5f : 1.0f);
 					ripple_add(st, st->hn_x + st->hn_dir * 0.46f * S / A, HERON_Y - 0.002f, 1.0f);
 				}
 				if (st->hn_tmr <= 0) {
@@ -2103,7 +2152,7 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 			st->hn_lean = us_approach(st->hn_lean, lean_t, 0.5f, dt);
 			st->hn_gulp = us_approach(st->hn_gulp, gulp_t, 0.15f, dt);
 			float lift = st->hn_state == 1 ? 1.0f : 0.0f;
-			heron_draw(c, st->hn_x * A, HERON_Y, HERON_S, st->hn_dir, us_clampf(st->hn_e, 0.0f, 1.1f), st->hn_k, st->hn_lean,
+			heron_draw(c, st->hn_x * A, HERON_Y, HERON_S * (ctx->crisp ? 1.5f : 1.0f), st->hn_dir, us_clampf(st->hn_e, 0.0f, 1.1f), st->hn_k, st->hn_lean,
 				   st->hn_gulp, st->hn_step, lift, wind * us_noise2(t * 0.8f, 5.0f), ctx->crisp ? 0.72f + 0.2f * lvl : hv * 1.15f);
 			/* the shallows lap at its legs */
 			if (!ctx->crisp) {
