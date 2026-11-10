@@ -19,6 +19,14 @@
  * Also: sub -> a long swell rolling toward the viewer; bass -> poplars lean; lowmid -> flowers nod;
  * mid -> kite climbs, swallows rise; air -> kite tail + midges dance; width -> counter-gusts from the
  * other flank; centroid -> wind direction.
+ * Life: a kestrel hangs on the wind by day (a pale barn owl, face on with its legs let down, by night):
+ *        wings flickering, head dead still, almost motionless when it blows hard; a kick's gust jolts it, a
+ *        hard snare and it stoops into the grass in a puff of seed and climbs back out. A hare on the near
+ *        slope sits, grazes and lollops; a snare sits it bolt upright, a hard one sends it jinking away at full
+ *        stretch (it comes back later); kicks flick its ears. Butterflies (white, brimstone, red, blue) flutter
+ *        low by day, flung along by the gust fronts and scattered up by the snare. Two swallows skim the grass
+ *        tips. Wind-flagged hawthorns on the mid hill bow to the kick fronts (may blossom in spring, haws in
+ *        autumn, bare in winter); poppies and cornflowers among the wildflowers.
  * World: reads growth (grass height), season (green spring, seeding summer, golden autumn, sparse
  *        snow-bent winter), daylight (sun/moon, brightness), wind (prevailing breeze), bloom (flowers);
  *        writes pollen (seeds shaken loose, snare flurries).
@@ -99,6 +107,8 @@ typedef struct {
 	float x, y, age, life, len, amp, ph, sp, dir;
 } wisp_t;
 
+#define NBF 7   /* butterflies */
+#define NHAW 3  /* wind-bent hawthorns */
 #define MAX_TIPS 256
 #define MAX_FLAKE 240
 #define MAX_GLINT 96
@@ -175,6 +185,18 @@ typedef struct {
 	float fgx[NFG], fgh[NFG], fgph[NFG], fgb[NFG], fgv[NFG]; /* foreground oat stalks framing the view */
 	float path_x0;        /* where the trodden path leaves the bottom edge (fraction of width) */
 	float cache_A;        /* aspect the blade patterns were computed for */
+	/* the hunter: a kestrel hanging on the wind by day, a barn owl quartering the field by night */
+	float hk_x, hk_y, hk_sx, hk_sy, hk_tx, hk_ty, hk_t, hk_dur, hk_flap, hk_cool, hk_hold, hk_d, hk_j;
+	int hk_st, hk_owl;
+	/* a hare on the near slope */
+	float hr_u, hr_d, hr_dir, hr_t, hr_ph, hr_alert, hr_hold, hr_graze, hr_spd, hr_cool, hr_ear, hr_fd;
+	int hr_st;
+	/* butterflies tossed by the gusts */
+	float bf_x[NBF], bf_y[NBF], bf_vx[NBF], bf_vy[NBF], bf_ph[NBF], bf_fr[NBF];
+	uint8_t bf_kind[NBF];
+	/* hawthorns on the mid hill, flagged by the prevailing wind */
+	float hw_u[NHAW], hw_d[NHAW], hw_h[NHAW], hw_b[NHAW], hw_v[NHAW], hw_lean;
+	int life_init;
 } st_t;
 
 /* ridge line (top edge) of ground layer k at x (normalized units) */
@@ -307,6 +329,23 @@ static void *create(uint32_t seed)
 	}
 	s->breeze = 0.15f;
 	s->light = 0.6f;
+	/* hawthorns on the mid hill, clear of the tree, the kite flyer and the path */
+	s->hw_lean = us_rand(r) < 0.5f ? -1.0f : 1.0f;
+	for (int i = 0; i < NHAW; i++) {
+		float u = 0.5f;
+		for (int tries = 0; tries < 40; tries++) {
+			u = us_randr(r, 0.04f, 0.96f);
+			float side = s->path_x0 > s->tree_u ? 1.0f : -1.0f;
+			int ok = fabsf(u - s->tree_u) > 0.14f && fabsf(u - s->kite_u) > 0.1f && fabsf(u - (s->tree_u + side * 0.12f)) > 0.08f;
+			for (int j = 0; j < i; j++)
+				ok = ok && fabsf(u - s->hw_u[j]) > 0.12f;
+			if (ok)
+				break;
+		}
+		s->hw_u[i] = u;
+		s->hw_d[i] = us_randr(r, 0.05f, 0.16f);
+		s->hw_h[i] = us_randr(r, 0.12f, 0.15f);
+	}
 	return s;
 }
 
@@ -850,7 +889,7 @@ static void spawn_drums(st_t *s, const us_ctx *ctx, int snapped, float sgn)
 	us_rng *r = &s->rng;
 	float dens = ctx->p->density;
 	if (snapped && s->ntip > 0) {
-		int n = (int)((40.0f + 60.0f * us_sat(a->snare)) * (0.5f + dens));
+		int n = (int)((ctx->crisp ? 40.0f + 60.0f * us_sat(a->snare) : 46.0f + 68.0f * us_sat(a->snare)) * (0.5f + dens));
 		us_world_add(ctx->w, &ctx->w->pollen, 0.0002f * n, 1.0f);
 		for (int k = 0; k < n && s->nfk < MAX_FLAKE; k++) {
 			int j = (int)(us_rng_u32(r) % (uint32_t)s->ntip);
@@ -890,7 +929,7 @@ static void spawn_drums(st_t *s, const us_ctx *ctx, int snapped, float sgn)
 		}
 	}
 	if (a->hat_hit && s->ntip > 0) {
-		int n = (int)((16.0f + 30.0f * us_sat(a->hat)) * (0.5f + dens) * (ctx->crisp ? 1.6f : 1.0f));
+		int n = (int)((ctx->crisp ? 16.0f + 30.0f * us_sat(a->hat) : 18.0f + 34.0f * us_sat(a->hat)) * (0.5f + dens) * (ctx->crisp ? 1.6f : 1.0f));
 		for (int k = 0; k < n && s->ngl < MAX_GLINT; k++) {
 			int j = (int)(us_rng_u32(r) % (uint32_t)s->ntip);
 			glint_t *g = &s->gl[s->ngl++];
@@ -1020,6 +1059,682 @@ static void draw_poplars(const st_t *s, us_canvas *c, const us_ctx *ctx, float A
 			wline(c, x + th * 0.06f, gy, mx + th * 0.13f, my, 0.001f, tv, tm);
 			wline(c, mx + th * 0.13f, my, tx, ty, 0.001f, tv, tm);
 			wline(c, x, gy, (x + mx) * 0.5f, (gy + my) * 0.5f, 0.001f, tv * 0.6f, US_MAT_STEM);
+		}
+	}
+}
+
+/* ---- life: shapes. A creature is a union of ellipses: filled solid (pixel: body colour with a lit top rim;
+ *      ink: a near-black cut-out), then (ink) outlined along the union's outer edge only. ---------------- */
+
+typedef struct {
+	float x, y, ax, ay, bx, by, i00, i01, i10, i11;
+} ell_t;
+
+static void ell_mk(ell_t *e, float x, float y, float ax, float ay, float bx, float by)
+{
+	float det = ax * by - bx * ay;
+	if (fabsf(det) < 1e-10f)
+		det = det < 0 ? -1e-10f : 1e-10f;
+	e->x = x;
+	e->y = y;
+	e->ax = ax;
+	e->ay = ay;
+	e->bx = bx;
+	e->by = by;
+	e->i00 = by / det;
+	e->i01 = -bx / det;
+	e->i10 = -ay / det;
+	e->i11 = ax / det;
+}
+
+static inline int ell_in(const ell_t *e, float x, float y, float g)
+{
+	float dx = x - e->x, dy = y - e->y;
+	float u = e->i00 * dx + e->i01 * dy, v = e->i10 * dx + e->i11 * dy;
+	return u * u + v * v < g;
+}
+
+/* a creature's local frame: x forward (units of its size), y up from its feet, pitched by rot */
+typedef struct {
+	float X, Y, kx, ky, cr, sr;
+} xf_t;
+
+static xf_t xf_mk(float X, float Y, float d, float k, float rot)
+{
+	xf_t t = {X, Y, d * k, k, cosf(rot), sinf(rot)};
+	return t;
+}
+
+static inline void xf_vec(const xf_t *t, float lx, float ly, float *x, float *y)
+{
+	float rx = lx * t->cr - ly * t->sr, ry = lx * t->sr + ly * t->cr;
+	*x = t->kx * rx;
+	*y = -t->ky * ry;
+}
+
+static inline void xf_pt(const xf_t *t, float lx, float ly, float *x, float *y)
+{
+	xf_vec(t, lx, ly, x, y);
+	*x += t->X;
+	*y += t->Y;
+}
+
+static void xf_ell(const xf_t *t, ell_t *e, float lx, float ly, float rx, float ry, float ang)
+{
+	float x, y, ax, ay, bx, by;
+	xf_pt(t, lx, ly, &x, &y);
+	xf_vec(t, cosf(ang) * rx, sinf(ang) * rx, &ax, &ay);
+	xf_vec(t, -sinf(ang) * ry, cosf(ang) * ry, &bx, &by);
+	ell_mk(e, x, y, ax, ay, bx, by);
+}
+
+static void xf_cap(const xf_t *t, ell_t *e, float x0, float y0, float x1, float y1, float w)
+{
+	float dx = x1 - x0, dy = y1 - y0, l = sqrtf(dx * dx + dy * dy) + 1e-6f;
+	xf_ell(t, e, 0.5f * (x0 + x1), 0.5f * (y0 + y1), 0.5f * l + 0.3f * w, w, atan2f(dy, dx));
+}
+
+static void xf_line(us_canvas *c, const xf_t *t, float x0, float y0, float x1, float y1, float v, uint8_t m)
+{
+	float ax, ay, bx, by;
+	xf_pt(t, x0, y0, &ax, &ay);
+	xf_pt(t, x1, y1, &bx, &by);
+	if (c->crisp)
+		oline(c, ax, ay, bx, by, 0.5f / c->s, v, m);
+	else
+		wline(c, ax, ay, bx, by, 0.0011f, v, m);
+}
+
+static void xf_tri(us_canvas *c, const xf_t *t, float x0, float y0, float x1, float y1, float x2, float y2, float v, uint8_t m)
+{
+	float ax, ay, bx, by, cx, cy;
+	xf_pt(t, x0, y0, &ax, &ay);
+	xf_pt(t, x1, y1, &bx, &by);
+	xf_pt(t, x2, y2, &cx, &cy);
+	if (c->crisp) {
+		otri(c, ax, ay, bx, by, cx, cy, v, m);
+		return;
+	}
+	wline(c, ax, ay, cx, cy, 0.0011f, v, m);
+	wline(c, bx, by, cx, cy, 0.0011f, v * 0.8f, m);
+}
+
+static void blob(us_canvas *c, const ell_t *e, int n, float fill, float line, uint8_t m)
+{
+	float S = c->s;
+	int crisp = c->crisp;
+	float x0 = 1e9f, x1 = -1e9f, y0 = 1e9f, y1 = -1e9f;
+	for (int i = 0; i < n; i++) {
+		float rx = fabsf(e[i].ax) + fabsf(e[i].bx), ry = fabsf(e[i].ay) + fabsf(e[i].by);
+		x0 = fminf(x0, e[i].x - rx);
+		x1 = fmaxf(x1, e[i].x + rx);
+		y0 = fminf(y0, e[i].y - ry);
+		y1 = fmaxf(y1, e[i].y + ry);
+	}
+	int px0 = (int)floorf(x0 * S), px1 = (int)ceilf(x1 * S), py0 = (int)floorf(y0 * S), py1 = (int)ceilf(y1 * S);
+	if (px0 < 0) px0 = 0;
+	if (py0 < 0) py0 = 0;
+	if (px1 > c->w - 1) px1 = c->w - 1;
+	if (py1 > c->h - 1) py1 = c->h - 1;
+	if (px1 - px0 > 400 || py1 - py0 > 400)
+		return;
+	for (int py = (crisp || fill >= 0) ? py0 : py1 + 1; py <= py1; py++) { /* (ink, fill < 0: outline only) */
+		float y = (py + 0.5f) / S;
+		for (int px = px0; px <= px1; px++) {
+			float x = (px + 0.5f) / S;
+			int in = 0;
+			for (int i = 0; i < n && !in; i++)
+				in = ell_in(&e[i], x, y, 1.0f);
+			if (!in)
+				continue;
+			float v = fill;
+			if (crisp) {
+				int up = 0;
+				for (int i = 0; i < n && !up; i++)
+					up = ell_in(&e[i], x, y - 1.0f / S, 1.0f);
+				if (!up)
+					v = us_sat(fill * 1.3f + 0.05f);
+			}
+			size_t k = (size_t)py * c->w + px;
+			c->ink[k] = (uint8_t)(us_sat(v) * 255.0f);
+			c->mat[k] = m;
+		}
+	}
+	if (crisp || line < 0.004f)
+		return;
+	for (int i = 0; i < n; i++) {
+		const ell_t *q = &e[i];
+		float per = (sqrtf(q->ax * q->ax + q->ay * q->ay) + sqrtf(q->bx * q->bx + q->by * q->by)) * US_PI * S;
+		int ns = (int)(per / 3.0f);
+		ns = ns < 10 ? 10 : ns > 48 ? 48 : ns;
+		float pxp = q->x + q->ax, pyp = q->y + q->ay;
+		for (int k = 1; k <= ns; k++) {
+			float a = US_TAU * k / ns, ca = cosf(a), sa = sinf(a);
+			float xx = q->x + ca * q->ax + sa * q->bx, yy = q->y + ca * q->ay + sa * q->by;
+			float mx = 0.5f * (xx + pxp), my = 0.5f * (yy + pyp);
+			int hid = 0;
+			for (int j = 0; j < n && !hid; j++)
+				if (j != i)
+					hid = ell_in(&e[j], mx, my, 0.92f);
+			if (!hid)
+				wline(c, pxp, pyp, xx, yy, 0.0011f, line, m);
+			pxp = xx;
+			pyp = yy;
+		}
+	}
+}
+
+/* ---- life: the hunter. By day a kestrel hangs on the wind facing into it, wings flickering, head dead
+ *      still; by night a pale barn owl does the same on softer, slower wings. It slides to a new spot now
+ *      and then; a kick's gust jostles it; a hard snare and it stoops into the grass and climbs back out. -- */
+
+static void hunt_spot(st_t *s, float *x, float *y)
+{
+	us_rng *r = &s->rng;
+	float mid = 0.5f * (s->tree_u + s->kite_u);
+	*x = mid + us_randr(r, -0.09f, 0.09f);
+	*y = us_randr(r, 0.33f, 0.41f);
+}
+
+static void hunter(st_t *s, us_canvas *c, const us_ctx *ctx, float A, float sgn, float dayv, int snapped, int kicked)
+{
+	us_rng *r = &s->rng;
+	float dt = ctx->dt;
+	int want_owl = ctx->w->daylight < 0.3f;
+	if (!s->life_init) {
+		s->hk_owl = want_owl;
+		hunt_spot(s, &s->hk_x, &s->hk_y);
+		s->hk_t = us_randr(r, 4.0f, 10.0f);
+		s->hk_d = -sgn;
+	}
+	s->hk_cool -= dt;
+	/* a kick's gust: a sharp jolt it recovers from at once */
+	if (kicked)
+		s->hk_j = 1.0f;
+	s->hk_j = us_approach(s->hk_j, 0.0f, 0.07f, ctx->real_dt);
+	switch (s->hk_st) {
+	case 0: /* hovering */
+		s->hk_t -= dt;
+		if ((snapped && ctx->a->snare > 0.45f && s->hk_cool <= 0) || (want_owl != s->hk_owl && s->hk_cool <= -8.0f)) {
+			s->hk_st = 2; /* the stoop */
+			s->hk_t = 0;
+			s->hk_sx = s->hk_x;
+			s->hk_sy = s->hk_y;
+			s->hk_tx = s->hk_x - sgn * us_randr(r, 0.01f, 0.04f);
+			s->hk_ty = ridge(s, 1, s->hk_tx * A, A) + us_randr(r, 0.08f, 0.2f) * lay_drop[1];
+			s->hk_cool = 6.0f;
+		} else if (s->hk_t <= 0) {
+			s->hk_st = 1;
+			s->hk_t = 0;
+			s->hk_sx = s->hk_x;
+			s->hk_sy = s->hk_y;
+			hunt_spot(s, &s->hk_tx, &s->hk_ty);
+			s->hk_dur = us_randr(r, 2.2f, 3.5f);
+		}
+		break;
+	case 1: /* sliding across to a new spot */
+	case 4: /* climbing back up out of the grass */
+		s->hk_t += dt / s->hk_dur;
+		if (s->hk_t >= 1.0f) {
+			s->hk_st = 0;
+			s->hk_t = us_randr(r, 6.0f, 15.0f);
+			s->hk_x = s->hk_tx;
+			s->hk_y = s->hk_ty;
+		} else {
+			float e = s->hk_st == 4 ? 1.0f - (1.0f - s->hk_t) * (1.0f - s->hk_t) : us_smooth(0.0f, 1.0f, s->hk_t);
+			float nx = us_lerp(s->hk_sx, s->hk_tx, e), ny = us_lerp(s->hk_sy, s->hk_ty, e) - (s->hk_st == 1 ? 0.03f * sinf(US_PI * s->hk_t) : 0.0f);
+			if (fabsf(nx - s->hk_x) > 1e-5f)
+				s->hk_d = nx > s->hk_x ? 1.0f : -1.0f;
+			s->hk_x = nx;
+			s->hk_y = ny;
+		}
+		break;
+	case 2: /* the stoop: wings folded, faster and faster */
+		s->hk_t += dt / 0.5f;
+		if (s->hk_t >= 1.0f) {
+			s->hk_st = 3;
+			s->hk_hold = us_randr(r, 0.7f, 1.4f);
+			s->hk_x = s->hk_tx;
+			s->hk_y = s->hk_ty;
+			/* grass and seed thrown up where it strikes */
+			for (int k = 0; k < 14 && s->nfk < MAX_FLAKE; k++) {
+				flake_t *q = &s->fk[s->nfk++];
+				q->x = q->px = s->hk_x * A + us_randn(r) * 0.006f;
+				q->y = q->py = s->hk_y;
+				q->vx = us_randn(r) * 0.12f + sgn * 0.05f;
+				q->vy = -us_randr(r, 0.1f, 0.3f);
+				q->life = us_randr(r, 0.5f, 0.8f);
+				q->sz = 0.0016f;
+				q->mat = US_MAT_ACCENT;
+			}
+		} else {
+			float e = s->hk_t * s->hk_t;
+			s->hk_x = us_lerp(s->hk_sx, s->hk_tx, e);
+			s->hk_y = us_lerp(s->hk_sy, s->hk_ty, e);
+		}
+		break;
+	case 3: /* down in the grass (the look can change while it is out of sight) */
+		s->hk_hold -= dt;
+		if (s->hk_hold <= 0) {
+			s->hk_owl = want_owl;
+			s->hk_st = 4;
+			s->hk_t = 0;
+			s->hk_sx = s->hk_x;
+			s->hk_sy = s->hk_y;
+			hunt_spot(s, &s->hk_tx, &s->hk_ty);
+			s->hk_dur = us_randr(r, 1.8f, 2.6f);
+		}
+		return;
+	}
+	if (s->hk_st == 0)
+		s->hk_d = -sgn; /* hanging into the wind */
+	/* ---- draw ---- */
+	int owl = s->hk_owl, crisp = c->crisp;
+	float k = (crisp ? 0.046f : 0.03f) * (owl ? 1.1f : 1.0f);
+	/* a kick's gust knocks it off its spot; it works straight back */
+	float x = s->hk_x * A + sgn * 0.02f * s->hk_j, y = s->hk_y - 0.012f * s->hk_j; /* (otherwise dead still on the air) */
+	float vis = owl ? 0.85f : 0.62f; /* the barn owl shows pale in the dark */
+	float fill = crisp ? (owl ? 0.7f : 0.42f) * dayv : 0.015f, line = us_sat(vis * dayv * 1.05f);
+	uint8_t m = US_MAT_ACCENT;
+	float d = s->hk_d;
+	int st = s->hk_st;
+	float rot = 0.0f;
+	if (st == 0)
+		rot = 0.55f; /* hovering: body raised, tail hanging */
+	else if (st == 2)
+		rot = -1.1f - 0.2f * s->hk_t;
+	else if (st == 4)
+		rot = 0.35f;
+	xf_t t = xf_mk(x, y, d, k, rot);
+	if (st == 0) /* the flicker: fast shallow beats, faster when the wind is up and a kick has jostled it */
+		s->hk_flap += dt * (owl ? 9.0f : 15.0f + 6.0f * s->breeze + 10.0f * s->hk_j);
+	else if (st != 2)
+		s->hk_flap += dt * (owl ? 6.0f : 10.0f);
+	/* in a strong wind it hangs almost still on the air, wings barely trembling; in light air it must beat;
+	 * a kick's gust knocks it about and sets it beating hard */
+	float famp = st == 0 ? us_sat(0.2f + 0.8f * (1.0f - s->breeze) * (1.0f - s->breeze) + 1.2f * s->hk_j) : 1.0f;
+	float fl = sinf(s->hk_flap) * famp;
+	if (owl && st != 2) {
+		/* the barn owl, seen face on: a pale heart-shaped face and two dark eyes, broad rounded wings raised
+		 * in a shallow V and beating, legs let down ready to drop */
+		xf_t f = xf_mk(x, y, 1.0f, k, 0.0f);
+		float el = st == 0 ? 0.55f + 0.32f * fl + 0.25f * s->hk_j : 0.2f + 0.75f * fl;
+		for (int sd = -1; sd <= 1; sd += 2) {
+			ell_t w;
+			float ca = cosf(el), sa = sinf(el);
+			xf_cap(&f, &w, sd * 0.1f, 0.12f, sd * (0.1f + 1.05f * ca), 0.12f + 1.05f * sa, 0.21f);
+			blob(c, &w, 1, crisp ? fill * 0.85f : 0.015f, line * 0.85f, m);
+		}
+		for (int sd = -1; sd <= 1; sd += 2)
+			xf_line(c, &f, sd * 0.06f, -0.26f, sd * 0.09f, -0.58f, crisp ? fill * 0.9f : line * 0.75f, m);
+		ell_t e[2];
+		xf_ell(&f, &e[0], 0.0f, 0.0f, 0.2f, 0.3f, 0.0f);
+		xf_ell(&f, &e[1], 0.0f, 0.38f, 0.27f, 0.23f, 0.0f);
+		blob(c, e, 2, fill, line, m);
+		/* the face disc and the eyes */
+		if (crisp) {
+			ell_t fd;
+			xf_ell(&f, &fd, 0.0f, 0.34f, 0.17f, 0.15f, 0.0f);
+			blob(c, &fd, 1, us_sat(fill * 1.25f), 0.0f, m);
+		} else {
+			xf_line(c, &f, 0.0f, 0.5f, -0.16f, 0.42f, line * 0.7f, m);
+			xf_line(c, &f, -0.16f, 0.42f, 0.0f, 0.2f, line * 0.7f, m);
+			xf_line(c, &f, 0.0f, 0.5f, 0.16f, 0.42f, line * 0.7f, m);
+			xf_line(c, &f, 0.16f, 0.42f, 0.0f, 0.2f, line * 0.7f, m);
+		}
+		for (int sd = -1; sd <= 1; sd += 2) {
+			float ex, ey;
+			xf_pt(&f, sd * 0.07f, 0.37f, &ex, &ey);
+			if (crisp)
+				oput(c, (int)(ex * c->s), (int)(ey * c->s), 0.05f, US_MAT_BG);
+			else
+				us_point(c, ex, ey, 0.0009f, line * 0.5f, m);
+		}
+		return;
+	}
+	/* wings: hovering they sweep high over the back, in flight they beat up and down, stooping they are
+	 * folded tight along the body */
+	float wl = owl ? 0.95f : 1.1f;
+	float ta[2], tl[2]; /* far, near wing: angle in the bird's frame and length */
+	if (st == 0) {
+		/* hovering: the wings stand in a V over the back, the near one swept back, the far one forward,
+		 * flickering; a kick's gust flares them */
+		float fl2 = sinf(s->hk_flap - 0.6f) * famp;
+		ta[1] = 1.95f - rot + (owl ? 0.3f : 0.38f) * fl + 0.3f * s->hk_j;
+		ta[0] = 1.25f - rot + (owl ? 0.3f : 0.38f) * fl2 - 0.2f * s->hk_j;
+		tl[1] = wl;
+		tl[0] = wl * 0.8f;
+	} else if (st == 2) {
+		ta[0] = ta[1] = 3.0f;
+		tl[0] = tl[1] = 0.7f;
+	} else {
+		/* flying: up-and-down beats, foreshortened as the wing passes level */
+		float fl2 = sinf(s->hk_flap - 0.5f);
+		ta[1] = 1.85f - 1.85f * (1.0f - fl);
+		ta[0] = 1.85f - 1.85f * (1.0f - fl2);
+		tl[1] = wl * (0.4f + 0.6f * fabsf(sinf(ta[1])));
+		tl[0] = wl * 0.85f * (0.4f + 0.6f * fabsf(sinf(ta[0])));
+	}
+	for (int w = 0; w < 2; w++) { /* far wing first (a beat behind, dimmer), then the body, then the near wing */
+		if (w == 1) {
+			ell_t e[5];
+			int n = 0;
+			xf_ell(&t, &e[n++], 0.0f, 0.0f, 0.36f, owl ? 0.17f : 0.12f, 0.0f);
+			xf_ell(&t, &e[n++], owl ? 0.36f : 0.33f, owl ? 0.08f : 0.04f, owl ? 0.22f : 0.12f, owl ? 0.21f : 0.11f, 0.0f);
+			if (owl && st != 2) /* legs let down, talons ready */
+				for (int q = 0; q < 2; q++)
+					xf_line(c, &t, 0.06f + 0.06f * q, -0.12f, 0.02f + 0.08f * q - 0.06f * rot, -0.5f, crisp ? fill : line * 0.8f, m);
+			if (owl)
+				xf_cap(&t, &e[n++], -0.3f, -0.02f, -0.48f, -0.06f, 0.08f);
+			else { /* the kestrel's long tail, fanned when it hovers */
+				xf_cap(&t, &e[n++], -0.28f, -0.01f, -0.78f, -0.03f, 0.06f + (st == 0 ? 0.03f : 0.0f));
+				if (st == 0)
+					xf_ell(&t, &e[n++], -0.72f, -0.03f, 0.12f, 0.13f, 0.0f);
+			}
+			blob(c, e, n, fill, line, m);
+			if (owl && !crisp) /* the pale heart-shaped face */
+				xf_line(c, &t, 0.5f, 0.2f, 0.52f, -0.04f, line * 0.6f, m);
+			if (!owl && !crisp) /* the hooked bill */
+				xf_line(c, &t, 0.44f, 0.04f, 0.5f, 0.0f, line, m);
+		}
+		float a = ta[w], L = tl[w];
+		float tx = 0.04f + cosf(a) * L, ty = 0.06f + sinf(a) * L;
+		float v = w == 0 ? 0.65f : 1.0f;
+		if (owl) { /* broad rounded wings */
+			ell_t e;
+			xf_cap(&t, &e, 0.06f, 0.06f, tx, ty, 0.14f);
+			blob(c, &e, 1, crisp ? fill * (w == 0 ? 0.8f : 1.0f) : 0.015f, line * v, m);
+		} else { /* long pointed wings: a narrow triangle from the shoulder out to the tip */
+			xf_tri(c, &t, 0.16f, 0.08f, -0.12f, 0.0f, tx, ty, crisp ? fill * (w == 0 ? 0.8f : 1.0f) : line * v, m);
+			if (!crisp)
+				xf_line(c, &t, 0.16f, 0.08f, -0.12f, 0.0f, line * v * 0.6f, m);
+		}
+	}
+	float ex, ey;
+	xf_pt(&t, 0.37f, 0.07f, &ex, &ey);
+	if (crisp)
+		oput(c, (int)(ex * c->s), (int)(ey * c->s), owl ? 0.2f : 0.9f, owl ? US_MAT_BG : US_MAT_LIGHT);
+	else
+		us_point(c, ex, ey, 0.0011f, owl ? 0.3f : 0.8f * dayv, US_MAT_LIGHT);
+}
+
+/* ---- life: a hare on the near slope. It sits, grazes, lollops a few yards; a snare sits it bolt
+ *      upright with its ears straight up; a hard one and it is off, jinking away at full stretch,
+ *      to come back later from the other side. A kick flicks its ears. -------------------------------- */
+
+static void hare_update(st_t *s, const us_ctx *ctx, int snapped, int kicked)
+{
+	us_rng *r = &s->rng;
+	float dt = ctx->dt, rdt = ctx->real_dt, A = ctx->aspect;
+	float snare = us_sat(ctx->a->snare);
+	if (!s->life_init) {
+		s->hr_u = us_clampf(s->kite_u + (s->tree_u < 0.5f ? 0.16f : -0.16f), 0.1f, 0.9f);
+		s->hr_d = us_randr(r, 0.08f, 0.16f);
+		s->hr_dir = us_rand(r) < 0.5f ? -1.0f : 1.0f;
+		s->hr_t = us_randr(r, 2.0f, 5.0f);
+	}
+	s->hr_cool -= dt;
+	if (s->hr_st != 3 && s->hr_st != 4 && snapped && snare > 0.15f) {
+		if (snare > 0.55f && s->hr_cool <= 0 && us_rand(r) < 0.35f) {
+			s->hr_st = 3; /* bolt */
+			s->hr_dir = us_rand(r) < 0.5f ? -1.0f : 1.0f;
+			s->hr_fd = -0.12f;
+			s->hr_cool = 18.0f;
+			s->hr_hold = 0;
+		} else
+			s->hr_hold = 0.6f + 0.8f * snare;
+	}
+	if (kicked)
+		s->hr_ear = 1.0f;
+	s->hr_ear = us_approach(s->hr_ear, 0.0f, 0.12f, rdt);
+	s->hr_hold -= rdt;
+	s->hr_alert = us_approach(s->hr_alert, s->hr_hold > 0 ? 1.0f : 0.0f, s->hr_hold > 0 ? 0.04f : 0.5f, rdt);
+	s->hr_t -= dt * (1.0f - 0.85f * s->hr_alert);
+	float tsp = 0;
+	switch (s->hr_st) {
+	case 0: /* sitting, looking about */
+		if (s->hr_t <= 0) {
+			s->hr_st = us_rand(r) < 0.6f ? 1 : 2;
+			s->hr_t = s->hr_st == 1 ? us_randr(r, 4.0f, 10.0f) : us_randr(r, 1.2f, 3.0f);
+			if (s->hr_st == 2 && us_rand(r) < 0.4f)
+				s->hr_dir = -s->hr_dir;
+		}
+		break;
+	case 1: /* grazing */
+		if (s->hr_t <= 0) {
+			s->hr_st = 0;
+			s->hr_t = us_randr(r, 2.5f, 7.0f);
+		}
+		break;
+	case 2: /* a slow lollop */
+		tsp = 0.3f;
+		if (s->hr_t <= 0) {
+			s->hr_st = 0;
+			s->hr_t = us_randr(r, 2.5f, 7.0f);
+		}
+		break;
+	case 3: /* bolting */
+		tsp = 1.0f;
+		if (us_rand(r) < dt * 0.5f)
+			s->hr_fd = -s->hr_fd * 0.5f; /* a jink */
+		if (s->hr_u < -0.1f || s->hr_u > 1.1f) {
+			s->hr_st = 4;
+			s->hr_t = us_randr(r, 6.0f, 14.0f);
+		}
+		break;
+	case 4: /* gone; it comes back in from an edge at a lollop */
+		if (s->hr_t <= 0) {
+			s->hr_dir = us_rand(r) < 0.5f ? -1.0f : 1.0f;
+			s->hr_u = s->hr_dir > 0 ? -0.06f : 1.06f;
+			s->hr_d = us_randr(r, 0.08f, 0.2f);
+			s->hr_st = 2;
+			s->hr_t = us_randr(r, 4.0f, 7.0f);
+		}
+		break;
+	}
+	/* stay in the field while at ease */
+	if (s->hr_st == 2 && ((s->hr_u < 0.06f && s->hr_dir < 0) || (s->hr_u > 0.94f && s->hr_dir > 0)))
+		s->hr_dir = -s->hr_dir;
+	s->hr_spd = us_approach(s->hr_spd, tsp * (s->hr_st == 3 ? 1.0f : 1.0f - s->hr_alert), s->hr_st == 3 ? 0.12f : 0.3f, dt);
+	float sc = us_lerp(lay_s0[2], lay_s1[2], s->hr_d);
+	float v = s->hr_spd * (s->hr_st == 3 ? 0.55f : 0.1f) * sc / 0.45f;
+	s->hr_u += s->hr_dir * v * dt / A;
+	if (s->hr_st == 3)
+		s->hr_d = us_clampf(s->hr_d + s->hr_fd * dt, 0.04f, 0.3f);
+	/* the gait: bounds when bolting, slow hops at a lollop */
+	s->hr_ph += dt * (s->hr_st == 3 ? 13.0f : 7.0f) * us_sat(s->hr_spd * 4.0f);
+	s->hr_graze = us_approach(s->hr_graze, s->hr_st == 1 && s->hr_alert < 0.3f ? 1.0f : 0.0f, 0.4f, dt);
+}
+
+static void hare_draw(st_t *s, us_canvas *c, const us_ctx *ctx, float A, float dayv)
+{
+	if (s->hr_st == 4)
+		return;
+	int crisp = c->crisp;
+	float x = s->hr_u * A;
+	float y = ridge(s, 2, x, A) + s->hr_d * lay_drop[2];
+	float sc = us_lerp(lay_s0[2], lay_s1[2], s->hr_d);
+	float k = 0.11f * sc * (crisp ? 1.35f : 1.0f);
+	float run = us_sat(s->hr_spd), bolt = s->hr_st == 3 ? run : 0.0f, al = s->hr_alert, g = s->hr_graze * (1.0f - al);
+	float ph = s->hr_ph;
+	float hop = us_sat(sinf(ph)) * (0.12f * run + 0.25f * bolt);
+	xf_t t = xf_mk(x, y - hop * k, s->hr_dir, k, 0.0f);
+	float fill = crisp ? 0.68f * dayv : 0.015f, line = us_sat(0.75f * dayv);
+	uint8_t m = US_MAT_EARTH;
+	/* a bolting hare stretches long and low; sitting it is a hunched oval on long hind feet */
+	float st = bolt * (0.5f + 0.5f * sinf(ph + 1.2f)); /* gathered .. extended */
+	ell_t e[7];
+	int n = 0;
+	float by = 0.32f + 0.1f * al + 0.08f * bolt, bang = 0.32f + 0.35f * al - 0.25f * g - 0.3f * bolt;
+	xf_ell(&t, &e[n++], -0.04f + 0.04f * al, by, 0.38f + 0.14f * st, 0.21f - 0.04f * bolt, bang);
+	xf_ell(&t, &e[n++], -0.24f + 0.06f * bolt, 0.26f + 0.06f * bolt, 0.24f, 0.21f, 0.0f);
+	float hx = 0.32f + 0.15f * g + 0.22f * bolt - 0.02f * al, hy = 0.56f - 0.38f * g + 0.12f * al - 0.08f * bolt;
+	xf_ell(&t, &e[n++], hx, hy, 0.16f, 0.12f, -0.2f - 0.5f * g);
+	/* ears: straight up when alert, laid along the back when running, back when grazing */
+	float tw = 0.15f * s->hr_ear * sinf((float)ctx->t * 30.0f);
+	float ea = 1.85f - 0.2f * al + 0.75f * bolt + 0.5f * g + tw, el = 0.5f + 0.06f * al;
+	xf_cap(&t, &e[n++], hx - 0.04f, hy + 0.07f, hx - 0.04f + cosf(ea) * el, hy + 0.07f + sinf(ea) * el, 0.055f);
+	xf_cap(&t, &e[n++], hx + 0.01f, hy + 0.08f, hx + 0.01f + cosf(ea - 0.18f) * el * 0.95f, hy + 0.08f + sinf(ea - 0.18f) * el * 0.95f, 0.05f);
+	blob(c, e, n, fill, line, m);
+	/* the white scut, flashing as it runs */
+	ell_t sc_e;
+	xf_ell(&t, &sc_e, -0.44f, 0.36f + 0.06f * bolt, 0.07f, 0.07f, 0.0f);
+	blob(c, &sc_e, 1, crisp ? 0.85f * dayv : 0.015f, us_sat(0.8f * dayv), US_MAT_ACCENT);
+	/* legs: long hind feet flat under it when sitting; a bound throws them forward then back */
+	float lv = crisp ? fill : line;
+	float fsw = sinf(ph) * (0.25f * run + 0.35f * bolt);
+	xf_line(c, &t, -0.3f, 0.12f, -0.36f + 0.5f * fsw + 0.3f * st, 0.0f, lv, m);
+	xf_line(c, &t, -0.36f + 0.5f * fsw + 0.3f * st, 0.0f, -0.02f + 0.5f * fsw + 0.3f * st, 0.0f, lv, m);
+	xf_line(c, &t, 0.24f + 0.1f * bolt, 0.2f, 0.26f - 0.6f * fsw + 0.25f * bolt, 0.0f + 0.1f * bolt, lv, m);
+	float ex, ey;
+	xf_pt(&t, hx + 0.06f, hy + 0.03f, &ex, &ey);
+	if (crisp)
+		oput(c, (int)(ex * c->s), (int)(ey * c->s), 0.12f, US_MAT_BG);
+	else
+		us_point(c, ex, ey, 0.001f, 0.6f * dayv, US_MAT_LIGHT);
+}
+
+/* ---- life: butterflies by day, fluttering low over the grass and tossed by the gusts ---------------- */
+
+static void butterflies(st_t *s, us_canvas *c, const us_ctx *ctx, float A, float sgn, int snapped)
+{
+	us_rng *r = &s->rng;
+	us_world *w = ctx->w;
+	float dt = ctx->dt, t = (float)ctx->t;
+	float vis = us_smooth(0.12f, 0.4f, w->daylight) * (1.0f - us_world_winter(w));
+	float warm = us_sat(0.3f + 0.5f * us_world_season_w(w, 1) + 0.3f * us_world_season_w(w, 0) + w->insects);
+	int nb = 2 + (int)((NBF - 2) * warm * (0.4f + 0.8f * ctx->p->density));
+	if (nb > NBF)
+		nb = NBF;
+	for (int i = 0; i < NBF; i++) {
+		if (!s->life_init) {
+			s->bf_x[i] = us_rand(r) * A;
+			s->bf_y[i] = us_randr(r, 0.6f, 0.86f);
+			s->bf_ph[i] = us_rand(r) * 10.0f;
+			s->bf_fr[i] = us_randr(r, 9.0f, 13.0f);
+			s->bf_kind[i] = (uint8_t)(us_rand(r) * 4);
+		}
+		float x = s->bf_x[i], y = s->bf_y[i];
+		/* erratic flutter on a lazy drift downwind; a gust front picks it up and flings it along */
+		float fb = front_at(s, x / A, 0.6f);
+		float n1 = us_noise2(i * 13.1f, t * 0.9f), n2 = us_noise2(i * 7.7f + 40.0f, t * 1.1f);
+		float tvx = sgn * (0.015f + 0.08f * s->breeze) + 0.09f * n1 + 0.35f * fb;
+		float lo = 0.6f, hi = 0.88f;
+		float tvy = 0.07f * n2 + (y < lo ? 0.08f : y > hi ? -0.08f : 0.0f) - 0.12f * fabsf(fb);
+		s->bf_vx[i] += (tvx - s->bf_vx[i]) * us_sat(dt * 2.5f);
+		s->bf_vy[i] += (tvy - s->bf_vy[i]) * us_sat(dt * 3.0f);
+		if (snapped && us_rand(r) < 0.8f) { /* a snare: they scatter up */
+			s->bf_vy[i] -= us_randr(r, 0.1f, 0.25f);
+			s->bf_vx[i] += us_randn(r) * 0.12f;
+		}
+		x += s->bf_vx[i] * dt;
+		y += s->bf_vy[i] * dt + 0.036f * sinf(s->bf_ph[i] * 0.5f) * dt;
+		if (x > A + 0.05f) x -= A + 0.1f;
+		if (x < -0.05f) x += A + 0.1f;
+		y = us_clampf(y, 0.45f, 0.98f);
+		s->bf_x[i] = x;
+		s->bf_y[i] = y;
+		s->bf_ph[i] += dt * s->bf_fr[i] * (1.0f + 0.5f * fabsf(fb));
+		if (i >= nb || vis < 0.02f)
+			continue;
+		/* lower in the frame is nearer the viewer: a little larger */
+		float sz = (0.006f + 0.006f * us_smooth(0.55f, 0.95f, y)) * (c->crisp ? 1.5f : 1.0f);
+		float open = fabsf(sinf(s->bf_ph[i]));
+		static const uint8_t mats[4] = {US_MAT_ACCENT, US_MAT_LIGHT, US_MAT_BLOOM, US_MAT_WATER};
+		uint8_t m = mats[s->bf_kind[i]];
+		float v = us_sat((s->bf_kind[i] == 0 ? 0.85f : 0.8f) * vis);
+		for (int sd = -1; sd <= 1; sd += 2) {
+			float af = -US_PI * 0.5f + sd * (0.2f + 1.15f * open), ah = af + sd * 0.75f;
+			if (c->crisp) {
+				float fx = x + cosf(af) * sz, fy = y + sinf(af) * sz;
+				us_line(c, x, y, fx, fy, 0.004f, v, m);
+				us_point(c, x + cosf(ah) * sz * 0.6f, y + sinf(ah) * sz * 0.6f, 0.002f, v * 0.9f, m);
+			} else {
+				leafshape(c, x, y, af, sz, sz * 0.42f, v, m);
+				leafshape(c, x, y, ah, sz * 0.7f, sz * 0.32f, v * 0.85f, m);
+			}
+		}
+		if (!c->crisp)
+			wline(c, x, y - sz * 0.2f, x, y + sz * 0.45f, 0.0011f, v * 0.7f, US_MAT_ACCENT);
+	}
+}
+
+/* ---- life: hawthorns on the mid hill, flagged by the prevailing wind: crowns combed out to the lee,
+ *      bare on the windward side. White may-blossom in spring, red haws in autumn; a kick's gust bows them. */
+
+static void hawthorn(st_t *s, us_canvas *c, const us_ctx *ctx, int i, float A, float sgn, float gstr, float dayv, float spring,
+		     float autumn, float winter)
+{
+	float dt = ctx->dt, t = (float)ctx->t;
+	int crisp = c->crisp;
+	float u = s->hw_u[i], x = u * A;
+	float d = s->hw_d[i];
+	float y = ridge(s, 1, x, A) + d * lay_drop[1];
+	float sc = us_lerp(lay_s0[1], lay_s1[1], d) / 0.12f;
+	float h = s->hw_h[i] * sc;
+	/* the boughs sway on a spring; a kick front bows them */
+	float fb = front_at(s, u, us_lerp(lay_s0[1], lay_s1[1], d));
+	float target = sgn * (0.05f + 0.25f * gstr * (0.6f + 0.4f * us_noise2(i * 3.3f, t * 0.6f))) + 0.5f * fb;
+	s->hw_v[i] += ((target - s->hw_b[i]) * 22.0f - s->hw_v[i] * 4.0f) * dt;
+	s->hw_b[i] += s->hw_v[i] * dt;
+	float b = s->hw_b[i], L = s->hw_lean;
+	float bv = (crisp ? 0.3f : 0.55f) * dayv;
+	/* trunk: low and leaning hard to the lee */
+	float tx = x + L * h * 0.28f + b * h * 0.1f, ty = y - h * 0.4f;
+	if (crisp)
+		oline(c, x, y, tx, ty, 1.5f / c->s, bv, US_MAT_STEM);
+	else {
+		wline(c, x - 0.0015f, y, tx, ty, 0.0011f, bv, US_MAT_STEM);
+		wline(c, x + 0.0015f, y, tx + 0.001f, ty, 0.0011f, bv * 0.8f, US_MAT_STEM);
+	}
+	/* the crown: a lopsided mass, its windward side shorn, combed out to the lee */
+	/* the crown rises from a low, shorn windward shoulder to a high streaming lee side */
+	float cx = tx, cy = ty;
+	ell_t e[4];
+	int n = 0;
+	float leaf = 1.0f - winter;
+	static const float CX[4] = {-0.18f, 0.08f, 0.34f, 0.56f}, CY[4] = {0.06f, 0.2f, 0.28f, 0.24f};
+	static const float RX[4] = {0.17f, 0.24f, 0.25f, 0.2f}, RY[4] = {0.15f, 0.22f, 0.22f, 0.15f};
+	for (int q = 0; q < 4; q++) {
+		float f = q / 3.0f;
+		float ex = cx + L * h * CX[q] + b * h * (0.1f + 0.3f * f), ey = cy - h * CY[q];
+		float lk = 0.8f + 0.2f * leaf;
+		ell_mk(&e[n++], ex, ey, h * RX[q] * lk, 0.0f, -L * h * RY[q] * 0.3f * lk, h * RY[q] * lk);
+	}
+	if (winter < 0.7f) {
+		blob(c, e, n, crisp ? 0.26f * dayv : -1.0f, 0.42f * dayv * leaf, US_MAT_LEAF);
+		if (!crisp) /* ink: the foliage as short strokes combed downwind */
+			for (int q = 0; q < 28; q++) {
+				uint32_t hh = (uint32_t)q * 2246822519u + (uint32_t)i * 31u;
+				const ell_t *E = &e[q & 3];
+				float an = ((hh >> 8) & 1023) / 1023.0f * US_TAU, rr = sqrtf(((hh >> 18) & 1023) / 1023.0f) * 0.8f;
+				float px = E->x + cosf(an) * rr * E->ax + sinf(an) * rr * E->bx, py = E->y + sinf(an) * rr * E->by;
+				float ln = h * 0.1f;
+				wline(c, px, py, px + L * ln + b * ln * 0.5f, py - ln * 0.25f, 0.0011f, 0.38f * dayv * leaf, US_MAT_LEAF);
+			}
+	}
+	/* limbs (always; they are all you see in winter) */
+	for (int q = 0; q < 3; q++) {
+		float ex = e[q + 1].x + L * h * 0.08f, ey = e[q + 1].y - h * 0.02f * q;
+		if (crisp)
+			oline(c, tx, ty, ex, ey, 0.5f / c->s, bv * (winter > 0.5f ? 1.2f : 0.9f), US_MAT_STEM);
+		else
+			wline(c, tx, ty, ex, ey, 0.0011f, bv * (winter > 0.5f ? 1.0f : 0.6f), US_MAT_STEM);
+	}
+	/* may blossom / haws: dots over the crown */
+	float bl = us_sat(spring * 1.4f - 0.3f) * leaf, hw = us_sat(autumn * 1.4f - 0.3f);
+	if (bl > 0.05f || hw > 0.05f) {
+		int nd = crisp ? 9 : 22;
+		for (int q = 0; q < nd; q++) {
+			uint32_t hh = (uint32_t)q * 2654435761u + (uint32_t)i * 97u;
+			float a = ((hh >> 8) & 1023) / 1023.0f, bq = ((hh >> 18) & 1023) / 1023.0f;
+			const ell_t *E = &e[q % n];
+			float an = a * US_TAU, rr = sqrtf(bq) * 0.85f;
+			float px = E->x + cosf(an) * rr * E->ax + sinf(an) * rr * E->bx, py = E->y + sinf(an) * rr * E->by;
+			if (bl > 0.05f)
+				us_point(c, px, py, crisp ? 0.003f : 0.0012f, bl * 0.8f * dayv, US_MAT_ACCENT);
+			else if ((q & 1) == 0)
+				us_point(c, px, py, crisp ? 0.003f : 0.0012f, hw * 0.75f * dayv, US_MAT_BLOOM);
 		}
 	}
 }
@@ -1207,6 +1922,7 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 
 	float dayv = 0.8f + 0.2f * us_smooth(0.0f, 0.6f, day);
 	float lightk = 0.5f + 0.75f * s->light; /* how lit the field is (loudness) */
+	hare_update(s, ctx, snapped, kicked == 1);
 
 	/* ---- the tree's spring: pushed by the local wind (fronts included), overshoots and rebounds ---- */
 	float tear = 0;
@@ -1464,7 +2180,7 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 	fp.lt = s->light;
 	fp.shk = ctx->crisp ? shk * 0.5f : shk;
 	fp.light = dayv * lightk * (0.15f + 0.85f * lightk);
-	fp.push = s->kimp * (ctx->crisp ? 1.7f : 4.0f); /* ink: the whole field brightens under the gust; pixel: gently, so it never flashes */
+	fp.push = s->kimp * (ctx->crisp ? 1.7f : 4.4f); /* ink: the whole field brightens under the gust; pixel: gently, so it never flashes */
 	fp.hat = s->henv;
 	fp.cloud = s->cloud_t;
 	/* pixel/mono: the land follows the daylight like the sky does; by night it sinks into muted earth and
@@ -1496,7 +2212,9 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 			}
 		}
 	}
-	int tree_done = 0, kite_done = 0;
+	int tree_done = 0, kite_done = 0, hare_done = 0;
+	int haw_done[NHAW] = {0};
+	int nhaw = 1 + (int)((NHAW - 1) * dens + 0.5f);
 	for (int k = 0; k < NLAY; k++) {
 		if (k == 1)
 			draw_poplars(s, c, ctx, A, sgn, dayv * lightk, winter);
@@ -1550,6 +2268,16 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 				draw_tree(s, c, ctx, A, sgn, s->gust, autumn, winter, dayv * lightk, tear);
 				tree_done = 1;
 			}
+			if (k == 1)
+				for (int i = 0; i < nhaw; i++)
+					if (!haw_done[i] && d >= s->hw_d[i]) {
+						hawthorn(s, c, ctx, i, A, sgn, gstr, dayv * lightk, spring, autumn, winter);
+						haw_done[i] = 1;
+					}
+			if (k == 2 && !hare_done && d >= s->hr_d) {
+				hare_draw(s, c, ctx, A, dayv * (0.75f + 0.25f * lightk));
+				hare_done = 1;
+			}
 			if (k == 1 && !kite_done && d >= KITE_D) {
 				float kx = s->kite_u * A;
 				draw_kite(s, c, ctx, A, sgn, ridge(s, 1, kx, A) + KITE_D * lay_drop[1], us_lerp(lay_s0[1], lay_s1[1], KITE_D), dayv,
@@ -1581,6 +2309,27 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 			float hatf = s->henv * (k == 0 ? 1.0f : 1.0f - sqrtf(sc)); /* hats glint along the far rows */
 			/* pixel canvases show the mid hill as colour with only a few strokes on it */
 			int kstep = ctx->crisp ? (k == 1 ? 3 : 2) : 1;
+			if (ctx->crisp && k == 1 && winter < 0.5f) {
+				/* pixel: the blades left out still carry their flowers, so the hill is dotted with drifts of
+				 * poppies and cornflowers */
+				float fk = (0.5f + 0.7f * w->bloom) * (1.0f - 0.7f * autumn);
+				for (int q = 0; q < nb; q++) {
+					if ((q - (row * 7) % kstep) % kstep == 0)
+						continue;
+					blade_t *b = &s->bl[b0 + q];
+					if (b->tint < 2 || fmodf(b->ph * 7.31f, 1.0f) > (0.02f + 0.7f * b->fpatch) * fk)
+						continue;
+					float x = b->u * A, y = row_y(s, row, x, A);
+					float hw, xc = path_at(s, A, k, d, sc, &hw);
+					if (xc > -5 && fabsf(x - xc) < hw)
+						continue;
+					float hh = H * b->h * b->clump * 0.8f;
+					float bx = 0.2f * sgn * hh * 0.6f; /* (held at their resting lean: pixel flicker would read as noise) */
+					int pop = fmodf(b->ph * 11.3f, 1.0f) < 0.55f;
+					us_put(c, (int)((x + bx) * c->s), (int)((y - hh) * c->s), us_sat((0.55f + 0.3f * sunk) * dayv * lightk),
+					       pop ? US_MAT_BLOOM : US_MAT_WATER);
+				}
+			}
 			for (int q = (row * 7) % kstep; q < nb; q += kstep) {
 				blade_t *b = &s->bl[b0 + q];
 				float x = b->u * A;
@@ -1676,15 +2425,34 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 							else
 								wline(c, fx, fy, px2, py2, 0.0008f, fv * 0.45f, US_MAT_ACCENT);
 						}
-					} else if (c->crisp) {
-						us_disc(c, fx, fy, rr * 0.9f, fv, US_MAT_BLOOM);
 					} else {
-						/* five petals: little loops around a bright eye */
-						for (int qq = 0; qq < 5; qq++) {
-							float an = US_TAU * qq / 5 + b->ph + nod * 2.0f;
-							wline(c, fx, fy, fx + cosf(an) * rr, fy + sinf(an) * rr * 0.7f, 0.0016f + 0.001f * sc, fv * 0.8f, US_MAT_BLOOM);
+						/* poppies (red cups), cornflowers (ragged blue stars) and ox-eye daisies */
+						float kind = fmodf(b->ph * 11.3f, 1.0f);
+						int poppy = kind < 0.45f, corn = !poppy && kind < 0.78f;
+						if (c->crisp) {
+							us_disc(c, fx, fy, rr * 0.9f, fv, corn ? US_MAT_WATER : US_MAT_BLOOM);
+						} else if (poppy) {
+							/* a nodding cup of four broad petals, open to the side */
+							float an0 = b->ph + nod * 2.0f;
+							for (int qq = 0; qq < 4; qq++) {
+								float an = an0 + US_TAU * qq / 4;
+								leafshape(c, fx, fy, an, rr * 1.1f, rr * 0.55f, fv * 0.85f, US_MAT_BLOOM);
+							}
+							us_point(c, fx, fy, 0.001f + 0.0008f * sc, fv * 0.25f, US_MAT_BLOOM);
+						} else if (corn) {
+							for (int qq = 0; qq < 8; qq++) {
+								float an = US_TAU * qq / 8 + b->ph;
+								float ln = rr * (0.75f + 0.3f * (qq & 1));
+								wline(c, fx, fy, fx + cosf(an) * ln, fy + sinf(an) * ln * 0.75f, 0.0013f + 0.0008f * sc, fv * 0.85f, US_MAT_WATER);
+							}
+						} else {
+							/* five petals: little loops around a bright eye */
+							for (int qq = 0; qq < 5; qq++) {
+								float an = US_TAU * qq / 5 + b->ph + nod * 2.0f;
+								wline(c, fx, fy, fx + cosf(an) * rr, fy + sinf(an) * rr * 0.7f, 0.0016f + 0.001f * sc, fv * 0.8f, US_MAT_ACCENT);
+							}
+							us_point(c, fx, fy, 0.0011f + 0.001f * sc, us_sat(fv * 1.3f), US_MAT_LIGHT);
 						}
-						us_point(c, fx, fy, 0.0011f + 0.001f * sc, us_sat(fv * 1.3f), US_MAT_LIGHT);
 					}
 					tip_add(s, fx, fy, sc + 2.0f); /* +2 marks a flower (petals fly) */
 				}
@@ -1730,9 +2498,11 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 	}
 
 	/* ---- the near layer: oat stalks framing the view; then the drums' answers on top ---- */
+	hunter(s, c, ctx, A, sgn, dayv * (0.8f + 0.2f * lightk), snapped, kicked == 1);
 	draw_fg(s, c, ctx, A, sgn, gstr, ax, az, height, dayv, lightk, winter, spring);
 	spawn_drums(s, ctx, snapped, sgn);
 	draw_drums(s, c, ctx, sgn, dayv * (0.45f + 0.45f * lightk));
+	butterflies(s, c, ctx, A, sgn, snapped);
 
 	/* ---- seeds / pollen adrift ---- */
 	s->seed_acc += shake;
@@ -1864,6 +2634,8 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 			bird_t *b = &s->bd[i];
 			float ty = HZ - 0.03f - (0.05f + 0.22f * s->mid_s) * (0.4f + 0.6f * b->alt) +
 				   0.05f * us_noise2(b->ph, (float)ctx->t * 0.25f);
+			if (i < 2) /* two skim low over the grass tips, hawking for the insects the wind stirs up */
+				ty = ridge(s, 2, b->x * A, A) - 0.07f - 0.04f * s->mid_s + 0.03f * us_noise2(b->ph + 9.0f, (float)ctx->t * 0.5f);
 			float tvx = sgn * (0.06f + 0.22f * s->gust) * (0.7f + 0.6f * b->alt) + 0.12f * us_noise2(b->ph + 4.0f, (float)ctx->t * 0.3f);
 			b->vx += (tvx - b->vx) * dt * 1.5f;
 			b->vy += ((ty - b->y) * 2.0f - b->vy * 1.4f) * dt;
@@ -1933,6 +2705,7 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 				us_point(c, x, y, 0.0009f, 0.4f * (1.0f - night) * dayv, US_MAT_ACCENT);
 		}
 	}
+	s->life_init = 1;
 }
 
 const us_scene_vt us_scene_wind = {"wind", "Wind", 0.0f, create, destroy, frame};
