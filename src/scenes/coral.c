@@ -119,7 +119,29 @@ typedef struct {
 } turtle_t;
 
 typedef struct {
+	int on, dir, phase;
+	float x, y, L, fl, glide, phase_t, wait, ph;
+} ray_t;
+
+typedef struct {
+	int mode; /* 0 sitting in its den, 1 jetting away, 2 swimming back, settling */
+	float x, y, vx, vy, hx, hy; /* mantle centre; den */
+	float stream, blanch, band, band_x, mood, cool, ph, mt;
+	float ink_x[6], ink_y[6], ink_r[6], ink_a[6];
+} octo_t;
+
+typedef struct {
+	int g;          /* the seagrass tuft it holds on to */
+	float tuck, ph, dir;
+} horse_t;
+
+typedef struct {
+	float u, face, rot, size, ph;
+} star_t;
+
+typedef struct {
 	us_rng rng;
+	us_rng rng2; /* the reef dwellers' own dice, so they leave the rest of the reef's draws untouched */
 	int inited;
 	float A0;
 	/* geography */
@@ -148,6 +170,12 @@ typedef struct {
 	school_t sc[MAX_SCHOOL];
 	rfish_t rf[MAX_RF];
 	turtle_t tu;
+	ray_t ray;
+	octo_t oc;
+	horse_t hs[2];
+	star_t ss[3];
+	int mor_h; /* the crevice the moray lives in */
+	float mor_side, mor_ext, mor_to, mor_ph;
 	/* envelopes */
 	float low_env, bass_env, hi_env, lvl_env, lvl_slow, swell_k, open_env, sub_env, mid_env, cent_env;
 	float surge_ph, surge_amp, cur_ang, duck, duck_to;
@@ -160,6 +188,7 @@ static void *create(uint32_t seed)
 {
 	st_t *s = calloc(1, sizeof(*s));
 	us_rng_seed(&s->rng, seed ^ 0x636f7261u);
+	us_rng_seed(&s->rng2, seed ^ 0x72656566u);
 	return s;
 }
 
@@ -487,7 +516,7 @@ static void add_col(st_t *st, int type, int rock, float u, float face, float siz
 
 static void init_scene(st_t *st, const us_ctx *ctx)
 {
-	us_rng *r = &st->rng;
+	us_rng *r = &st->rng, *r2 = &st->rng2;
 	us_world *w = ctx->w;
 	float A = ctx->aspect;
 	st->A0 = A;
@@ -641,6 +670,73 @@ static void init_scene(st_t *st, const us_ctx *ctx)
 		f->wait = us_randr(r, 2.0f, 8.0f);
 	}
 	st->tu.wait = us_randr(r, 3.0f, 9.0f);
+	st->ray.wait = us_randr(r2, 14.0f, 26.0f);
+	st->ray.ph = us_rand(r2) * 10.0f;
+	/* the moray keeps the biggest crevice of the main outcrop; the octopus a den on the far side of it */
+	{
+		/* the crevice clearest of colonies (so the eel's head reads against bare rock) */
+		int hb = 0, ho = 0;
+		float clear_b = -1.0f;
+		for (int h = 0; h < m->nh; h++) {
+			float fx = m->cx + m->hu[h] * m->hw, top = rock_top(m, fx);
+			float y = top + (m->base - top) * m->hd[h];
+			float dmin = 9.0f, nside = 1.0f;
+			for (int i = 0; i < st->ncol; i++) {
+				col_t *k = &st->col[i];
+				if (k->rock != 0)
+					continue;
+				float ky = col_base_y(st, k) - k->size * 0.3f;
+				float ddx = (k->fx - fx) * A, ddy = ky - y;
+				float d = sqrtf(ddx * ddx + ddy * ddy) - k->size * 0.5f;
+				if (d < dmin)
+					dmin = d, nside = k->fx > fx ? -1.0f : 1.0f;
+			}
+			dmin += 0.2f * m->hr[h];
+			if (dmin > clear_b)
+				clear_b = dmin, hb = h, st->mor_side = nside; /* it looks away from its nearest neighbour */
+		}
+		float best = -1.0f;
+		for (int h = 0; h < m->nh; h++)
+			if (h != hb && fabsf(m->hu[h] - m->hu[hb]) > best)
+				best = fabsf(m->hu[h] - m->hu[hb]), ho = h;
+		st->mor_h = hb;
+		st->mor_ext = 0.5f, st->mor_to = 1.0f;
+		octo_t *o = &st->oc;
+		float fx = m->cx + m->hu[ho] * m->hw, top = rock_top(m, fx);
+		o->hx = fx;
+		o->hy = top + (m->base - top) * m->hd[ho] - 0.004f;
+		o->x = fx * A, o->y = o->hy;
+		o->ph = us_rand(r2) * 10.0f;
+		o->band = 1.0f;
+		o->cool = 3.0f;
+	}
+	for (int i = 0; i < 3; i++) {
+		star_t *q = &st->ss[i];
+		q->u = us_randr(r2, -0.8f, 0.8f);
+		q->face = us_randr(r2, 0.35f, 0.75f);
+		q->rot = us_rand(r2) * US_TAU;
+		q->size = us_randr(r2, 0.014f, 0.019f);
+		q->ph = us_rand(r2) * 10.0f;
+	}
+	/* seahorses, each holding a seagrass tuft out on the sand (not under the kelp, not by the anemone) */
+	for (int k = 0; k < 2; k++) {
+		horse_t *hh = &st->hs[k];
+		hh->g = k;
+		float bestv = -1.0f;
+		for (int i = 0; i < MAX_GRASS; i++) {
+			grass_t *g = &st->grass[i];
+			float d = (g->y - Y_HOR) / (1.0f - Y_HOR);
+			float side = k ? (g->fx > m->cx ? 1.0f : 0.0f) : (g->fx < m->cx ? 1.0f : 0.0f);
+			float score = side + (g->fx > 0.16f && g->fx < 0.84f ? 2.5f : 0.0f) + (d > 0.3f && d < 0.75f ? 1.0f : 0.0f) +
+				      (fabsf(g->fx - (m->cx + sgn * m->hw * 0.98f)) > 0.08f ? 1.0f : 0.0f) + 0.3f * hashf(0x4057u, i);
+			if (k && i == st->hs[0].g)
+				score = -9.0f;
+			if (score > bestv)
+				bestv = score, hh->g = i;
+		}
+		hh->dir = st->grass[hh->g].fx < 0.5f ? 1.0f : -1.0f;
+		hh->ph = us_rand(r2) * 10.0f;
+	}
 	st->cur_ang = us_randr(r, -0.4f, 0.4f);
 	st->surge_amp = 0.3f;
 	st->inited = 1;
@@ -936,6 +1032,315 @@ static void draw_turtle(us_canvas *c, const turtle_t *tu, float v)
 		wu_line(c, sx0, sy0, ex, ey - 0.03f * L, sk * 0.9f, US_MAT_STEM);
 }
 
+/* a spotted eagle ray seen a little from above: pointed wings that rise and beat down (on the kicks), a
+ * duck-bill snout, a long whip of a tail; fl is the wingtip height (+1 up, -1 down) */
+static void ray_pt(const ray_t *ry, float u, float w, float *ox, float *oy)
+{
+	float L = ry->L;
+	float lift = ry->fl * 0.2f * L * powf(fminf(1.0f, fabsf(w) / 0.5f), 1.5f);
+	*ox = ry->x + ry->dir * u * L * (1.0f - 0.12f * fabsf(ry->fl) * fabsf(w) / 0.5f);
+	*oy = ry->y + w * L * 0.42f - lift;
+}
+
+static void draw_ray(us_canvas *c, const ray_t *ry, float v, float t)
+{
+	enum { NO = 8 };
+	static const float pu[NO] = {0.36f, 0.31f, 0.2f, 0.1f, -0.12f, -0.07f, -0.15f, -0.2f};
+	static const float pw[NO] = {0.0f, 0.045f, 0.075f, 0.24f, 0.5f, 0.28f, 0.1f, 0.04f};
+	float L = ry->L;
+	/* the tail first, a slow wave travelling down it */
+	{
+		float px, py;
+		ray_pt(ry, -0.2f, 0.0f, &px, &py);
+		for (int k = 1; k <= 12; k++) {
+			float f = k / 12.0f;
+			float u = -0.2f - 0.95f * f;
+			float qx, qy;
+			ray_pt(ry, u, 0.0f, &qx, &qy);
+			qy += 0.03f * L * f * sinf(t * 2.0f - f * 6.0f + ry->ph);
+			hair(c, px, py, qx, qy, v * (0.45f - 0.25f * f), US_MAT_WATER);
+			px = qx, py = qy;
+		}
+	}
+	float xy[2 * (2 * NO)];
+	int n = 0;
+	for (int i = 0; i < NO; i++, n++)
+		ray_pt(ry, pu[i], pw[i], &xy[2 * n], &xy[2 * n + 1]);
+	for (int i = NO - 1; i >= 1; i--, n++)
+		ray_pt(ry, pu[i], -pw[i], &xy[2 * n], &xy[2 * n + 1]);
+	/* the far wing is drawn darker: the near wing and the body over it */
+	float far[2 * (NO + 2)];
+	int nf = 0;
+	ray_pt(ry, pu[2], 0.0f, &far[0], &far[1]), nf++;
+	for (int i = 2; i < NO; i++, nf++)
+		ray_pt(ry, pu[i], -pw[i], &far[2 * nf], &far[2 * nf + 1]);
+	ray_pt(ry, pu[NO - 1], 0.0f, &far[2 * nf], &far[2 * nf + 1]), nf++;
+	/* a dark back against the bright water, a paler rim where the light catches the wing edges */
+	poly_over(c, xy, n, v * 0.12f, v * 0.1f, US_MAT_WATER);
+	poly_over(c, far, nf, v * 0.08f, v * 0.07f, US_MAT_WATER);
+	for (int i = 0; i < n; i++) {
+		int j = (i + 1) % n;
+		hair(c, xy[2 * i], xy[2 * i + 1], xy[2 * j], xy[2 * j + 1], v * 0.5f, US_MAT_WATER);
+	}
+	/* the head lobe and the eye */
+	{
+		float hx, hy;
+		ray_pt(ry, 0.29f, 0.0f, &hx, &hy);
+		ell_over(c, hx, hy, 0.05f * L, 0.03f * L, v * 0.14f, US_MAT_WATER, 0.5f, 0, 0.0f);
+		float ex, ey;
+		ray_pt(ry, 0.24f, 0.06f, &ex, &ey);
+		us_disc(c, ex, ey, c->crisp ? 0.002f : 0.006f * L, v * 0.6f, US_MAT_ACCENT);
+	}
+	/* white spots over the back */
+	int ns = c->crisp ? 6 : 18;
+	for (int k = 0; k < ns; k++) {
+		float h1 = hashf(0x5eedu, k), h2 = hashf(0x5eedu, k + 50);
+		float u = -0.12f + 0.3f * h1, w = (h2 - 0.5f) * 2.0f * (0.06f + 0.35f * (0.18f - fabsf(u - 0.06f)) / 0.18f);
+		float sx, sy;
+		ray_pt(ry, u, w, &sx, &sy);
+		if (c->crisp)
+			us_put(c, (int)(sx * c->s), (int)(sy * c->s), us_sat(v * 0.7f), US_MAT_ACCENT);
+		else
+			us_disc(c, sx, sy, 0.0045f * L, us_sat(v * 0.6f), US_MAT_ACCENT);
+	}
+}
+
+/* a day octopus on the reef: a bulbous mantle over a crown of curling arms; it jets off trailing its arms */
+static void draw_octo(us_canvas *c, const octo_t *o, float v, float t, float sway)
+{
+	float m = o->stream;
+	/* the mantle axis: up and a little back while it sits, leading the way when it jets */
+	float vl = sqrtf(o->vx * o->vx + o->vy * o->vy) + 1e-6f;
+	float sit_a = -US_PI * 0.5f - 0.35f + 0.08f * sinf(o->ph * 0.3f);
+	float jet_a = atan2f(o->vy / vl, o->vx / vl);
+	float da = jet_a - sit_a;
+	while (da > US_PI) da -= US_TAU;
+	while (da < -US_PI) da += US_TAU;
+	float ax = sit_a + da * m;
+	float cx = cosf(ax), cy = sinf(ax), px = -cy, py = cx;
+	float bx = o->x, by = o->y;
+	uint8_t mat = o->blanch > 0.4f ? US_MAT_ACCENT : o->mood > 0.5f ? US_MAT_BLOOM : US_MAT_EARTH;
+	float vb = us_sat(v * (0.62f + 0.6f * o->blanch));
+	/* the arms */
+	for (int k = 0; k < 8; k++) {
+		float side = k < 4 ? -1.0f : 1.0f;
+		float a_sit = ax + US_PI + (k - 3.5f) * 0.4f;
+		float a_jet = ax + US_PI + (k - 3.5f) * 0.05f;
+		float ang = us_lerp(a_sit, a_jet, m);
+		float x = bx, y = by;
+		const int N = c->crisp ? 6 : 9;
+		float seg = (0.072f + 0.012f * hashf(0x0c70u, k)) / N * (1.0f + 0.25f * m);
+		for (int i = 0; i < N; i++) {
+			float f = (float)i / N;
+			float curl = (1.0f - m) * ((0.06f + 0.2f * f) * sinf(o->ph * 0.8f + k * 1.9f + f * 3.0f) + (f > 0.6f ? side * 0.5f * (f - 0.6f) : 0.0f));
+			ang += curl + m * 0.05f * sinf(t * 6.0f + k + f * 5.0f) - (1.0f - m) * 0.06f * sway * f * cosf(ang);
+			float nx = x + cosf(ang) * seg, ny = y + sinf(ang) * seg;
+			float r0 = 0.0042f * (1.0f - f) + 0.0007f, r1 = 0.0042f * (1.0f - f - 1.0f / N) + 0.0007f;
+			cap_over(c, x, y, nx, ny, r0, r1, vb * (k == 3 || k == 4 ? 0.85f : 0.7f), mat);
+			if (!c->crisp && (i & 1) && i < N - 2) /* suckers along the underside */
+				us_point(c, nx - sinf(ang) * side * r1 * 0.8f, ny + cosf(ang) * side * r1 * 0.8f, 0.0007f, us_sat(vb * 1.3f), US_MAT_ACCENT);
+			x = nx, y = ny;
+		}
+	}
+	/* head and mantle */
+	float breathe = 1.0f + 0.07f * sinf(o->ph * 1.6f);
+	cap_over(c, bx, by, bx + cx * 0.012f, by + cy * 0.012f, 0.0105f, 0.0115f, vb * 0.95f, mat);
+	cap_over(c, bx + cx * 0.02f, by + cy * 0.02f, bx + cx * 0.032f, by + cy * 0.032f, 0.015f * breathe, 0.013f * breathe, vb, mat);
+	if (!c->crisp) {
+		/* mottling and the passing cloud: dark bands that sweep down the mantle */
+		for (int k = 0; k < 7; k++) {
+			float h1 = hashf(0x0c71u, k), h2 = hashf(0x0c72u, k);
+			float s = 0.016f + 0.02f * h1, w = (h2 - 0.5f) * 0.02f;
+			float mv = 0.5f + 0.5f * us_noise2(k * 3.1f, o->mt);
+			us_disc(c, bx + cx * s + px * w, by + cy * s + py * w, 0.0022f, us_sat(vb * (1.2f + 0.4f * mv)), mat);
+		}
+		if (o->band < 1.0f)
+			for (int b = 0; b < 2; b++) {
+				float s = 0.04f - 0.04f * o->band - 0.008f * b;
+				if (s < 0.004f || s > 0.04f)
+					continue;
+				float w = 0.013f;
+				cap_over(c, bx + cx * s - px * w, by + cy * s - py * w, bx + cx * s + px * w, by + cy * s + py * w, 0.0022f, 0.0022f,
+					 vb * 0.35f, mat);
+			}
+	} else if (o->band < 1.0f) {
+		float s = 0.04f - 0.04f * o->band;
+		us_disc(c, bx + cx * s, by + cy * s, 0.004f, vb * 0.4f, mat);
+	}
+	/* eyes: bumps at the side of the head with a dark slit */
+	for (int e = -1; e <= 1; e += 2) {
+		float ex = bx + cx * 0.011f + px * e * 0.0085f, ey = by + cy * 0.011f + py * e * 0.0085f;
+		us_disc(c, ex, ey, c->crisp ? 0.003f : 0.0034f, us_sat(vb * 1.25f), US_MAT_ACCENT);
+		if (!c->crisp)
+			wu_line(c, ex - 0.0018f, ey, ex + 0.0018f, ey, 0.05f, US_MAT_BG);
+	}
+}
+
+/* a green moray looking out of its crevice: a thick neck, a deep head with a high brow, the jaw working
+ * as it breathes (side: +1 looks right) */
+static void draw_moray(us_canvas *c, float hx, float hy, float hr, float side, float ext, float gape, float v)
+{
+	if (ext < 0.03f)
+		return;
+	float a = -0.25f;
+	float dx = side * cosf(a), dy = sinf(a);
+	float ux = dy * side, uy = -dx * side; /* the top of the head */
+	if (uy > 0)
+		ux = -ux, uy = -uy;
+	float k = fmaxf(0.0105f, hr * 0.8f);
+	float len = 0.004f + 0.065f * ext;
+	float tx = hx + dx * len, ty = hy + dy * len;
+	uint8_t mat = US_MAT_STEM;
+#define MP(s_, o_, X, Y) (*(X) = tx + dx * (s_) * k + ux * (o_) * k, *(Y) = ty + dy * (s_) * k + uy * (o_) * k)
+	/* the neck out of the hole, arching up a little like a snake's */
+	{
+		float mx = hx + dx * len * 0.5f + ux * len * 0.22f, my = hy + dy * len * 0.5f + uy * len * 0.22f;
+		cap_over(c, hx, hy, mx, my, k * 1.05f, k * 1.02f, v * 0.42f, mat);
+		cap_over(c, mx, my, tx, ty, k * 1.02f, k, v * 0.45f, mat);
+	}
+	/* upper head: brow, snout, the upper jaw's edge back to the corner of the mouth */
+	static const float up[][2] = {{-0.3f, 1.0f}, {1.2f, 1.15f}, {2.4f, 0.8f}, {3.6f, 0.3f}, {3.9f, -0.05f}, {3.0f, -0.2f},
+				      {1.8f, -0.25f}, {0.6f, -0.3f}, {-0.3f, -0.4f}};
+	float xy[2 * 9];
+	for (int i = 0; i < 9; i++)
+		MP(up[i][0], up[i][1], &xy[2 * i], &xy[2 * i + 1]);
+	/* lower jaw, hinged at the corner of the mouth */
+	float ja = 0.08f + 0.42f * gape;
+	float ca = cosf(ja), sa = sinf(ja);
+	static const float lo[][2] = {{0.0f, 0.0f}, {3.2f, -0.05f}, {3.0f, -0.35f}, {1.5f, -0.6f}, {-0.6f, -0.75f}};
+	float jw[2 * 5];
+	for (int i = 0; i < 5; i++) {
+		float ls = lo[i][0], lov = lo[i][1];
+		float rs = ls * ca + lov * sa, ro = -ls * sa + lov * ca; /* rotate down about the hinge */
+		MP(0.6f + rs, -0.3f + ro, &jw[2 * i], &jw[2 * i + 1]);
+	}
+	/* the open mouth */
+	{
+		float m[6] = {jw[0], jw[1], xy[8], xy[9], jw[2], jw[3]};
+		poly_over(c, m, 3, v * 0.1f, v * 0.1f, US_MAT_EARTH);
+	}
+	poly_over(c, jw, 5, v * 0.45f, v * 0.4f, mat);
+	poly_over(c, xy, 9, v * 0.58f, v * 0.48f, mat);
+	if (!c->crisp) {
+		for (int i = 0; i + 1 < 9; i++)
+			wu_line(c, xy[2 * i], xy[2 * i + 1], xy[2 * i + 2], xy[2 * i + 3], us_sat(v * (i < 4 ? 1.1f : 0.5f)), mat);
+		for (int i = 0; i + 1 < 5; i++)
+			wu_line(c, jw[2 * i], jw[2 * i + 1], jw[2 * i + 2], jw[2 * i + 3], us_sat(v * 0.6f), mat);
+		/* fangs along the upper jaw */
+		if (gape > 0.25f)
+			for (int i = 0; i < 4; i++) {
+				float px, py;
+				MP(1.2f + 0.6f * i, -0.3f, &px, &py);
+				wu_line(c, px, py, px, py + k * 0.22f, us_sat(v * 1.2f), US_MAT_ACCENT);
+			}
+		/* the fin ridge along the top of the neck */
+		float nx0, ny0, nx1, ny1;
+		MP(-len / k, 1.0f, &nx0, &ny0);
+		MP(0.0f, 1.05f, &nx1, &ny1);
+		wu_line(c, nx0, ny0, nx1, ny1, us_sat(v * 1.0f), mat);
+	}
+	/* the leopard spotting: pale spots over the neck and head */
+	{
+		int ns = c->crisp ? 4 : 16;
+		for (int i = 0; i < ns; i++) {
+			float s_ = (-len / k) * hashf(0x3011u, i) + 3.0f * hashf(0x3013u, i) * (i & 1);
+			float o_ = (hashf(0x3012u, i) - 0.5f) * (s_ > 0 ? 1.0f : 1.5f), px, py;
+			if (s_ > 2.4f && o_ < 0.0f)
+				continue;
+			MP(s_, o_, &px, &py);
+			if (c->crisp)
+				us_put(c, (int)(px * c->s), (int)(py * c->s), us_sat(v * 1.2f), US_MAT_LIGHT);
+			else
+				us_disc(c, px, py, k * 0.13f, us_sat(v * 1.15f), US_MAT_LIGHT);
+		}
+	}
+	/* the eye, forward and high */
+	float ex, ey;
+	MP(2.3f, 0.45f, &ex, &ey);
+	us_disc(c, ex, ey, c->crisp ? 0.002f : k * 0.28f, us_sat(v * 1.4f), US_MAT_LIGHT);
+	if (!c->crisp)
+		us_disc(c, ex, ey, k * 0.12f, 0.03f, US_MAT_BG);
+#undef MP
+}
+
+/* a sea star on the rock: five arms, slightly foreshortened on the sloping face */
+static void draw_star(us_canvas *c, float x, float y, float r, float rot, float v, float curl)
+{
+	float xy[2 * 10];
+	for (int i = 0; i < 10; i++) {
+		float a = rot + US_TAU * i / 10.0f;
+		float rr = (i & 1) ? r * 0.36f : r * (1.0f - 0.12f * curl * ((i >> 1) & 1));
+		xy[2 * i] = x + cosf(a) * rr;
+		xy[2 * i + 1] = y + sinf(a) * rr * 0.72f;
+	}
+	poly_over(c, xy, 10, v * 0.75f, v * 0.62f, US_MAT_BLOOM);
+	if (!c->crisp) {
+		for (int i = 0; i < 10; i++) {
+			int j = (i + 1) % 10;
+			wu_line(c, xy[2 * i], xy[2 * i + 1], xy[2 * j], xy[2 * j + 1], us_sat(v * 1.05f), US_MAT_BLOOM);
+		}
+		for (int i = 0; i < 10; i += 2) /* a row of bumps down each arm */
+			for (int k = 1; k <= 2; k++)
+				us_point(c, us_lerp(x, xy[2 * i], k / 3.0f), us_lerp(y, xy[2 * i + 1], k / 3.0f), 0.0011f, us_sat(v * 1.2f), US_MAT_LIGHT);
+	}
+}
+
+/* a seahorse, tail wrapped round a seagrass blade at (ax, ay); upright, facing dir; tuck bows the head */
+static void draw_horse(us_canvas *c, float ax, float ay, float H, float dir, float lean, float tuck, float fin, float v, uint8_t mat)
+{
+	/* the spine from the tail's tip (curled round the blade) up to the back of the head (x facing, y up), radius */
+	static const float P[][3] = {
+		{-0.05f, 0.0f, 0.013f},  {-0.02f, 0.045f, 0.015f}, {0.04f, 0.03f, 0.017f}, {0.05f, -0.04f, 0.021f},
+		{0.07f, -0.15f, 0.03f},  {0.09f, -0.28f, 0.048f},  {0.14f, -0.42f, 0.072f}, {0.13f, -0.56f, 0.08f},
+		{0.07f, -0.68f, 0.062f}, {0.03f, -0.77f, 0.046f},  {0.07f, -0.86f, 0.054f},
+	};
+	enum { NP = 11, NECK = 9 };
+	/* extra points: head front, snout tip, coronet, eye */
+	static const float E[4][3] = {{0.14f, -0.88f, 0.042f}, {0.33f, -0.83f, 0.018f}, {0.05f, -0.96f, 0.024f}, {0.115f, -0.895f, 0.0f}};
+	float xs[NP + 4], ys[NP + 4], rs[NP + 4];
+	float cl = cosf(lean), sl = sinf(lean);
+	float pvx = P[NECK][0], pvy = P[NECK][1], ct = cosf(tuck * 0.8f), st = sinf(tuck * 0.8f);
+	for (int i = 0; i < NP + 4; i++) {
+		const float *q = i < NP ? P[i] : E[i - NP];
+		float lx = q[0], ly = q[1];
+		rs[i] = q[2] * H;
+		/* tuck: the head and neck bow down toward the chest */
+		if (i >= NECK) {
+			float qx = lx - pvx, qy = ly - pvy;
+			lx = pvx + qx * ct - qy * st;
+			ly = pvy + qx * st + qy * ct;
+		}
+		lx *= dir * H, ly *= H;
+		xs[i] = ax + lx * cl - ly * sl;
+		ys[i] = ay + lx * sl + ly * cl;
+	}
+	for (int i = 0; i + 1 < NP; i++)
+		cap_over(c, xs[i], ys[i], xs[i + 1], ys[i + 1], rs[i], rs[i + 1], v * (0.55f + 0.025f * i), mat);
+	cap_over(c, xs[NP - 1], ys[NP - 1], xs[NP], ys[NP], rs[NP - 1], rs[NP], v * 0.78f, mat);         /* head */
+	cap_over(c, xs[NP], ys[NP], xs[NP + 1], ys[NP + 1], rs[NP + 1], rs[NP + 1] * 0.9f, v * 0.72f, mat); /* snout */
+	cap_over(c, xs[NP - 1], ys[NP - 1], xs[NP + 2], ys[NP + 2], rs[NP - 1] * 0.6f, rs[NP + 2], v * 0.72f, mat); /* coronet */
+	us_disc(c, xs[NP + 3], ys[NP + 3], c->crisp ? 0.0015f : 0.004f * H / 0.06f, 0.05f, US_MAT_BG);
+	if (!c->crisp) {
+		/* the bony rings down the trunk and tail */
+		for (int i = 3; i < NECK; i++) {
+			float dxs = xs[i + 1] - xs[i - 1], dys = ys[i + 1] - ys[i - 1];
+			float d = sqrtf(dxs * dxs + dys * dys) + 1e-6f;
+			float nx = -dys / d, ny = dxs / d;
+			for (int h = 0; h < 2; h++) {
+				float mx = us_lerp(xs[i], xs[i + 1], 0.5f * h), my = us_lerp(ys[i], ys[i + 1], 0.5f * h);
+				float rr = us_lerp(rs[i], rs[i + 1], 0.5f * h) * 0.9f;
+				wu_line(c, mx - nx * rr, my - ny * rr, mx + nx * rr, my + ny * rr, us_sat(v * 1.05f), mat);
+			}
+		}
+		/* the dorsal fin on its back, a blur of fluttering rays */
+		float fx = xs[6] - dir * rs[6] * 0.9f, fy = ys[6];
+		for (int k = 0; k < 4; k++) {
+			float o = (k - 1.5f) * 0.014f * H;
+			wu_line(c, fx, fy + o * 0.6f, fx - dir * 0.08f * H, fy + o * 1.6f + 0.025f * H * fin * sinf(k * 2.3f), us_sat(v * 0.9f), mat);
+		}
+	}
+}
+
 /* --------------------------------------------------------------------- the frame ---- */
 
 static float water_v(float y, float crisp)
@@ -956,7 +1361,7 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 	st_t *st = sp;
 	const us_audio *a = ctx->a;
 	us_world *w = ctx->w;
-	us_rng *r = &st->rng;
+	us_rng *r = &st->rng, *r2 = &st->rng2;
 	float dt = ctx->dt, rdt = ctx->real_dt, A = ctx->aspect, dens = ctx->p->density;
 	float t = (float)ctx->t;
 	if (!st->inited)
@@ -1096,7 +1501,7 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 					if (pr < 9.0f)
 						ray += expf(-pr) * (0.6f + 0.4f * sinf(st->ray_t * 0.3f + st->ray_ph[k] * 3.0f));
 				}
-				float wv = (base + rays * 0.28f * (1.0f + 4.0f * st->lurch) * ray * fade) * lum;
+				float wv = (base + rays * 0.28f * (1.0f + 4.8f * st->lurch) * ray * fade) * lum;
 				/* pixel palettes: keep the open water off the background shade, so silhouettes read against it */
 				st->wf[j * WFW + i] = wv;
 			}
@@ -1488,6 +1893,110 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 		}
 	}
 
+	/* ---- reef dwellers: sea stars on the rock, the moray in its crevice, the octopus by its den ---- */
+	{
+		rock_t *m = &st->rk[0];
+		int nss = 1 + (int)(dens * 2.0f + 0.5f);
+		for (int i = 0; i < nss && i < 3; i++) {
+			star_t *q = &st->ss[i];
+			q->ph += dt;
+			q->u += 0.0015f * sinf(q->ph * 0.05f + i) * dt; /* creeping, imperceptibly */
+			float fx = m->cx + q->u * m->hw, top = rock_top(m, fx);
+			if (top > 2.0f)
+				continue;
+			float y = top + (m->base - top) * q->face * 0.8f;
+			draw_star(c, fx * A, y, q->size, q->rot, us_sat(lum * 0.95f * (1.0f + 0.2f * sn)), 0.5f + 0.5f * sinf(q->ph * 0.3f) + st->kick_s);
+		}
+		/* the moray: breathing, lunging out a little on the kicks, snapping back in on a snare */
+		{
+			int h = st->mor_h;
+			float fx = m->cx + m->hu[h] * m->hw, top = rock_top(m, fx);
+			if (top < 2.0f) {
+				float hy = top + (m->base - top) * m->hd[h];
+				if (snare_ev)
+					st->mor_to = 0.0f;
+				st->mor_to = us_approach(st->mor_to, 1.0f, 2.5f, dt);
+				float target = st->mor_to * st->mor_to * (0.55f + 0.25f * sinf(t * 0.17f + 1.0f));
+				if (kick_ev)
+					st->mor_ext = us_sat(st->mor_ext + 0.35f * st->mor_to);
+				st->mor_ext = us_approach(st->mor_ext, target, target < st->mor_ext - 0.15f ? 0.05f : 0.5f, rdt);
+				st->mor_ph += dt * (2.0f + 1.5f * st->lvl_env);
+				float gape = 0.5f + 0.5f * sinf(st->mor_ph);
+				float side = st->mor_side;
+				draw_moray(c, fx * A, hy, m->hr[h], side, st->mor_ext, gape * gape, us_sat(lum * 0.9f * fl));
+			}
+		}
+		/* the octopus: settles in its den, a dark band sweeps it on every kick; a snare may send it jetting off
+		 * behind a puff of ink, after which it swims back and settles in again */
+		{
+			octo_t *o = &st->oc;
+			float dx_ = o->hx * A, dy_ = o->hy;
+			o->ph += dt;
+			o->mt += dt * (0.15f + 0.8f * st->lvl_env);
+			o->mood = us_approach(o->mood, us_sat(1.4f * st->lvl_env + 0.6f * o->blanch), 2.0f, dt);
+			o->cool -= dt;
+			if (kick_ev)
+				o->band = 0.0f;
+			o->band += rdt * 2.2f;
+			o->blanch = us_approach(o->blanch, 0.0f, 0.45f, rdt);
+			if (snare_ev) {
+				if (o->mode == 0 && o->cool <= 0 && us_rand(r2) < 0.55f) {
+					float away = dx_ > st->rk[0].cx * A ? 1.0f : -1.0f;
+					float an = -0.55f - 0.3f * us_rand(r2);
+					o->vx = away * cosf(an) * 0.32f;
+					o->vy = sinf(an) * 0.32f;
+					o->mode = 1;
+					o->cool = us_randr(r2, 7.0f, 12.0f);
+					for (int i = 0; i < 6; i++) {
+						o->ink_x[i] = o->x + us_randr(r2, -0.008f, 0.008f) - o->vx * 0.02f * i;
+						o->ink_y[i] = o->y + us_randr(r2, -0.008f, 0.004f) - o->vy * 0.02f * i;
+						o->ink_r[i] = us_randr(r2, 0.006f, 0.011f);
+						o->ink_a[i] = 1.0f;
+					}
+				}
+				o->blanch = 1.0f;
+			}
+			if (o->mode == 1) {
+				o->stream = us_approach(o->stream, 1.0f, 0.06f, rdt);
+				float drag = expf(-dt * 1.7f);
+				o->vx *= drag, o->vy *= drag;
+				if (o->vx * o->vx + o->vy * o->vy < 0.03f * 0.03f)
+					o->mode = 2;
+			} else if (o->mode == 2) {
+				/* swimming home in slow pulses, then letting the arms down onto the rock */
+				float ex = dx_ - o->x, ey = dy_ - o->y, d = sqrtf(ex * ex + ey * ey) + 1e-6f;
+				float pulse = 0.5f + 0.5f * sinf(o->ph * 3.0f);
+				float sp = 0.045f * (0.4f + 0.6f * pulse) * us_sat(d / 0.03f);
+				o->vx = us_approach(o->vx, ex / d * sp, 0.4f, dt);
+				o->vy = us_approach(o->vy, ey / d * sp, 0.4f, dt);
+				o->stream = us_approach(o->stream, us_sat(d / 0.05f) * 0.75f, 0.5f, dt);
+				if (d < 0.006f)
+					o->mode = 0;
+			} else {
+				o->vx = us_approach(o->vx, (dx_ - o->x) * 2.0f, 0.3f, dt);
+				o->vy = us_approach(o->vy, (dy_ - o->y) * 2.0f, 0.3f, dt);
+				o->stream = us_approach(o->stream, 0.0f, 0.5f, dt);
+			}
+			o->x += o->vx * dt;
+			o->y += o->vy * dt;
+			if (o->y < 0.14f)
+				o->y = 0.14f, o->vy = 0.0f;
+			/* the ink: dark puffs swelling and thinning into the water */
+			for (int i = 0; i < 6; i++) {
+				if (o->ink_a[i] < 0.02f)
+					continue;
+				o->ink_a[i] = us_approach(o->ink_a[i], 0.0f, 2.2f, dt);
+				o->ink_r[i] += dt * 0.012f;
+				o->ink_x[i] += 0.006f * cur * dt;
+				o->ink_y[i] -= 0.004f * dt;
+				float wv = water_v(o->ink_y[i], crisp) * lum;
+				float iv = wv * (1.0f - 0.75f * o->ink_a[i]);
+				ell_over(c, o->ink_x[i], o->ink_y[i], o->ink_r[i], o->ink_r[i] * 0.8f, iv, US_MAT_WATER, 0.0f, 0, 0.0f);
+			}
+			draw_octo(c, o, us_sat((0.45f + 0.55f * lum) * fa * fl), t, surge);
+		}
+	}
+
 	/* ---- butterflyfish pottering about the reef ---- */
 	{
 		int nrf = 2 + (int)(dens * 2.0f + 0.5f);
@@ -1549,6 +2058,45 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 		}
 	}
 
+	/* ---- now and then an eagle ray glides over the reef; its wingbeats come down on the kicks ---- */
+	{
+		ray_t *ry = &st->ray;
+		if (!ry->on) {
+			ry->wait -= dt * (0.6f + 0.8f * st->lvl_env);
+			if (ry->wait <= 0) {
+				ry->on = 1;
+				ry->dir = us_rand(r2) < 0.5f ? 1 : -1;
+				ry->L = crisp ? 0.28f : 0.26f;
+				ry->x = ry->dir > 0 ? -0.25f : A + 0.25f;
+				ry->y = us_randr(r2, 0.15f, 0.32f);
+				if (st->tu.on && fabsf(ry->y - st->tu.y) < 0.12f) /* keep clear of the turtle */
+					ry->y = st->tu.y > 0.27f ? st->tu.y - 0.13f : st->tu.y + 0.13f;
+				ry->phase = 0, ry->phase_t = 0, ry->fl = 0.2f, ry->glide = 0.4f;
+			}
+		}
+		if (ry->on) {
+			ry->phase_t += dt;
+			if (ry->phase == 0 && ry->phase_t > 1.4f)
+				ry->phase = 1, ry->phase_t = 0;
+			else if (ry->phase == 1 && ((kick_ev && ry->phase_t > 0.35f) || ry->phase_t > 4.5f))
+				ry->phase = 2, ry->phase_t = 0, ry->glide = 1.0f;
+			else if (ry->phase == 2 && ry->phase_t > 0.4f)
+				ry->phase = 0, ry->phase_t = 0;
+			float fl_to = ry->phase == 1 ? 1.0f : ry->phase == 2 ? -0.9f : 0.15f;
+			ry->fl = us_approach(ry->fl, fl_to, ry->phase == 2 ? 0.06f : ry->phase == 1 ? 0.7f : 0.9f, dt);
+			ry->glide = us_approach(ry->glide, 0.0f, 1.8f, dt);
+			ry->ph += dt;
+			ry->x += ry->dir * (0.02f + 0.05f * ry->glide) * dt;
+			ry->y += (0.006f * us_noise2(5.1f, ry->ph * 0.2f) + 0.004f * ry->fl) * dt;
+			if (ry->x < -0.3f || ry->x > A + 0.3f) {
+				ry->on = 0;
+				ry->wait = us_randr(r2, 30.0f, 60.0f);
+			} else {
+				draw_ray(c, ry, us_sat((0.45f + 0.55f * lum) * fa * fl), t);
+			}
+		}
+	}
+
 	/* ---- the near school ---- */
 	for (int k = 0; k < ns; k++)
 		if (!st->sc[k].deep)
@@ -1578,6 +2126,32 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 					x = nx, y = ny;
 				}
 			}
+		}
+	}
+
+	/* ---- seahorses holding on to the seagrass: they sway with it, fan their dorsal fins (faster on the
+	 *      hats) and tuck their heads down when a snare startles them ---- */
+	{
+		int nh = 1 + (dens > 0.35f);
+		for (int k = 0; k < nh; k++) {
+			horse_t *hh = &st->hs[k];
+			grass_t *g = &st->grass[hh->g];
+			hh->ph += dt;
+			if (snare_ev)
+				hh->tuck = 1.0f;
+			hh->tuck = us_approach(hh->tuck, 0.0f, 0.7f, rdt);
+			float X = g->fx * A, d = (g->y - Y_HOR) / (1.0f - Y_HOR);
+			int b = g->n / 2;
+			float u = (b + 0.5f) / g->n - 0.5f;
+			float hb = g->h * (0.7f + 0.5f * hashf((uint32_t)hh->g, b));
+			float bend = (u * 1.2f + 0.5f * surge + 0.25f * cur + 0.1f * sinf(t * 0.9f + g->ph + b)) * (0.4f + 0.6f * d);
+			float f = 0.5f;
+			float ax = X + u * g->h * 0.3f + bend * hb * 0.45f * f * f, ay = g->y - hb * f;
+			float H = (crisp ? 0.1f : 0.09f) * (0.65f + 0.5f * d);
+			float fin = sinf(t * (6.0f + 26.0f * hat) + k * 2.0f) * (0.12f + 0.9f * hat);
+			float v = us_sat((0.62f + 0.12f * hat) * (0.45f + 0.55f * lum) * fa * fl);
+			draw_horse(c, ax, ay, H, hh->dir, 0.22f * bend + 0.04f * sinf(hh->ph * 0.5f), hh->tuck, fin, v,
+				   k ? US_MAT_BLOOM : US_MAT_LIGHT);
 		}
 	}
 
