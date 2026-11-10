@@ -32,6 +32,11 @@ settle. Nothing ever freezes: in silence the world keeps breathing.
 | Deep Sea | every jellyfish bell contracts and they surge upward together | a shockwave of bioluminescent plankton bursts outward | comb-jelly rainbows ripple, marine snow sparkles | how much of the abyss lights up |
 | Misty Valley | the waterfall surges and mist billows down the valley | the cranes lift off with big wingbeats, the old pine sheds needles | spray and dew glint, glitter runs down the river | the mist lifts to reveal the far peaks, the light warms |
 
+Every place is inhabited, and its creatures answer the music too: a heron strikes on the snare in the marsh, pond and
+river; a fox pounces into the snow; caribou lift their heads under the aurora; jerboas hop on the kick in the dunes;
+frogs call in turn by the firefly pond; an octopus jets off the reef; a kingfisher dives; horses shy from the lightning.
+Many follow the living world, with butterflies in summer, bats and owls at night, and bare stalks in winter.
+
 Every scene also keeps its finer mappings (bass, melody, individual frequency bands, stereo width,
 the slow swell of a phrase). In Ink looks the glow itself breathes with the music.
 
