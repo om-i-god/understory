@@ -30,6 +30,16 @@
  * Context: a dusk sky (a soft rose afterglow, first stars overhead, lens-shaped cloud banks engraved in fine
  *          strokes with sun-lit undersides), a pylon line with sagging wires and perched starlings, a hedgerow
  *          and church on the horizon, a mere below it that holds a broken reflection of the flock.
+ * The marsh below (each with its own small life):
+ *   grey heron    -> stands in the shallows, wades a few slow steps, stalks with its neck coiled and strikes at the
+ *                    water (a ring spreads), sometimes tipping its bill up to swallow; louder music = a busier, hungrier
+ *                    heron; a snare snaps its neck up tall and alert (a spring that overshoots); hunched in the roost
+ *   coots         -> paddle the mere nodding with every stroke, dive and come up elsewhere; on the kick the raft nods
+ *                    together; a snare sends one skittering across the water, wings flailing; their white shields
+ *                    catch the hats; more of them in autumn and winter (the migrants come in)
+ *   reeds         -> the kick shoves the whole bed (a damped spring); a snare whips the tops and flicks the seed
+ *                    plumes one way; hats glint on a fresh few plume tips; reedmace stands at the front; the reeds
+ *                    thin out into a shallow pool where the heron fishes
  * World: reads flock (bird count at open, slowly followed), pollen + insects (food => more birds), season,
  *        daylight, wind; writes flock (lively music with food around draws birds in).
  */
@@ -57,6 +67,11 @@
 #define NHEDGE 384 /* hedgerow profile samples across the width */
 #define NSTAR 60   /* first stars, high up */
 #define NBANK 7    /* cloud banks lit from below by the low sun */
+#define NCOOT 7    /* coots paddling on the mere */
+#define NRIP 14    /* ripple rings on the mere (coots diving, the heron's strike, kicks at the bow) */
+#define NMACE 9    /* reedmace (bulrush) in the front of the reed bed */
+#define HERON_Y 0.888f /* the heron stands in the shallows at the foot of the mere */
+#define HERON_S 0.112f /* and stands this tall */
 
 /* pylon line: x as a fraction of width, height (normalized); receding, so each is smaller */
 static const float PYL_X[NPYL] = {-0.06f, 0.33f, 0.585f, 0.765f};
@@ -141,6 +156,15 @@ typedef struct {
 	uint32_t hat_seed;
 	float hx_col[257]; /* sky glow: horizontal sun factor, sampled across the width */
 	float star_x[NSTAR], star_y[NSTAR], star_b[NSTAR];
+	/* the marsh: a grey heron fishing the shallows, coots on the mere, reedmace, and the reeds' kick spring */
+	float hn_x, hn_dir, hn_e, hn_ev, hn_k, hn_lean, hn_gulp, hn_tmr, hn_step, hn_alert, hn_turn;
+	int hn_state; /* 0 stand, 1 wade, 2 stalk, 3 strike, 4 swallow */
+	float ct_x[NCOOT], ct_y[NCOOT], ct_v[NCOOT], ct_dir[NCOOT], ct_tmr[NCOOT], ct_ph[NCOOT], ct_nod[NCOOT], ct_sk[NCOOT];
+	int ct_state[NCOOT]; /* 0 paddling, 1 under (dived), 2 skittering across the water, 3 away */
+	float ct_cool;
+	float rp_x[NRIP], rp_y[NRIP], rp_age[NRIP], rp_str[NRIP];
+	float reed_k, reed_kv;
+	float mace_x[NMACE], mace_h[NMACE], mace_ph[NMACE];
 } st_t;
 
 static void *create(uint32_t seed)
@@ -537,6 +561,267 @@ static void init_extras(st_t *st)
 			h = h > 0 ? 0.002f : 0; /* the churchyard */
 		st->hedge[i] = h;
 	}
+	/* the marsh */
+	st->hn_x = us_randr(r, 0.16f, 0.24f);
+	st->hn_dir = us_rand(r) < 0.6f ? 1.0f : -1.0f;
+	st->hn_e = 0.5f;
+	st->hn_tmr = us_randr(r, 2.0f, 5.0f);
+	for (int k = 0; k < NCOOT; k++) {
+		st->ct_x[k] = us_randr(r, 0.38f, 0.95f);
+		st->ct_y[k] = HORIZON + us_randr(r, 0.012f, 0.07f);
+		st->ct_dir[k] = us_rand(r) < 0.5f ? -1.0f : 1.0f;
+		st->ct_v[k] = us_randr(r, 0.5f, 1.0f);
+		st->ct_tmr[k] = us_randr(r, 3.0f, 15.0f);
+		st->ct_ph[k] = us_rand(r) * US_TAU;
+	}
+	for (int k = 0; k < NRIP; k++)
+		st->rp_age[k] = 9.0f;
+	/* reedmace in two clumps, either side of the heron's pool */
+	for (int k = 0; k < NMACE; k++) {
+		float cl = k < 4 ? 0.05f : (k < 7 ? 0.36f : 0.83f);
+		st->mace_x[k] = cl + us_randr(r, -0.025f, 0.025f) + 0.012f * k;
+		st->mace_h[k] = us_randr(r, 0.11f, 0.16f);
+		st->mace_ph[k] = us_rand(r) * 30.0f;
+	}
+}
+
+/* ---- the marsh: heron, coots, ripples, reedmace -------------------- */
+
+/* a 1-pixel line for the crisp looks (us_line rounds thin widths up to two pixels) */
+static void pline(us_canvas *c, float ax, float ay, float bx, float by, float v, uint8_t m)
+{
+	int x0 = (int)floorf(ax * c->s), y0 = (int)floorf(ay * c->s), x1 = (int)floorf(bx * c->s), y1 = (int)floorf(by * c->s);
+	int dx = abs(x1 - x0), dy = -abs(y1 - y0), sx = x0 < x1 ? 1 : -1, sy = y0 < y1 ? 1 : -1, err = dx + dy;
+	for (int n = 0; n < 2000; n++) {
+		us_put(c, x0, y0, v, m);
+		if (x0 == x1 && y0 == y1)
+			break;
+		int e2 = 2 * err;
+		if (e2 >= dy)
+			err += dy, x0 += sx;
+		if (e2 <= dx)
+			err += dx, y0 += sy;
+	}
+}
+
+static void ripple_add(st_t *st, float xf, float y, float str)
+{
+	int best = 0;
+	for (int k = 1; k < NRIP; k++)
+		if (st->rp_age[k] > st->rp_age[best])
+			best = k;
+	st->rp_x[best] = xf, st->rp_y[best] = y, st->rp_age[best] = 0, st->rp_str[best] = str;
+}
+
+/* a flattened ripple ring on the water (a perspective ellipse) */
+static void ripple_draw(us_canvas *c, float x, float y, float rx, float v)
+{
+	float ry = rx * 0.24f;
+	if (c->crisp) {
+		int n = (int)(rx * c->s * 4.0f) + 6;
+		for (int i = 0; i < n; i++) {
+			float a = US_TAU * i / n;
+			us_put(c, (int)((x + cosf(a) * rx) * c->s), (int)((y + sinf(a) * ry) * c->s), v, US_MAT_WATER);
+		}
+		return;
+	}
+	int n = 22;
+	float px = x + rx, py = y;
+	for (int i = 1; i <= n; i++) {
+		float a = US_TAU * i / n;
+		float qx = x + cosf(a) * rx, qy = y + sinf(a) * ry;
+		/* the near side of a ring catches more sky than the far side */
+		wline(c, px, py, qx, qy, v * (0.65f + 0.35f * sinf(a - 0.5f * US_TAU / n)), US_MAT_WATER);
+		px = qx, py = qy;
+	}
+}
+
+static inline void bez3(float t, const float *p, float *x, float *y)
+{
+	float u = 1.0f - t, a = u * u * u, b = 3 * u * u * t, cc = 3 * u * t * t, d = t * t * t;
+	*x = a * p[0] + b * p[2] + cc * p[4] + d * p[6];
+	*y = a * p[1] + b * p[3] + cc * p[5] + d * p[7];
+}
+
+/* A grey heron standing in the shallows, side-on (x, y = its feet at the waterline, S = its height, f = facing).
+ * e: the neck, 0 hunched into the shoulders .. 1 stretched up tall; k: the strike (head down at the water ahead);
+ * lean: the stalking crouch; gulp: bill tipped up swallowing; step: wading phase (0 = both feet down). */
+static void heron_draw(us_canvas *c, float x, float y, float S, float f, float e, float k, float lean, float gulp,
+		       float step, float lift, float plume, float v)
+{
+	int cr = c->crisp;
+#define HX(a) (x + f * (a) * S)
+#define HY(b) (y - (b) * S)
+	/* body: a tilted teardrop, breast high, tail low */
+	float th = (cr ? 0.62f : 0.5f) - 0.38f * lean - 0.1f * k;
+	float bx = -0.02f + 0.05f * lean, by = 0.52f - 0.07f * lean - 0.04f * k;
+	float ux = cosf(th), uy = sinf(th), nx = -uy, ny = ux;
+	float body[2 * 19];
+	for (int i = 0; i <= 18; i++) {
+		float a = US_TAU * i / 18;
+		float ca = cosf(a), sa = sinf(a);
+		float along = ca * (ca > 0 ? 0.15f : 0.21f);
+		float across = sa * (cr ? 0.1f : 0.072f) * (ca < 0 ? 1.0f + 0.55f * ca : 1.0f) * (sa < 0 ? 0.85f : 1.0f);
+		float lx = bx + ux * along + nx * across, ly = by + uy * along + ny * across;
+		body[2 * i] = HX(lx), body[2 * i + 1] = HY(ly);
+	}
+	/* legs: long and thin, the hidden 'knee' bending backward as a leg lifts */
+	float hipx = bx - 0.01f, hipy = by - 0.05f;
+	for (int l = 0; l < 2; l++) {
+		float lf = l ? fmaxf(0.0f, -sinf(step)) : fmaxf(0.0f, sinf(step));
+		lf *= lift;
+		float fx = (l ? -0.035f : 0.03f) * (cr ? 0.0f : 1.0f) + 0.06f * lf, fy = 0.11f * lf;
+		float kx = (hipx + fx) * 0.5f - 0.025f - 0.06f * lf, ky = (hipy + fy) * 0.5f + 0.02f * lf;
+		float lv = v * (l ? 0.7f : 0.85f);
+		if (cr) {
+			pline(c, HX(hipx), HY(hipy), HX(kx), HY(ky), lv, US_MAT_ACCENT);
+			pline(c, HX(kx), HY(ky), HX(fx), HY(fy), lv, US_MAT_ACCENT);
+		} else {
+			wline(c, HX(hipx), HY(hipy), HX(kx), HY(ky), lv, US_MAT_ACCENT);
+			wline(c, HX(kx), HY(ky), HX(fx), HY(fy), lv, US_MAT_ACCENT);
+			/* toes, when the foot is lifted clear of the water */
+			if (lf > 0.3f)
+				wline(c, HX(fx), HY(fy), HX(fx + 0.04f), HY(fy - 0.01f), lv * 0.7f, US_MAT_ACCENT);
+			/* the legs' reflection, broken by the water */
+			if (lf < 0.2f)
+				for (int q = 0; q < 3; q++) {
+					float yy = y + (0.03f + 0.06f * q) * S;
+					wline(c, HX(fx - 0.003f * q), yy, HX(fx - 0.003f * q), yy + 0.035f * S, v * 0.22f, US_MAT_WATER);
+				}
+		}
+	}
+	/* body mass: a dim fill, a firmer outline, the folded wing and the hanging primaries */
+	/* a fan from one rim point over a coarse hexagon: broad triangles fill solidly (thin slivers would only
+	 * leave their anti-aliased edges under MAX blending) */
+	for (int j = 1; j < 5 && !cr; j++)
+		us_tri(c, body[0], body[1], body[6 * j], body[6 * j + 1], body[6 * j + 6], body[6 * j + 7], v * (cr ? 0.62f : 0.28f),
+		       US_MAT_ACCENT);
+	if (!cr)
+		for (int i = 0; i < 18; i++)
+			wline(c, body[2 * i], body[2 * i + 1], body[2 * i + 2], body[2 * i + 3], v, US_MAT_ACCENT);
+	{
+		float sx = bx + ux * 0.1f + nx * 0.045f, sy = by + uy * 0.1f + ny * 0.045f;
+		float tx = bx - ux * 0.27f - nx * 0.015f, ty = by - uy * 0.27f - ny * 0.015f;
+		if (cr) {
+			/* pixel: a sloping two-row body, the back a shade lighter than the belly */
+			float px1 = 1.0f / c->s;
+			pline(c, HX(bx - ux * 0.22f), HY(by - uy * 0.22f), HX(bx + ux * 0.14f), HY(by + uy * 0.14f), v * 0.8f,
+			      US_MAT_ACCENT);
+			pline(c, HX(bx - ux * 0.16f), HY(by - uy * 0.16f) - px1, HX(bx + ux * 0.1f), HY(by + uy * 0.1f) - px1, v,
+			      US_MAT_ACCENT);
+		} else {
+			wline(c, HX(sx), HY(sy), HX(tx), HY(ty), v * 0.9f, US_MAT_ACCENT);
+			wline(c, HX(sx - ux * 0.04f - nx * 0.02f), HY(sy - uy * 0.04f - ny * 0.02f), HX(tx + ux * 0.02f - nx * 0.02f),
+			      HY(ty + uy * 0.02f - ny * 0.02f), v * 0.55f, US_MAT_ACCENT);
+		}
+	}
+	/* neck: an S-curve from the breast to the head; striking it straightens into a spear */
+	float n0x = bx + ux * 0.12f + nx * 0.03f, n0y = by + uy * 0.12f + ny * 0.03f;
+	float hrx = n0x + 0.05f, hry = n0y + 0.1f;     /* hunched: head sunk on the shoulders */
+	float hex = 0.15f, hey = 0.99f;                /* stretched up tall */
+	float hsx = 0.46f, hsy = 0.035f;               /* struck: bill in the water ahead */
+	float hx = us_lerp(us_lerp(hrx, hex, e), hsx, k), hy = us_lerp(us_lerp(hry, hey, e), hsy, k);
+	float cp[8] = {n0x, n0y,
+		       n0x - 0.05f - 0.06f * e, n0y + 0.1f + 0.14f * e,
+		       hx - 0.1f + 0.02f * e, hy - 0.06f - 0.1f * e,
+		       hx, hy};
+	/* the strike pulls the neck straight */
+	cp[2] = us_lerp(cp[2], us_lerp(n0x, hx, 0.33f), k), cp[3] = us_lerp(cp[3], us_lerp(n0y, hy, 0.33f), k);
+	cp[4] = us_lerp(cp[4], us_lerp(n0x, hx, 0.66f), k), cp[5] = us_lerp(cp[5], us_lerp(n0y, hy, 0.66f), k);
+	float nk[2 * 11];
+	for (int i = 0; i <= 10; i++) {
+		float px, py;
+		bez3(i / 10.0f, cp, &px, &py);
+		nk[2 * i] = HX(px), nk[2 * i + 1] = HY(py);
+	}
+	if (cr)
+		for (int i = 0; i < 10; i++)
+			pline(c, nk[2 * i], nk[2 * i + 1], nk[2 * i + 2], nk[2 * i + 3], v, US_MAT_ACCENT);
+	else
+		us_polyline(c, nk, 11, 0.0021f * S / 0.09f, v, US_MAT_ACCENT);
+	/* head + dagger bill (yellow) + the black crest plume trailing back */
+	float ba = us_lerp(-0.12f, 0.95f, gulp);
+	{
+		float tdx = cp[6] - cp[4], tdy = cp[7] - cp[5];
+		float sa = atan2f(tdy, tdx); /* along the neck's end */
+		ba = us_lerp(ba, sa, k);
+	}
+	float dxb = cosf(ba), dyb = sinf(ba);
+	float hr = 0.03f;
+	if (cr) {
+		us_put(c, (int)floorf(HX(hx) * c->s), (int)floorf(HY(hy) * c->s), v, US_MAT_ACCENT);
+		us_put(c, (int)floorf(HX(hx - 0.03f) * c->s), (int)floorf(HY(hy) * c->s), v, US_MAT_ACCENT);
+	} else
+		us_disc(c, HX(hx), HY(hy), hr * S, v * 0.8f, US_MAT_ACCENT);
+	float b0x = hx + dxb * hr * 0.6f, b0y = hy + dyb * hr * 0.6f;
+	float btx = hx + dxb * 0.17f, bty = hy + dyb * 0.17f;
+	float bw = 0.011f;
+	if (cr)
+		pline(c, HX(hx + dxb * 0.06f), HY(hy + dyb * 0.06f), HX(btx), HY(bty), v * 1.1f, US_MAT_LIGHT);
+	else
+		us_tri(c, HX(b0x - dyb * bw), HY(b0y + dxb * bw), HX(b0x + dyb * bw), HY(b0y - dxb * bw), HX(btx), HY(bty),
+		       v * 1.1f, US_MAT_LIGHT);
+	if (!cr) {
+		float pa = ba + US_PI + 0.35f + 0.25f * plume;
+		float pxe = hx + cosf(pa) * 0.11f, pye = hy + sinf(pa) * 0.11f - 0.015f;
+		wline(c, HX(hx), HY(hy + 0.01f), HX(pxe), HY(pye), v * 0.7f, US_MAT_ACCENT);
+		wline(c, HX(hx), HY(hy + 0.005f), HX(pxe + 0.02f), HY(pye + 0.012f), v * 0.45f, US_MAT_ACCENT);
+	}
+#undef HX
+#undef HY
+}
+
+/* A coot paddling on the mere, side-on: a low rounded black body riding high, a small head that nods with
+ * every stroke, the white bill-shield. x, y = waterline under the body; s = depth scale; nod 0..1. */
+static void coot_draw(us_canvas *c, float x, float y, float s, float f, float nod, float flap, float shield, float v)
+{
+	if (c->crisp) {
+		int px = (int)(x * c->s), py = (int)(y * c->s), d = f > 0 ? 1 : -1;
+		int big = s > 0.75f;
+		for (int i = -2; i <= 1; i++)
+			us_put(c, px + d * i, py - 1, v, US_MAT_ACCENT);
+		for (int i = -1 - big; i <= 0; i++)
+			us_put(c, px + d * i, py - 2, v, US_MAT_ACCENT);
+		int hn = nod > 0.4f ? 1 : 0;
+		us_put(c, px + d * (1 + hn), py - 3 + hn, v, US_MAT_ACCENT);
+		us_put(c, px + d * (2 + hn), py - 3 + hn, us_sat(0.5f + shield), US_MAT_LIGHT);
+		if (flap > 0.2f) {
+			us_put(c, px - d, py - 3 - (flap > 0.6f), v * 0.8f, US_MAT_ACCENT);
+			us_put(c, px - d * 2, py - 4, v * 0.6f * flap, US_MAT_ACCENT);
+		}
+		return;
+	}
+	float L = 0.0155f * s, H = 0.009f * s;
+#define CX(a) (x + f * (a) * L)
+#define CY(b) (y - (b) * H)
+	/* hull: a low arc, highest just behind the middle, the stern a little cocked */
+	float pts[2 * 11];
+	for (int i = 0; i <= 10; i++) {
+		float u = i / 10.0f, a = US_PI * u;
+		float ax = -cosf(a) * (u < 0.5f ? 1.0f : 0.8f), ay = sinf(a) * (1.0f - 0.15f * u) + 0.25f * (1.0f - u) * (1.0f - u);
+		pts[2 * i] = CX(ax), pts[2 * i + 1] = CY(ay);
+	}
+	for (int i = 0; i < 10; i++)
+		us_tri(c, CX(0.0f), CY(0.0f), pts[2 * i], pts[2 * i + 1], pts[2 * i + 2], pts[2 * i + 3], v * 0.45f, US_MAT_ACCENT);
+	us_polyline(c, pts, 11, 0.0011f, v, US_MAT_ACCENT);
+	wline(c, CX(-1.0f), CY(0.0f), CX(0.8f), CY(0.0f), v * 0.6f, US_MAT_ACCENT);
+	/* neck + head: the nod throws the head forward and down */
+	float hx = 0.95f + 0.35f * nod, hy = 1.55f - 0.6f * nod;
+	wline(c, CX(0.55f), CY(0.7f), CX(hx), CY(hy), v, US_MAT_ACCENT);
+	us_disc(c, CX(hx), CY(hy), 0.28f * H, v * 0.9f, US_MAT_ACCENT);
+	/* the white shield and bill */
+	wline(c, CX(hx + 0.12f), CY(hy + 0.12f), CX(hx + 0.5f), CY(hy - 0.12f), us_sat(v * 1.3f + shield), US_MAT_LIGHT);
+	if (flap > 0.05f) {
+		/* skittering: wings flailing up off the back */
+		float wa = flap * (0.6f + 0.4f * sinf(flap * 40.0f));
+		wline(c, CX(0.1f), CY(0.9f), CX(-0.6f), CY(0.9f + 2.2f * wa), v * 0.9f, US_MAT_ACCENT);
+		wline(c, CX(-0.6f), CY(0.9f + 2.2f * wa), CX(-1.1f), CY(0.9f + 1.4f * wa), v * 0.6f, US_MAT_ACCENT);
+	}
+	/* a short broken reflection under it */
+	wline(c, CX(-0.9f), y + 0.6f * H, CX(0.7f), y + 0.6f * H, v * 0.25f, US_MAT_WATER);
+	wline(c, CX(-0.6f), y + 1.3f * H, CX(0.4f), y + 1.3f * H, v * 0.15f, US_MAT_WATER);
+#undef CX
+#undef CY
 }
 
 /* evolve one sheet's pose and sample its spine (screen space) */
@@ -1280,7 +1565,9 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 					x += stp;
 				if (x > x0 + 0.001f) {
 					float xc = 0.5f * (x0 + x);
-					float yy = y + (0.0015f + 0.005f * st->sub_s) * (0.4f + f) * sinf(t * 1.1f + k * 0.9f + xc * 4.0f);
+					/* the kick's thump shivers the whole surface for a moment */
+					float yy = y + (0.0015f + 0.005f * st->sub_s) * (0.4f + f) * sinf(t * 1.1f + k * 0.9f + xc * 4.0f) +
+						   0.0035f * st->kb * (0.3f + f) * sinf(xc * 37.0f + k * 2.3f);
 					hline_sky(c, x0, x, yy, v, US_MAT_WATER, NULL, ctx->crisp ? 2 : 1);
 				}
 				x += stp;
@@ -1614,13 +1901,243 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 		}
 	}
 
+	/* ---- the marsh: ripples, coots on the mere, the heron fishing the shallows ---- */
+	{
+		float autumn = us_world_season_w(w, 2), lvl = st->lvl_s;
+		float hv = 0.5f * (0.75f + 0.35f * lvl) * (0.8f + 0.2f * glow);
+		/* ripples */
+		for (int k = 0; k < NRIP; k++) {
+			if (st->rp_age[k] >= 9.0f)
+				continue;
+			st->rp_age[k] += dt;
+			float ag = st->rp_age[k], life = 0.3f + 2.2f * st->rp_str[k] * st->rp_str[k]; /* faint rings die fast */
+			if (ag > life) {
+				st->rp_age[k] = 9.0f;
+				continue;
+			}
+			float dsc = 0.45f + 0.55f * us_sat((st->rp_y[k] - HORIZON) / 0.085f);
+			float rv = (ctx->crisp ? 0.55f : 0.42f) * st->rp_str[k] * (1.0f - ag / life) * (1.0f - ag / life);
+			float rx = (0.003f + 0.022f * ag * (0.6f + 0.4f * st->rp_str[k])) * dsc;
+			ripple_draw(c, st->rp_x[k] * A, st->rp_y[k], rx, rv);
+			if (ag > 0.25f && st->rp_str[k] > 0.6f) /* a second, inner ring */
+				ripple_draw(c, st->rp_x[k] * A, st->rp_y[k], rx * 0.55f, rv * 0.6f);
+		}
+
+		/* coots: more of them on the mere in autumn and winter (the migrants come in); each nods its head with
+		 * every paddle stroke, and on the kick the whole raft nods together and pushes a bow ring; a snare sends
+		 * one skittering across the water, wings flailing, feet pattering */
+		int nc = 2 + (int)(2.0f * dens + 0.5f) + (int)(2.5f * us_sat(autumn + winter) + 0.3f);
+		if (nc > NCOOT)
+			nc = NCOOT;
+		st->ct_cool -= rdt;
+		int sk_pick = -1;
+		if (a->snare_hit && st->ct_cool <= 0) {
+			sk_pick = (int)(us_rand(r) * nc);
+			st->ct_cool = us_randr(r, 0.8f, 2.0f);
+		}
+		for (int k = 0; k < NCOOT; k++) {
+			int want = k < nc;
+			if (!want && st->ct_state[k] != 3) {
+				/* paddles off into the reeds at the edge */
+				st->ct_dir[k] = st->ct_x[k] < 0.5f ? -1.0f : 1.0f;
+			}
+			float sc = 0.45f + 0.55f * us_sat((st->ct_y[k] - HORIZON) / 0.075f);
+			float x = st->ct_x[k];
+			if (st->ct_state[k] == 3) {
+				if (want) { /* a new one swims in from the side */
+					st->ct_state[k] = 0;
+					st->ct_dir[k] = us_rand(r) < 0.5f ? 1.0f : -1.0f;
+					st->ct_x[k] = st->ct_dir[k] > 0 ? -0.02f : 1.02f;
+				} else
+					continue;
+			}
+			if (a->kick_hit && st->ct_state[k] == 0)
+				st->ct_nod[k] = 1.0f, ripple_add(st, x + st->ct_dir[k] * 0.012f * sc / A, st->ct_y[k], 0.35f * us_sat(a->kick));
+			st->ct_nod[k] *= expf(-rdt / 0.11f);
+			st->ct_ph[k] += dt * (2.4f + 1.5f * lvl) * st->ct_v[k];
+			float stroke = 0.5f + 0.5f * sinf(st->ct_ph[k]);
+			float nod = fmaxf(st->ct_nod[k], 0.2f * stroke * stroke);
+			float spd = 0.006f * st->ct_v[k] * sc * (0.6f + 0.6f * stroke);
+			if (k == sk_pick && st->ct_state[k] == 0) {
+				st->ct_state[k] = 2, st->ct_sk[k] = us_randr(r, 0.7f, 1.2f);
+				if (us_rand(r) < 0.5f)
+					st->ct_dir[k] = -st->ct_dir[k];
+			}
+			st->ct_tmr[k] -= dt;
+			switch (st->ct_state[k]) {
+			case 0:
+				if (st->ct_tmr[k] <= 0 && want) {
+					float u = us_rand(r);
+					if (u < 0.35f) { /* dives: a ring, then gone a few seconds */
+						st->ct_state[k] = 1, st->ct_tmr[k] = us_randr(r, 2.0f, 4.5f);
+						ripple_add(st, x, st->ct_y[k], 0.8f);
+					} else {
+						st->ct_dir[k] = -st->ct_dir[k];
+						st->ct_tmr[k] = us_randr(r, 4.0f, 14.0f);
+					}
+				}
+				break;
+			case 1:
+				spd *= 0.6f; /* swimming on underwater */
+				if (st->ct_tmr[k] <= 0) {
+					st->ct_state[k] = 0, st->ct_tmr[k] = us_randr(r, 5.0f, 15.0f);
+					ripple_add(st, x + st->ct_dir[k] * spd * 3.0f / A, st->ct_y[k], 0.7f);
+				}
+				break;
+			case 2:
+				st->ct_sk[k] -= dt;
+				spd = 0.09f * sc * us_sat(st->ct_sk[k] * 2.0f + 0.2f);
+				if (us_rand(r) < dt * 14.0f) /* the pattering feet */
+					ripple_add(st, x - st->ct_dir[k] * 0.006f * sc / A, st->ct_y[k], 0.3f);
+				if (st->ct_sk[k] <= 0)
+					st->ct_state[k] = 0, st->ct_tmr[k] = us_randr(r, 3.0f, 9.0f);
+				break;
+			}
+			/* stay on the open mere, out of the heron's corner */
+			if (want && st->ct_state[k] != 2) {
+				if (x < 0.33f && st->ct_dir[k] < 0)
+					st->ct_dir[k] = 1.0f;
+				if (x > 0.97f && st->ct_dir[k] > 0)
+					st->ct_dir[k] = -1.0f;
+			}
+			x += st->ct_dir[k] * spd * dt / A;
+			st->ct_x[k] = x;
+			if (!want && (x < -0.03f || x > 1.03f)) {
+				st->ct_state[k] = 3;
+				continue;
+			}
+			if (st->ct_state[k] == 1)
+				continue;
+			float flap = st->ct_state[k] == 2 ? us_sat(st->ct_sk[k] * 2.0f) : 0.0f;
+			float cv = hv * (0.55f + 0.45f * sc) * 0.9f;
+			coot_draw(c, x * A, st->ct_y[k] + 0.0006f * stroke * sc, sc, st->ct_dir[k], nod, flap, 0.5f * st->hat_env, cv);
+			/* a faint V wake opening behind */
+			if (!ctx->crisp) {
+				float wl = (0.012f + 0.25f * spd) * sc, bx = x * A - st->ct_dir[k] * 0.009f * sc, by = st->ct_y[k] + 0.001f;
+				wline(c, bx, by, bx - st->ct_dir[k] * wl, by - wl * 0.08f, cv * 0.3f, US_MAT_WATER);
+				wline(c, bx, by, bx - st->ct_dir[k] * wl, by + wl * 0.14f, cv * 0.3f, US_MAT_WATER);
+			}
+		}
+
+		/* the heron: stands, wades a few slow steps, stalks (neck coiled, leaning in), strikes at the water and
+		 * sometimes swallows. Louder music = a hungrier, busier heron. A snare snaps its neck up tall, alert
+		 * (a quick spring that overshoots and settles); in the quiet roost it hunches into its shoulders. */
+		{
+			float e_t = 0.55f + 0.2f * us_noise2(t * 0.11f, 77.0f), lean_t = 0, k_t = 0, gulp_t = 0;
+			st->hn_tmr -= dt;
+			if (a->snare_hit && st->hn_state != 3) {
+				st->hn_alert = 1.0f;
+				st->hn_ev += 3.5f * (0.6f + 0.4f * us_sat(a->snare));
+				if (st->hn_state == 2 || st->hn_state == 4)
+					st->hn_state = 0, st->hn_tmr = us_randr(r, 1.0f, 2.5f);
+			}
+			st->hn_alert *= expf(-rdt / 0.7f);
+			switch (st->hn_state) {
+			case 0:
+				if (st->hn_tmr <= 0) {
+					float u = us_rand(r);
+					if (roost > 0.5f)
+						st->hn_tmr = us_randr(r, 3.0f, 6.0f);
+					else if (u < 0.3f) {
+						st->hn_state = 1, st->hn_tmr = us_randr(r, 2.5f, 5.0f);
+						if (st->hn_x < 0.15f)
+							st->hn_dir = 1.0f;
+						else if (st->hn_x > 0.26f)
+							st->hn_dir = -1.0f;
+						else if (us_rand(r) < 0.3f)
+							st->hn_dir = -st->hn_dir;
+					} else if (u < 0.55f + 0.35f * lvl)
+						st->hn_state = 2, st->hn_tmr = us_randr(r, 1.2f, 3.5f) * (1.2f - 0.6f * lvl);
+					else
+						st->hn_tmr = us_randr(r, 1.5f, 5.0f) * (1.3f - 0.6f * lvl);
+				}
+				break;
+			case 1:
+				st->hn_step += dt * 2.2f;
+				e_t = 0.5f;
+				st->hn_x += st->hn_dir * dt * 0.006f * (0.5f + 0.5f * fabsf(sinf(st->hn_step))) / A;
+				if (st->hn_tmr <= 0 || st->hn_x < 0.12f || st->hn_x > 0.29f) {
+					/* finish the stride, then stand */
+					float ph = fmodf(st->hn_step, US_PI);
+					if (ph < 0.15f || ph > US_PI - 0.15f)
+						st->hn_state = 0, st->hn_tmr = us_randr(r, 1.5f, 4.0f), st->hn_step = 0;
+				}
+				break;
+			case 2:
+				e_t = 0.12f, lean_t = 1.0f;
+				if (st->hn_tmr <= 0)
+					st->hn_state = 3, st->hn_tmr = 0.45f;
+				break;
+			case 3:
+				e_t = 0.3f, lean_t = 1.0f, k_t = 1.0f;
+				if (st->hn_k > 0.85f && st->hn_tmr > 0.2f) {
+					st->hn_tmr = 0.2f;
+					float S = HERON_S;
+					ripple_add(st, st->hn_x + st->hn_dir * 0.46f * S / A, HERON_Y - 0.002f, 1.0f);
+				}
+				if (st->hn_tmr <= 0) {
+					if (us_rand(r) < 0.45f)
+						st->hn_state = 4, st->hn_tmr = 1.1f;
+					else
+						st->hn_state = 0, st->hn_tmr = us_randr(r, 1.0f, 3.0f);
+				}
+				break;
+			case 4:
+				e_t = 0.85f, gulp_t = 1.0f;
+				if (st->hn_tmr <= 0)
+					st->hn_state = 0, st->hn_tmr = us_randr(r, 2.0f, 4.0f);
+				break;
+			}
+			if (roost > 0.5f && st->hn_state != 3)
+				e_t = 0.02f, lean_t = 0;
+			e_t = us_lerp(e_t, 1.0f, us_sat(st->hn_alert * 1.3f));
+			/* the neck is a spring: the snare's jolt overshoots and settles */
+			{
+				float sdt = dt > 0.033f ? 0.033f : dt;
+				const float wn = US_TAU * 1.6f;
+				st->hn_ev += (wn * wn * (e_t - st->hn_e) - 2.0f * 0.45f * wn * st->hn_ev) * sdt;
+				st->hn_e += st->hn_ev * sdt;
+				st->hn_e = us_clampf(st->hn_e, -0.1f, 1.15f);
+			}
+			st->hn_k = us_approach(st->hn_k, k_t, k_t > st->hn_k ? 0.05f : 0.18f, dt);
+			st->hn_lean = us_approach(st->hn_lean, lean_t, 0.5f, dt);
+			st->hn_gulp = us_approach(st->hn_gulp, gulp_t, 0.15f, dt);
+			float lift = st->hn_state == 1 ? 1.0f : 0.0f;
+			heron_draw(c, st->hn_x * A, HERON_Y, HERON_S, st->hn_dir, us_clampf(st->hn_e, 0.0f, 1.1f), st->hn_k, st->hn_lean,
+				   st->hn_gulp, st->hn_step, lift, wind * us_noise2(t * 0.8f, 5.0f), ctx->crisp ? 0.72f + 0.2f * lvl : hv * 1.15f);
+			/* the shallows lap at its legs */
+			if (!ctx->crisp) {
+				float lx = st->hn_x * A;
+				hline(c, lx - 0.012f, lx + 0.012f, HERON_Y + 0.001f, 0.18f, US_MAT_WATER);
+				hline(c, lx - 0.006f, lx + 0.008f, HERON_Y + 0.004f, 0.12f, US_MAT_WATER);
+			}
+		}
+	}
+
 	/* ---- reed bed in front ---- */
 	{
+		/* the kick shoves through the reed bed: a damped spring, the whole bed leaning and swinging back */
+		{
+			float sdt = dt > 0.033f ? 0.033f : dt;
+			const float wn = US_TAU * 2.6f;
+			if (a->kick_hit)
+				st->reed_kv += (3.4f + 2.6f * us_sat(a->kick)) * (1.0f - 0.7f * roost);
+			st->reed_kv += (-wn * wn * st->reed_k - 2.0f * 0.65f * wn * st->reed_kv) * sdt;
+			st->reed_k += st->reed_kv * sdt;
+		}
+		/* the snare is a sharp flaw of wind: the reed tops whip one way and snap back (the kick leans whole stems) */
+		float sn_whip = 0.3f * (st->sn_age < 1.0f ? expf(-st->sn_age / 0.09f) : 0.0f) * (st->sn_u > 0.5f ? 1.0f : -1.0f) *
+				(1.0f - roost);
 		int nr = (int)(NREEDS * (0.5f + 0.5f * dens));
 		for (int k = 0; k < nr; k++) {
 			float x0 = st->reed_x[k] * A, h = st->reed_h[k];
+			/* the heron's pool: the reeds stand short and sparse in the shallows around it */
+			float pool = us_smooth(0.06f, 0.0f, fabsf(st->reed_x[k] - 0.205f) - 0.075f);
+			if (pool > 0.5f && (k & 1))
+				continue;
+			h *= 1.0f - 0.65f * pool;
 			float sw = (us_noise2(x0 * 1.3f - st->wind_t * 0.8f, st->reed_ph[k]) * 0.6f + 0.3f) * (0.15f + 0.5f * wind) +
-				   0.25f * us_noise2(st->reed_ph[k], 0.3f);
+				   0.25f * us_noise2(st->reed_ph[k], 0.3f) + st->reed_k * (0.75f + 0.25f * sinf(st->reed_ph[k])) + sn_whip;
 			float base = 1.01f, top = 0.96f - h * 1.3f;
 			float pts[8];
 			for (int q = 0; q < 4; q++) {
@@ -1631,13 +2148,66 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 			for (int q = 0; q < 3; q++)
 				wline(c, pts[2 * q], pts[2 * q + 1], pts[2 * q + 2], pts[2 * q + 3], 0.24f + 0.14f * (h / 0.12f),
 				      ctx->crisp ? US_MAT_EARTH : US_MAT_LEAF);
-			if (k % 3 == 0) {
+			if ((k & 1) == 0 && h > 0.04f) {
+				/* a feathery seed plume nodding downwind, its silk catching the afterglow */
 				float px = pts[6], py = pts[7];
-				for (int q = 0; q < 4; q++) {
-					float aa = -1.2f + 0.45f * q + sw * 2.0f;
-					float ll = 0.008f + 0.002f * q;
-					wline(c, px, py, px + sinf(aa) * ll * 0.6f, py - cosf(aa) * ll * 0.4f + ll * 0.5f, 0.26f,
-					      US_MAT_EARTH);
+				/* a snare is a brisk flaw of wind through the plumes: they all flick one way and swing back */
+				float flick = 1.9f * st->sn_env * (st->sn_u > 0.5f ? 1.0f : -1.0f) * (1.0f - roost);
+				float ang = 0.25f + 0.9f * us_clampf(sw, -0.6f, 0.9f) + flick; /* lean from vertical */
+				float pl = 0.008f + 0.13f * h;
+				float axx = sinf(ang), axy = -cosf(ang);
+				int ns = ctx->crisp ? 2 : 6;
+				for (int q = 0; q < ns; q++) {
+					float u = (q + 0.5f) / ns;
+					float qx = px + axx * pl * u, qy = py + axy * pl * u;
+					float sl = pl * (0.55f - 0.3f * u);
+					/* each spikelet hangs down and away on the downwind side, swinging a little */
+					float da = 2.2f - 0.5f * u + 0.25f * sw + 0.8f * flick;
+					float ex = qx + sinf(ang + da) * sl, ey = qy - cosf(ang + da) * sl;
+					wline(c, qx, qy, ex, ey, ctx->crisp ? 0.3f : 0.2f + 0.06f * glow, ctx->crisp ? US_MAT_EARTH : US_MAT_BLOOM);
+				}
+				wline(c, px, py, px + axx * pl, py + axy * pl, 0.28f, US_MAT_EARTH);
+				/* hats: a fresh few plume tips catch the low sun on each tick */
+				if (st->hat_env > 0.1f && (hash2((uint32_t)k + 311u, st->hat_seed) & 1023u) < (ctx->crisp ? 560u : 820u)) {
+					float gx = px + axx * pl, gy = py + axy * pl, gv = us_sat(st->hat_env * (ctx->crisp ? 0.9f : 1.3f));
+					if (ctx->crisp)
+						us_put(c, (int)(gx * c->s), (int)(gy * c->s), gv, US_MAT_LIGHT);
+					else {
+						wline(c, gx - 0.007f, gy, gx + 0.007f, gy, gv, US_MAT_LIGHT);
+						wline(c, gx, gy - 0.004f, gx, gy + 0.004f, gv * 0.8f, US_MAT_LIGHT);
+					}
+				}
+			}
+		}
+		/* reedmace (bulrush): stiff stems with a dark velvet cigar and a thin spike above, a long leaf or two */
+		for (int k = 0; k < NMACE; k++) {
+			if (k >= 4 + (int)(5.0f * dens + 0.5f))
+				break;
+			float x0 = st->mace_x[k] * A, h = st->mace_h[k];
+			float sw = ((us_noise2(x0 * 1.3f - st->wind_t * 0.8f, st->mace_ph[k]) * 0.6f + 0.3f) * (0.12f + 0.4f * wind) +
+				    0.8f * st->reed_k) * 0.6f;
+			float base = 1.01f, top = base - h;
+			float tx = x0 + sw * h * 1.2f, ty = top + fabsf(sw) * h * 0.08f;
+			/* gentle curve: the stem bends from low down */
+			float mx = x0 + sw * h * 0.35f, my = base - h * 0.55f;
+			wline(c, x0, base, mx, my, 0.3f, ctx->crisp ? US_MAT_EARTH : US_MAT_STEM);
+			wline(c, mx, my, tx, ty, 0.3f, ctx->crisp ? US_MAT_EARTH : US_MAT_STEM);
+			float dx = tx - mx, dy = ty - my, dl = sqrtf(dx * dx + dy * dy) + 1e-6f;
+			dx /= dl, dy /= dl;
+			float cl = 0.024f + 0.006f * (h / 0.16f);
+			float c0x = tx - dx * cl * 1.25f, c0y = ty - dy * cl * 1.25f, c1x = tx - dx * cl * 0.2f, c1y = ty - dy * cl * 0.2f;
+			us_line(c, c0x, c0y, c1x, c1y, ctx->crisp ? 0.007f : 0.0052f, ctx->crisp ? 0.5f : 0.42f, US_MAT_EARTH);
+			wline(c, tx, ty, tx + dx * cl * 0.7f, ty + dy * cl * 0.7f, 0.3f, US_MAT_EARTH);
+			if (!ctx->crisp) {
+				/* the cigar's lit edge */
+				wline(c, c0x + 0.0016f, c0y, c1x + 0.0016f, c1y, 0.3f, US_MAT_LIGHT);
+				/* a long blade arching away from the foot */
+				float side = (k & 1) ? 1.0f : -1.0f, lx = x0, ly = base;
+				for (int q = 1; q <= 4; q++) {
+					float u = q / 4.0f;
+					float nx = x0 + side * h * 0.28f * u * u + sw * h * 0.4f * u, ny = base - h * 0.75f * u + h * 0.25f * u * u;
+					wline(c, lx, ly, nx, ny, 0.24f, US_MAT_LEAF);
+					lx = nx, ly = ny;
 				}
 			}
 		}
