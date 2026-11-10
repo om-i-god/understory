@@ -15,6 +15,10 @@
  *   Crisp: the raster painted with ordered dither: slate bodies, lilac/cream only where light catches.
  * Below: far fields with hedgerows, a telegraph line, birds on the wire and a farmhouse; a near ridge with
  * a lone oak in the foreground.
+ * Life on the ridge: horses sheltering by the oak (grazing heads down, looking up now and then, tails and
+ * manes streaming downwind), ox-eye daisies and poppies in the long grass (seed heads in autumn, bare stalks
+ * in winter), and now and then a band of rooks beating low across the sky in front of the storm (fewer at
+ * night, bigger bands in autumn).
  *
  * Reactivity (each drum has its own answer):
  *   kick  = the decks heave: every mass drops and swells for a moment (heavier masses more), the rain
@@ -22,6 +26,10 @@
  *   snare = lightning inside the clouds: a sheet flash lights the billows around it from within, showing
  *           the deck's folds; when the storm is built up, some snares fire a forked bolt to the ground.
  *   hats  = the rain sparkles (drops glint) and splashes crown on the fields.
+ *   life:  kick = the horses' tails and manes whip out, one may stamp a hoof, the flowers snap over and spring
+ *          back, the rooks are tossed (wings flared, thrown up or down, blown back); snare = a grazing horse
+ *          throws its head up and the sheet flash shows the horses and flowers; a ground strike brings every
+ *          head up and sends the nearer horses trotting a few strides away (they drift back in a lull).
  *   loudness (eased) builds the storm: decks close and lower, masses thicken, more rain, more inner light;
  *           quiet passages break the decks up, the rain thins and stars show through the gaps.
  *   sub = a slow roll along the near deck's base; mids = a soft light wandering inside the deck;
@@ -53,6 +61,9 @@
 #define NPOLE 6    /* telegraph poles on the far fields */
 #define NBIRD 9    /* birds on the wire */
 #define HZ 0.835f  /* mean horizon height */
+#define NHORSE 3
+#define NROOK 7
+#define NFLW 30
 
 enum { LY_TOWER = 0, LY_FAR, LY_MID, LY_NEAR };
 
@@ -93,6 +104,24 @@ typedef struct {
 typedef struct {
 	float x, y, t;
 } splash_t;
+
+/* horses sheltering by the oak on the ridge */
+typedef struct {
+	float hc;          /* home position along the hill (0..1, rises toward 1) */
+	float off, vx;     /* walked offset from home (normalized x) + speed */
+	float dir;         /* facing: +1 right, -1 left */
+	float head, head_t, look_t; /* 0 grazing .. 1 head up; target; time left looking */
+	float leg_ph;      /* walk cycle */
+	float stamp;       /* a hind hoof lifted (kick) */
+	float S;           /* size */
+	float rest;        /* time before walking home */
+} horse_t;
+
+/* rooks blown across the low sky in front of the storm */
+typedef struct {
+	int on;
+	float x, y, vx, vy, ph, toss, rot, sz;
+} rook_t;
 
 typedef struct {
 	us_rng rng;
@@ -175,6 +204,14 @@ typedef struct {
 	float pole_u[NPOLE];
 	bird_t bird[NBIRD];
 	float barn_u, power_out;
+
+	/* life on the ridge: horses under the oak, wildflowers in the grass; rooks on the wind */
+	us_rng lrng; /* their own random stream, so they never shift the weather's */
+	horse_t horse[NHORSE];
+	rook_t rook[NROOK];
+	float rook_next;
+	float fl_a[NFLW], fl_v[NFLW]; /* each flower's stem angle + its spring velocity (whips on the kick) */
+	int struck;   /* a ground strike landed this frame */
 
 	/* the puddle's rain rings */
 	float rip_x[6], rip_y[6], rip_t[6];
@@ -292,6 +329,17 @@ static void *create(uint32_t seed)
 			b->dy = us_randr(&s->rng, -0.42f, -0.22f);
 		}
 	}
+	us_rng_seed(&s->lrng, seed ^ 0x686f7273u);
+	for (int k = 0; k < NHORSE; k++) {
+		horse_t *h = &s->horse[k];
+		h->hc = 0.57f + 0.075f * k + us_randr(&s->lrng, -0.015f, 0.015f);
+		h->dir = (k & 1) ? 1.0f : -1.0f;
+		h->S = (k == 1 ? 0.05f : 0.062f) * us_randr(&s->lrng, 0.95f, 1.05f);
+		h->head = h->head_t = us_rand(&s->lrng) < 0.5f ? 0.0f : 1.0f;
+		h->look_t = us_randr(&s->lrng, 1.0f, 8.0f);
+		h->leg_ph = us_rand(&s->lrng) * US_TAU;
+	}
+	s->rook_next = us_randr(&s->lrng, 3.0f, 9.0f);
 	s->tower_h = 0.3f;
 	s->sf_t = 9.0f;
 	s->heat_t = 9.0f;
@@ -1274,6 +1322,386 @@ static void draw_splashes(st_t *s, us_canvas *c, float A, float rdt)
 	}
 }
 
+/* ---- life on the ridge: horses sheltering by the oak, wildflowers in the long grass, rooks on the wind ---- */
+static float hill_u(float hc, float side) { return side > 0 ? hc : 1.0f - hc; }
+
+static void horse_pos(const st_t *s, const horse_t *h, float A, float *x, float *y)
+{
+	*x = hill_u(h->hc, s->ridge_side) * A + h->off;
+	*y = ridge_y(us_sat(*x / A), s->ridge_side) + 0.005f;
+}
+
+/* the horses graze with their heads down; a snare makes one throw its head up and look, a ground strike
+ * brings every head up and sends the nearer ones trotting a few strides away from it (they drift back to the
+ * oak in a lull); the kick's gust whips their manes and tails and now and then one stamps a hind hoof */
+static void horses_step(st_t *s, const us_audio *a, float A, float dt, float rdt)
+{
+	us_rng *r = &s->lrng;
+	for (int k = 0; k < NHORSE; k++) {
+		horse_t *h = &s->horse[k];
+		float x, y;
+		horse_pos(s, h, A, &x, &y);
+		h->look_t -= dt;
+		if (h->look_t <= 0.0f) {
+			if (h->head_t > 0.5f) {
+				h->head_t = 0.0f;
+				h->look_t = us_randr(r, 9.0f, 22.0f);
+			} else {
+				h->head_t = 1.0f;
+				h->look_t = us_randr(r, 1.5f, 4.0f);
+			}
+		}
+		if (a->snare_hit && h->head < 0.3f && us_rand(r) < 0.6f) {
+			h->head_t = 1.0f;
+			h->look_t = us_randr(r, 0.8f, 1.8f);
+		}
+		if (s->struck) {
+			float dx = x - s->hit_x;
+			h->head_t = 1.0f;
+			h->look_t = us_randr(r, 3.0f, 6.0f);
+			if (fabsf(dx) < 0.7f * A) {
+				h->dir = dx > 0.0f ? 1.0f : -1.0f;
+				h->rest = us_randr(r, 0.6f, 1.2f); /* trot away */
+			}
+		}
+		if (a->kick_hit && us_rand(r) < 0.3f)
+			h->stamp = 1.0f;
+		h->stamp *= expf(-rdt / 0.12f);
+		/* where to: trot away, walk back home while grazing, or stand */
+		float tv = 0.0f;
+		float lo = (0.45f - h->hc) * A, hi = (0.8f - h->hc) * A;
+		if (s->ridge_side < 0) {
+			float t0 = -hi;
+			hi = -lo;
+			lo = t0;
+		}
+		if (h->rest > 0.0f) {
+			h->rest -= dt;
+			tv = h->dir * 0.1f;
+		} else if (fabsf(h->off) > 0.012f && h->head_t < 0.5f) {
+			float d = h->off > 0.0f ? -1.0f : 1.0f;
+			if (fabsf(h->vx) < 0.004f)
+				h->dir = d; /* turns before it walks */
+			if (h->dir == d)
+				tv = d * 0.014f;
+		}
+		h->vx = us_approach(h->vx, tv, 0.25f, dt);
+		h->off += h->vx * dt;
+		if (h->off < lo || h->off > hi) {
+			h->off = us_clampf(h->off, lo, hi);
+			h->vx = 0.0f;
+			h->rest = 0.0f;
+		}
+		h->leg_ph += fabsf(h->vx) * dt / (0.55f * h->S) * US_TAU;
+		h->head = us_approach(h->head, h->head_t, h->head_t > h->head ? 0.06f : 0.9f, dt); /* a startle is quick */
+	}
+}
+
+typedef struct {
+	float x0, y0, x1, y1, w, k; /* k: rim brightness factor */
+} cap_t;
+
+static void draw_horse(st_t *s, us_canvas *c, const horse_t *h, float A, float t, float wind, float L)
+{
+	float x, y;
+	horse_pos(s, h, A, &x, &y);
+	float S = h->S, d = h->dir, hd = h->head;
+	cap_t cp[24];
+	int n = 0;
+#define CAP(ax, ay, bx, by, ww, kk)                                                                                  \
+	do {                                                                                                           \
+		cp[n].x0 = x + d * (ax) * S;                                                                           \
+		cp[n].y0 = y + (ay) * S;                                                                               \
+		cp[n].x1 = x + d * (bx) * S;                                                                           \
+		cp[n].y1 = y + (by) * S;                                                                               \
+		cp[n].w = (ww) * S;                                                                                    \
+		cp[n].k = (kk);                                                                                        \
+		n++;                                                                                                   \
+	} while (0)
+	float mv = us_sat(fabsf(h->vx) / 0.03f);
+	/* legs: near + far pair at each end; a walk/trot cycle when moving, a hind stamp on the kick */
+	for (int j = 0; j < 4; j++) {
+		int hind = j >= 2;
+		float lx = hind ? (j == 2 ? -0.24f : -0.31f) : (j == 0 ? 0.2f : 0.27f);
+		float ph = h->leg_ph + (float)j * US_PI * 0.5f + (hind ? US_PI : 0.0f) * (float)(j & 1);
+		float sw = mv * 0.13f * sinf(ph), lift = mv * 0.07f * fmaxf(0.0f, cosf(ph));
+		if (j == 2)
+			lift += 0.13f * h->stamp;
+		if (hind) {
+			CAP(lx, -0.6f, lx - 0.05f + 0.5f * sw, -0.3f, 0.12f, 0.7f);
+			CAP(lx - 0.05f + 0.5f * sw, -0.3f, lx - 0.01f + sw, -lift, 0.055f, 0.6f);
+		} else {
+			CAP(lx, -0.55f, lx + 0.5f * sw, -0.28f - 0.5f * lift, 0.08f, 0.7f);
+			CAP(lx + 0.5f * sw, -0.28f - 0.5f * lift, lx + sw, -lift, 0.055f, 0.6f);
+		}
+	}
+	/* body: barrel, rump, chest */
+	CAP(-0.3f, -0.67f, 0.22f, -0.68f, 0.33f, 1.0f);
+	CAP(-0.34f, -0.72f, -0.18f, -0.74f, 0.25f, 1.0f);
+	CAP(0.2f, -0.67f, 0.28f, -0.64f, 0.27f, 1.0f);
+	/* neck + head: grazing (nose to the grass, a slow nibble) .. head up and looking */
+	float nib = (1.0f - us_sat(hd * 3.0f)) * 0.015f * sinf(t * 1.1f + h->hc * 40.0f);
+	float n0x = 0.27f, n0y = -0.76f;
+	float h0x = us_lerp(0.56f, 0.5f, hd), h0y = us_lerp(-0.25f + nib, -1.05f, hd);
+	float m0x = us_lerp(0.62f, 0.72f, hd), m0y = us_lerp(-0.03f + nib, -0.9f, hd);
+	float nmx = 0.5f * (n0x + h0x) + 0.03f, nmy = 0.5f * (n0y + h0y) - us_lerp(0.06f, 0.02f, hd);
+	CAP(n0x, n0y, nmx, nmy, 0.24f, 1.0f);
+	CAP(nmx, nmy, h0x, h0y, 0.16f, 1.0f);
+	CAP(h0x, h0y, m0x, m0y, 0.12f, 1.0f);
+	CAP(us_lerp(h0x, m0x, 0.7f), us_lerp(h0y, m0y, 0.7f), m0x, m0y, 0.1f, 1.0f);
+	if (hd > 0.45f) /* ears pricked */
+		CAP(h0x - 0.01f, h0y - 0.02f, h0x - 0.05f, h0y - 0.13f, 0.035f, 1.0f);
+	/* the tail streams downwind (to the left); the gust front whips it */
+	float blow = -(0.25f + 20.0f * wind + 1.8f * s->heave); /* the kick's slap of wind whips it out */
+	float tbx = x + d * -0.4f * S, tby = y - 0.72f * S;
+	float tpx = tbx, tpy = tby;
+	for (int q = 1; q <= 4; q++) {
+		float f = q / 4.0f;
+		float fl = 0.05f * us_noise2(t * (0.8f + 3.0f * wind) + h->hc * 9.0f, f * 2.0f) * f;
+		float bx = tbx + (-d * 0.06f * f + (blow * 0.45f + fl) * f * f) * S;
+		float by = tby + (0.1f * f + 0.36f * f * (1.0f - 0.5f * us_sat(-blow * 0.5f))) * S;
+		cp[n].x0 = tpx;
+		cp[n].y0 = tpy;
+		cp[n].x1 = bx;
+		cp[n].y1 = by;
+		cp[n].w = (0.075f - 0.012f * q) * S;
+		cp[n].k = 0.8f;
+		n++;
+		tpx = bx;
+		tpy = by;
+	}
+#undef CAP
+	int crisp = c->crisp;
+	float rv = us_sat((crisp ? 0.36f : 0.22f) + 0.12f * s->lumf + 0.8f * L);
+	float rw = 2.8f / c->s;
+	if (crisp) {
+		/* pixel: a dark silhouette, a pixel of light along its back, neck and head (lit through by a flash) */
+		float up = 1.0f / c->s, fv = us_sat(0.6f * L);
+		for (int i = 0; i < n; i++)
+			if (cp[i].k > 0.95f)
+				stamp_thick(c, cp[i].x0, cp[i].y0 - up, cp[i].x1, cp[i].y1 - up, cp[i].w, us_sat(rv + 0.1f), US_MAT_ACCENT);
+		for (int i = 0; i < n; i++) {
+			if (cp[i].w * c->s < 1.2f)
+				stamp_line(c, cp[i].x0, cp[i].y0, cp[i].x1, cp[i].y1, fv, fv > 0.1f ? US_MAT_EARTH : US_MAT_BG);
+			else
+				stamp_thick(c, cp[i].x0, cp[i].y0, cp[i].x1, cp[i].y1, cp[i].w, fv, fv > 0.1f ? US_MAT_EARTH : US_MAT_BG);
+		}
+	} else {
+		for (int i = 0; i < n; i++)
+			us_line(c, cp[i].x0, cp[i].y0, cp[i].x1, cp[i].y1, cp[i].w + rw, rv * cp[i].k, US_MAT_EARTH);
+		for (int i = 0; i < n; i++)
+			stamp_thick(c, cp[i].x0, cp[i].y0, cp[i].x1, cp[i].y1, cp[i].w, 0.0f, US_MAT_BG);
+	}
+	/* the mane: a few strands lifted off the crest by the wind */
+	if (!crisp)
+		for (int q = 0; q < 4; q++) {
+			float f = 0.15f + 0.22f * q;
+			float mx = x + d * us_lerp(n0x - 0.04f, h0x, f) * S, my = y + (us_lerp(n0y - 0.1f, h0y - 0.06f, f)) * S;
+			float fl = us_noise2(t * (1.0f + 4.0f * wind) + q * 1.7f, h->hc * 7.0f);
+			wline(c, mx, my, mx + (blow * 0.09f + 0.02f * fl) * S, my - (0.05f + 0.02f * fl) * S, 0.001f, rv * 0.8f, US_MAT_EARTH);
+		}
+}
+
+/* rooks: a loose band beats across the low sky downwind (right to left); the kick's gust tosses them,
+ * wings flared, before they right themselves. Fewer at night (they roost), bigger bands in autumn. */
+static void rooks_step(st_t *s, const us_ctx *ctx, float A, float wind, float dt)
+{
+	us_rng *r = &s->lrng;
+	const us_audio *a = ctx->a;
+	int active = 0;
+	for (int k = 0; k < NROOK; k++)
+		active += s->rook[k].on;
+	s->rook_next -= dt;
+	if (!active && s->rook_next <= 0.0f) {
+		float nf = us_smooth(0.04f, 0.3f, ctx->w->daylight);
+		float au = us_world_season_w(ctx->w, 2);
+		s->rook_next = us_randr(r, 10.0f, 26.0f);
+		if (us_rand(r) < 0.25f + 0.75f * nf) {
+			int n = 2 + (int)(ctx->p->density * 3.0f + 2.0f * au + us_rand(r));
+			if (n > NROOK)
+				n = NROOK;
+			float x = A + 0.04f, yc = us_randr(r, 0.62f, 0.72f);
+			for (int k = 0; k < n; k++) {
+				rook_t *b = &s->rook[k];
+				b->on = 1;
+				x += us_randr(r, 0.02f, 0.09f);
+				b->x = x;
+				b->y = yc + us_randr(r, -0.04f, 0.04f);
+				b->vx = -0.08f;
+				b->vy = 0.0f;
+				b->ph = us_rand(r) * US_TAU;
+				b->toss = 0.0f;
+				b->rot = 0.0f;
+				b->sz = us_randr(r, 0.016f, 0.021f);
+			}
+		}
+	}
+	for (int k = 0; k < NROOK; k++) {
+		rook_t *b = &s->rook[k];
+		if (!b->on)
+			continue;
+		if (a->kick_hit) {
+			b->vy += us_randn(r) * 0.12f - 0.04f * a->kick;
+			b->vx -= us_randr(r, 0.04f, 0.1f) * (0.5f + a->kick);
+			b->toss = 1.0f;
+			b->rot = us_randn(r) * 0.55f;
+		}
+		float gf = gust_front(s, b->x);
+		b->vx -= gf * 0.4f * dt;
+		float tvx = -(0.05f + 1.1f * wind);
+		float tvy = 0.025f * us_noise2((float)ctx->t * 0.4f, k * 3.1f) + 0.6f * (0.67f - b->y);
+		b->vx = us_approach(b->vx, tvx, 0.9f, dt);
+		b->vy = us_approach(b->vy, tvy, 0.5f, dt);
+		b->x += b->vx * dt;
+		b->y += b->vy * dt;
+		b->toss *= expf(-dt / 0.45f);
+		{ /* rooks flap in bursts and glide between */
+			float burst = us_noise2(k * 1.3f, (float)ctx->t * 0.35f) > -0.1f;
+			b->ph += dt * (b->toss > 0.4f ? 3.0f : burst ? 9.0f : 0.0f);
+			if (!burst && b->toss < 0.4f)
+				b->ph = us_approach(b->ph, floorf(b->ph / US_TAU) * US_TAU + 0.35f, 0.3f, dt);
+		}
+		if (b->x < -0.08f || b->y < 0.0f)
+			b->on = 0;
+	}
+}
+
+static void draw_rooks(st_t *s, us_canvas *c, float L)
+{
+	int crisp = c->crisp;
+	for (int k = 0; k < NROOK; k++) {
+		rook_t *b = &s->rook[k];
+		if (!b->on)
+			continue;
+		float sz = b->sz, x = b->x, y = b->y;
+		float dir = b->vx < 0.0f ? -1.0f : 1.0f;
+		/* wing beat (tips swing from high to low); tossed: wings held up in a flared V */
+		float wv = b->toss > 0.4f ? 0.85f : sinf(b->ph);
+		float ang = b->rot * b->toss, ca = cosf(ang), sa = sinf(ang);
+		float v = us_sat((crisp ? 0.55f : 0.4f) + 0.6f * L + 0.08f * s->lumf);
+		uint8_t m = US_MAT_ACCENT;
+#define RP(px_, py_, ox, oy)                                                                                         \
+	do {                                                                                                           \
+		float _x = (px_) * sz, _y = (py_) * sz;                                                                \
+		ox = x + _x * ca - _y * sa;                                                                            \
+		oy = y + _x * sa + _y * ca;                                                                            \
+	} while (0)
+		/* broad wings, seen spread: a thick inner arm, a long hand ending in splayed fingers */
+		for (int sd = -1; sd <= 1; sd += 2) {
+			float ex = sd * 0.45f, ey = -0.28f * wv - 0.05f;
+			float tx = sd * 1.0f, ty = -0.62f * wv + 0.12f;
+			float ax, ay, bx, by, cx2, cy2, dx2, dy2, fx, fy;
+			RP(sd * 0.06f, -0.08f, ax, ay);
+			RP(ex, ey - 0.07f, bx, by);
+			RP(ex - sd * 0.02f, ey + 0.13f, cx2, cy2);
+			RP(sd * 0.06f, 0.1f, dx2, dy2);
+			RP(tx, ty, fx, fy);
+			us_tri(c, ax, ay, bx, by, cx2, cy2, v, m);
+			us_tri(c, ax, ay, cx2, cy2, dx2, dy2, v, m);
+			us_tri(c, bx, by, fx, fy, cx2, cy2, v * 0.95f, m);
+			if (!crisp)
+				for (int f = 0; f < 3; f++) { /* fingered primaries */
+					float gx, gy;
+					RP(tx + sd * 0.12f, ty + 0.06f + 0.11f * f, gx, gy);
+					wline(c, us_lerp(bx, fx, 0.6f), us_lerp(by, fy, 0.6f) + (0.04f * f) * sz, gx, gy, 0.0011f, v * 0.9f, m);
+				}
+		}
+		/* body, head and beak toward the flight, a wedge tail behind */
+		float hx, hy, tx0, ty0, t1x, t1y, t2x, t2y, bkx, bky;
+		RP(dir * 0.24f, -0.02f, hx, hy);
+		RP(dir * 0.38f, 0.0f, bkx, bky);
+		RP(-dir * 0.2f, 0.02f, tx0, ty0);
+		RP(-dir * 0.42f, -0.06f, t1x, t1y);
+		RP(-dir * 0.42f, 0.12f, t2x, t2y);
+		us_line(c, tx0, ty0, hx, hy, (crisp ? 0.003f : 0.17f * sz), v, m);
+		us_disc(c, hx, hy, crisp ? 0.0025f : 0.085f * sz, v, m);
+		if (!crisp)
+			wline(c, hx, hy, bkx, bky, 0.0012f, v, m);
+		us_tri(c, tx0, ty0, t1x, t1y, t2x, t2y, v * 0.9f, m);
+#undef RP
+	}
+}
+
+/* wildflowers in the ridge grass: ox-eye daisies and poppies on long stems, each a damped spring that the
+ * wind leans over and the kick's gust whips downwind; heads hold rain that the hats glint */
+static void draw_flowers(st_t *s, const us_ctx *ctx, us_canvas *c, float A, float wind, float Lg, float dt)
+{
+	float side = s->ridge_side;
+	us_world *w = ctx->w;
+	float sp = us_world_season_w(w, 0), su = us_world_season_w(w, 1), au = us_world_season_w(w, 2), wi = us_world_season_w(w, 3);
+	float bloomk = us_sat(0.7f * sp + 1.0f * su + 0.35f * au) * (1.0f - wi);
+	int nf = 12 + (int)(18.0f * ctx->p->density);
+	int crisp = c->crisp;
+	float t = (float)ctx->t;
+	for (int k = 0; k < nf && k < NFLW; k++) {
+		uint32_t h = hash3(k, 11, 93);
+		float hc = 0.4f + 0.6f * hf(h, 0);
+		float u = hill_u(hc, side);
+		float top = ridge_y(u, side);
+		float gy = top + 0.012f + (0.995f - top - 0.012f) * hf(h, 1) * hf(h, 1);
+		{ /* not in the puddle */
+			float pu = hill_u(0.58f, side), ex = (u - pu) * A / 0.11f, ey = (gy - ridge_y(pu, side) - 0.06f) / 0.022f;
+			if (ex * ex + ey * ey < 1.0f)
+				continue;
+		}
+		float x = u * A;
+		float near = us_smooth(0.88f, 1.0f, gy);
+		float Ls = (0.03f + 0.025f * hf(h, 2)) * (0.75f + 0.6f * near);
+		float tgt = -(0.12f + 7.0f * wind * (0.6f + 0.4f * us_noise2(x * 3.0f - t * 0.5f, k * 0.37f)));
+		s->fl_v[k] += (220.0f * (tgt - s->fl_a[k]) - 24.0f * s->fl_v[k]) * dt;
+		if (ctx->a->kick_hit)
+			s->fl_a[k] -= (0.45f + 0.3f * hf(h, 2)) * (0.6f + 0.6f * ctx->a->kick);
+		s->fl_a[k] += s->fl_v[k] * dt;
+		s->fl_a[k] = us_clampf(s->fl_a[k], -1.4f, 0.6f);
+		float an = s->fl_a[k] - 0.5f * s->heave;
+		float dxl = x - s->hit_x;
+		float Lt = Lg * (0.4f + 0.6f * expf(-dxl * dxl / 0.15f)) + 0.15f * s->heat_v + 0.3f * s->sf; /* sheet lightning shows them */
+		float mx = x + sinf(an * 0.45f) * Ls * 0.5f, my = gy - cosf(an * 0.45f) * Ls * 0.5f;
+		float hx = mx + sinf(an) * Ls * 0.5f, hy = my - cosf(an) * Ls * 0.5f;
+		float sv = us_sat((crisp ? 0.28f : 0.18f) + 0.06f * s->lumf + 0.8f * Lt);
+		if (crisp) {
+			us_line(c, x, gy, mx, my, 0.002f, sv, US_MAT_LEAF);
+			us_line(c, mx, my, hx, hy, 0.002f, sv, US_MAT_LEAF);
+		} else {
+			wline(c, x, gy, mx, my, 0.0011f, sv, US_MAT_LEAF);
+			wline(c, mx, my, hx, hy, 0.001f, sv, US_MAT_LEAF);
+			/* a leaf low on the stem */
+			float lx = us_lerp(x, mx, 0.5f), ly = us_lerp(gy, my, 0.5f);
+			wline(c, lx, ly, lx + ((k & 1) ? 1.0f : -1.0f) * Ls * 0.18f + sinf(an) * Ls * 0.1f, ly - Ls * 0.1f, 0.001f, sv * 0.9f, US_MAT_LEAF);
+		}
+		if (hf(h, 2) > bloomk + 0.1f) /* out of season: a bare stalk */
+			continue;
+		float hr = (0.0032f + 0.0028f * near);
+		float gl = 0.0f;
+		float hv = us_sat((crisp ? 0.5f : 0.36f) + 0.12f * s->lumf + 0.9f * Lt + gl);
+		int poppy = (h >> 30) & 1;
+		if (au > 0.55f) { /* autumn: seed heads */
+			us_point(c, hx, hy, crisp ? 0.003f : hr * 0.5f, hv * 0.7f, US_MAT_STEM);
+			continue;
+		}
+		if (crisp) {
+			us_disc(c, hx, hy, 0.0035f, hv, poppy ? US_MAT_BLOOM : US_MAT_ACCENT);
+			if (!poppy)
+				us_put(c, (int)(hx * c->s), (int)(hy * c->s), us_sat(hv + 0.2f), US_MAT_LIGHT);
+		} else if (poppy) {
+			/* a cup of petals, nodding with the stem */
+			float ca = cosf(an), sa = sinf(an);
+			for (int q = -2; q <= 2; q++) {
+				float pa = q * 0.38f;
+				float ex = hx + (sinf(pa) * ca + cosf(pa) * sa) * hr * 1.2f, ey = hy - (cosf(pa) * ca - sinf(pa) * sa) * hr * 1.0f;
+				wline(c, hx, hy, ex, ey, 0.0013f, hv, US_MAT_BLOOM);
+			}
+		} else {
+			for (int q = 0; q < 8; q++) {
+				float pa = q * US_TAU / 8.0f + an;
+				wline(c, hx + cosf(pa) * hr * 0.3f, hy + sinf(pa) * hr * 0.3f * 0.6f, hx + cosf(pa) * hr, hy + sinf(pa) * hr * 0.6f, 0.001f, hv,
+				      US_MAT_ACCENT);
+			}
+			us_point(c, hx, hy, hr * 0.28f, us_sat(hv + 0.15f), US_MAT_LIGHT);
+		}
+	}
+}
+
 static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 {
 	st_t *s = sp;
@@ -1283,6 +1711,7 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 	float dens = ctx->p->density;
 	float t = (float)ctx->t;
 	us_rng *r = &s->rng;
+	s->struck = 0;
 
 	/* ---- charge: swell builds it (world also builds it slowly), strikes discharge ---- */
 	float drive = us_smooth(0.25f, 0.8f, a->swell) * 0.03f + 0.008f * a->level * a->active;
@@ -1415,6 +1844,7 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 		if (s->cool <= 0 && a->snare > 0.45f && us_rand(r) < pb) {
 			if (us_rand(r) < 0.35f + 0.4f * cv) {
 				strike(s, A, 1, dens, a->snare, a->width);
+				s->struck = 1;
 				s->power_out = 1.6f;
 				us_world_add(w, &w->storm_charge, -us_randr(r, 0.05f, 0.1f), 1.0f);
 				s->cool = us_randr(r, 0.8f, 2.5f) * (1.25f - 0.6f * ch);
@@ -1616,6 +2046,10 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 		}
 	}
 
+	/* ---- rooks on the wind, in front of the far bank ---- */
+	rooks_step(s, ctx, A, wind, dt);
+	draw_rooks(s, c, s->flash * s->bolt_amp + 0.1f * s->heat_v);
+
 	/* ---- lightning channel ---- */
 	if (s->nseg > 0) {
 		float after = 0.32f * expf(-s->bolt_t / 0.5f); /* retinal afterimage */
@@ -1816,6 +2250,14 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 					us_polyline(c, pts, 9, crisp ? 0.002f : 0.001f, us_sat((crisp ? 0.25f : 0.16f) + 0.7f * Lg), US_MAT_STEM);
 				}
 		}
+		/* horses sheltering near the oak (the slope's grass in front of them) */
+		horses_step(s, a, A, dt, rdt);
+		for (int k = 0; k < NHORSE - (dens < 0.3f); k++) {
+			float hx, hy;
+			horse_pos(s, &s->horse[k], A, &hx, &hy);
+			float dxh = hx - s->hit_x;
+			draw_horse(s, c, &s->horse[k], A, tnow, wind, Lg * (0.4f + 0.6f * expf(-dxh * dxh / 0.15f)) + 0.15f * s->heat_v + 0.3f * s->sf);
+		}
 		/* tufts of long grass on the slope, combed over by the wind; the kick's gust front flattens them */
 		{
 			int nt = 10 + (int)(14.0f * dens);
@@ -1857,6 +2299,7 @@ static void frame(void *sp, const us_ctx *ctx, us_canvas *c)
 				}
 			}
 		}
+		draw_flowers(s, ctx, c, A, wind, Lg, dt);
 		/* the oak on the crest, the scene's near anchor: a solid silhouette (it hides the clouds behind it),
 		 * limbs that thrash a little in the gusts, lit when the lightning flashes */
 		const float OS = 1.65f;
